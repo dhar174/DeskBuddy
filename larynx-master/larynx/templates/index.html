@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+
+    <head>
+
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+        <meta name="description" content="">
+        <meta name="author" content="">
+
+        <title>Larynx TTS</title>
+
+        <!-- Bootstrap core CSS -->
+        <link href="css/bootstrap.min.css" rel="stylesheet">
+
+        <!-- Custom styles for this template -->
+        <style>
+         body {
+             padding-top: 0;
+             background-color: #111;
+         }
+         @media (min-width: 992px) {
+             body {
+                 padding-top: 0;
+             }
+         }
+
+         audio {
+             border: 1px solid #AAA;
+         }
+
+        </style>
+    </head>
+
+    <body class="text-light">
+        <!-- Page Content -->
+        <div class="container">
+            <div class="row mt-1">
+                <div class="col-lg-12 text-center">
+                    <h1>Larynx</h1>
+                </div>
+            </div>
+            <div class="row mt-3">
+                <div class="col">
+                    <textarea id="text" placeholder="Type here..." class="form-control" rows="8" name="text"></textarea>
+                </div>
+                <div class="col-auto">
+                    <button id="speak-button" name="speak" class="btn btn-lg btn-primary">Speak</button>
+                    <br/><br/>
+                    <a href="/openapi/" title="OpenAPI page" class="badge badge-info">API</a>
+                </div>
+            </div>
+            <div class="row mt-3">
+                <div class="col-auto">
+                    <select id="voice-list" name="voices">
+                    </select>
+                </div>
+                <div class="col-auto">
+                    <select id="vocoder-list" name="vocoders">
+                        <!-- <option value="waveglow/wn_256">Best Quality</option> -->
+                        <option value="hifi_gan/universal_large" selected>High Quality</option>
+                        <option value="hifi_gan/vctk_medium">Medium Quality</option>
+                        <option value="hifi_gan/vctk_small">Low Quality</option>
+                    </select>
+                </div>
+                <div class="col-auto">
+                  <input type="checkbox" id="ssml">
+                  <label class="ml-1" for="ssml">SSML</label>
+                </div>
+                <div class="col-auto">
+                    <button id="download" class="btn btn-sm btn-success" title="Download more voices" hidden>Download</button>
+                </div>
+            </div>
+            <div id="audio-message" class="row mt-3" hidden>
+                <div class="col">
+                    <audio id="audio" preload="none" controls autoplay hidden></audio>
+                    <p id="message"></p>
+                </div>
+            </div>
+            <div id="more-settings" hidden>
+                <div class="row mt-3">
+                    <div class="col-auto">
+                        <label for="denoiser-strength" title="Denoiser strength (0 to disable)">Denoiser:</label>
+                        <input type="number" id="denoiser-strength" name="denoiser" size="5" min="0" max="1" step="0.001" value="0.005">
+                        <label for="noise-scale" class="ml-2" title="Voice volatility">Noise:</label>
+                        <input type="number" id="noise-scale" name="noiseScale" size="5" min="0" max="1" step="0.001" value="0.667">
+                        <label for="length-scale" class="ml-2" title="Voice speed (< 1 is faster)">Length:</label>
+                        <input type="number" id="length-scale" name="lengthScale" size="5" min="0" step="0.001" value="1">
+                    </div>
+                </div>
+                <div class="row mt-3">
+                    <div class="col">
+                        <a href="javascript:showHideSettings()">Less &#9206;</a>
+                    </div>
+                </div>
+                <div class="row mt-3 mb-3">
+                    <div class="col text-center">
+                        <table id="phoneme-table" class="table">
+                            <thead>
+                                <th>
+                                    <a href="https://en.wikipedia.org/wiki/International_Phonetic_Alphabet">IPA</a>
+                                </th>
+                                <th>Example</th>
+                                <th>Audio</th>
+                            </thead>
+                            <tbody>
+                            </tbody>
+                        </table>
+                        <br>
+                        <div class="text-muted">
+                            Phonemes sounds from <a href="https://www.ipachart.com/" target="_blank" title="IPA chart with sounds">IPA chart</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row mt-3">
+                <div class="col">
+                    <a id="more-settings-link" href="javascript:showHideSettings()">More &#9207;</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bootstrap core JavaScript -->
+        <script>
+         var lastPhonemeLanguage = ''
+         var voicesInfo = {}
+
+         function q(selector) {return document.querySelector(selector)}
+         q('#text').focus()
+
+         function do_tts(e) {
+             text = q('#text').value
+             if (text) {
+                 q('#message').textContent = 'Synthesizing...'
+                 q('#speak-button').disabled = true
+                 q('#audio').hidden = true
+                 synthesize(text)
+             }
+             e.preventDefault()
+             return false
+         }
+
+         q('#speak-button').addEventListener('click', do_tts)
+
+         function get_language() {
+             var voiceList = q('#voice-list')
+             var voice = voiceList.options[voiceList.selectedIndex].value
+             var language = voice.split('/')[0]
+
+             return language
+         }
+
+         async function synthesize(text) {
+             var voiceList = q('#voice-list')
+             var voice = voiceList.options[voiceList.selectedIndex].value
+
+             var vocoderList = q('#vocoder-list')
+             var vocoder = vocoderList.options[vocoderList.selectedIndex].value
+             var denoiserStrength = q('#denoiser-strength').value || '0'
+             var noiseScale = q('#noise-scale').value || '0.667'
+             var lengthScale = q('#length-scale').value || '1.0'
+             var ssml = q('#ssml').value || 'false'
+
+             q('#audio-message').hidden = false
+
+             var startTime = performance.now()
+
+             res = await fetch(
+                 'api/tts?text=' + encodeURIComponent(text) +
+                 '&voice=' + encodeURIComponent(voice) +
+                 '&vocoder=' + encodeURIComponent(vocoder) +
+                 '&denoiserStrength=' + encodeURIComponent(denoiserStrength) +
+                 '&noiseScale=' + encodeURIComponent(noiseScale) +
+                 '&lengthScale=' + encodeURIComponent(lengthScale) +
+                 '&ssml=' + encodeURIComponent(ssml),
+                 {cache: 'no-cache'})
+
+             if (res.ok) {
+                 blob = await res.blob()
+                 var elapsedTime = performance.now() - startTime
+
+                 q('#message').textContent = (elapsedTime / 1000) + ' second(s)'
+                 q('#speak-button').disabled = false
+                 q('#audio').src = URL.createObjectURL(blob)
+                 q('#audio').hidden = false
+             } else {
+                 message = await res.text()
+                 q('#message').textContent = message
+                 q('#speak-button').disabled = false
+             }
+         }
+
+         function voiceChanged() {
+             var voiceList = q('#voice-list')
+             var info = voicesInfo[voiceList.options[voiceList.selectedIndex].value]
+
+             q('#speak-button').disabled = !info.downloaded
+             q('#download').hidden = info.downloaded
+             q('#download').disabled = false
+
+             // Reset audio
+             q('#audio-message').hidden = true
+             q('#message').textContent = ''
+             q('#audio').hidden = true
+             q('#audio').autoplay = true
+
+             if ((!info.downloaded) && (info.sample_url.length > 0)) {
+                 // Show sample audio
+                 q('#audio-message').hidden = false
+                 q('#message').textContent = 'Sample'
+                 q('#audio').hidden = false
+                 q('#audio').autoplay = false
+                 q('#audio').src = info.sample_url
+             }
+
+             loadPhonemes()
+         }
+
+         q('#voice-list').addEventListener('change', voiceChanged)
+
+         function loadVoices() {
+             voicesInfo = {}
+             q('#download').hidden = true
+
+             // Remove previous voices
+             var voiceList = q('#voice-list')
+             for (var i = voiceList.options.length - 1; i >= 0; i--) {
+                 voiceList.options[i].remove()
+             }
+
+             fetch('api/voices')
+                 .then(function(res) {
+                     if (!res.ok) throw Error(res.statusText)
+                     return res.json()
+                 }).then(function(voices) {
+                     voicesInfo = voices
+
+                     // Populate select
+                     var indexToSelect = -1
+
+                     Object.entries(voices).forEach(function(id_voice, idx) {
+                         var id = id_voice[0]
+                         var name = id
+
+                         if (id_voice[1].downloaded) {
+                             name = '* ' + name
+
+                             if (indexToSelect < 0) {
+                                 indexToSelect = idx
+                             } else {
+                                 indexToSelect = Math.min(idx, indexToSelect)
+                             }
+                         }
+
+                         voiceList.insertAdjacentHTML(
+                             'beforeend', '<option value="' + id + '">' + name + '</option>'
+                         )
+                     })
+
+                     if (voiceList.selectedIndex != indexToSelect) {
+                         voiceList.selectedIndex = indexToSelect
+                         voiceChanged()
+                     }
+                 }).catch(function(err) {
+                     q('#message').textContent = 'Error: ' + err.message
+                     q('#speak-button').disabled = false
+                 })
+         }
+
+         function loadPhonemes() {
+             var language = get_language()
+             if (language == lastPhonemeLanguage) {
+                 return
+             }
+
+             lastPhonemeLanguage = language
+
+             fetch('api/phonemes?language=' + encodeURIComponent(language))
+                 .then(function(res) {
+                     if (!res.ok) throw Error(res.statusText)
+                     return res.json()
+                 }).then(function(phonemes) {
+                     var newBody = document.createElement('tbody')
+                     var oldBody = q('#phoneme-table').getElementsByTagName('tbody')[0]
+
+                     Object.entries(phonemes).forEach(function(phoneme_info) {
+
+                         var phoneme = phoneme_info[0]
+                         var info = phoneme_info[1]
+                         var example = info.example
+                         var url = info.url || ''
+
+                         var tr = document.createElement('tr')
+                         var tdPhoneme = document.createElement('td')
+                         var tdAudio = document.createElement('td')
+
+                         tdPhoneme.textContent = phoneme
+
+                         if (url.length > 0) {
+                             // Audio example
+                             tdAudio.innerHTML = '<audio controls src="' + url + '"></audio>'
+                         }
+
+                         var tdExample = document.createElement('td')
+                         tdExample.textContent = example
+
+                         tr.appendChild(tdPhoneme)
+                         tr.appendChild(tdExample)
+                         tr.appendChild(tdAudio)
+                         newBody.appendChild(tr)
+                     })
+
+                     oldBody.parentNode.replaceChild(newBody, oldBody)
+                 }).catch(function(err) {
+                     q('#message').textContent = 'Error: ' + err.message
+                     q('#speak-button').disabled = false
+                 })
+         }
+
+         function showHideSettings() {
+             var moreSettings = q('#more-settings')
+             var moreSettingsLink = q('#more-settings-link')
+
+             if (moreSettings.hidden) {
+                 // Show
+                 moreSettings.hidden = false
+                 moreSettingsLink.hidden = true
+             } else {
+                 // Hide
+                 moreSettings.hidden = true
+                 moreSettingsLink.hidden = false
+             }
+         }
+
+         q('#download').addEventListener('click', function() {
+             var voiceList = q('#voice-list')
+             var info = voicesInfo[voiceList.options[voiceList.selectedIndex].value]
+
+             if (info.downloaded) {
+                 return
+             }
+
+             q('#audio-message').hidden = false
+             q('#download').disabled = true
+             q('#message').textContent = 'Downloading ' + info.id
+
+             fetch('api/download?id=' + encodeURIComponent(info.id))
+                 .then(function(res) {
+                     if (!res.ok) throw Error(res.statusText)
+                     return res.json()
+                 }).then(function() {
+                     // Set UI to downloaded state
+                     info.downloaded = true
+                     voiceList.options[voiceList.selectedIndex].text = '* ' + info.id
+                     q('#speak-button').disabled = false
+                     q('#download').hidden = true
+                     q('#download').disabled = false
+                     q('#audio').src = null
+                     q('#audio').autoplay = true
+                     q('#message').textContent = 'Finished ' + info.id
+                 }).catch(function(err) {
+                     q('#message').textContent = 'Error: ' + err.message
+                     q('#download').disabled = false
+                 })
+
+         })
+
+         window.addEventListener('load', function() {
+             loadVoices()
+         })
+        </script>
+
+    </body>
+
+</html>
