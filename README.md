@@ -2,7 +2,7 @@
  An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. Video coming soon.
 
 # Current Features as of 1.26.2023 (full setup):
- 1. Connects to expressive robot which syncs mouth movements with language model output ![1914_1_jpg](https://user-images.githubusercontent.com/5241499/214900213-4f4e0c39-f747-4ef7-ac8b-f32137187e3d.png)
+ 1. Connects to expressive robot which syncs mouth movements with language model output![1914_1_jpg](https://user-images.githubusercontent.com/5241499/214900838-5bad9e33-f242-4e08-ac9c-52aef2b11491.png)
 
  2. Robot speaks using Larynx running in a Docker container. [Github link](https://github.com/rhasspy/larynx)
  3. Robot intuitively listens for speech and does it's best to take turns. Speech recognition is done using Whisper ASR model(s) by OpenAI running in a Docker container. [Github link](https://github.com/openai/whisper)
