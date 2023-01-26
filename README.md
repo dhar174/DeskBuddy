@@ -2,7 +2,8 @@
  An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. Video coming soon.
 
 # Current Features as of 1.26.2023 (full setup):
- 1. Connects to expressive robot which syncs mouth movements with language model output
+ 1. Connects to expressive robot which syncs mouth movements with language model output ![1914_1_jpg](https://user-images.githubusercontent.com/5241499/214900213-4f4e0c39-f747-4ef7-ac8b-f32137187e3d.png)
+
  2. Robot speaks using Larynx running in a Docker container. [Github link](https://github.com/rhasspy/larynx)
  3. Robot intuitively listens for speech and does it's best to take turns. Speech recognition is done using Whisper ASR model(s) by OpenAI running in a Docker container. [Github link](https://github.com/openai/whisper)
  4. Main Language Model: Using the Pygmalion-6B model with 6-billion parameters. Inference working (albeit slowly) on single-node (desktop PC with 64GB RAM+   RTX 2080 Super 8GB VRAM) by utilizing Deepspeed Zero-3 inference with parameter offloading augmented by Huggingface Accelerate launcher. 
@@ -12,7 +13,7 @@
 # Feature and Update Roadmap, Definites (in order of priority):
  1. More efficient hardware utilization!!
  
- 2. A complex and swiftly evolving plan for context understanding and real-time synthesis of contextual information. A VERY preliminary idea-map can be seen   [here](https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png) ![alt text] ([https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png] "Idea Map for Context Integration")
+ 2. A complex and swiftly evolving plan for context understanding and real-time synthesis of contextual information. A VERY preliminary idea-map can be seen   [here](https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png) ![Idea Map for Context Integration](https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png)
  
   This will include an integration of a variety of low-compute classifier steps. Not only will this allow for better understanding of context and the ability to gauage appropriateness of responses, it will also allow for performance improvement by passing certain narrow-domain tasks to much smaller fine-tuned text generation models. 
   New classification steps which may lead to different models or different prompting may include:
