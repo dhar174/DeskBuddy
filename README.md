@@ -12,7 +12,7 @@
 # Feature and Update Roadmap, Definites (in order of priority):
  1. More efficient hardware utilization!!
  
- 2. A complex and swiftly evolving plan for context understanding and real-time synthesis of contextual information. A VERY preliminary idea-map can be seen   [here](https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png) ![alt text] (https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png "Idea Map for Context Integration")
+ 2. A complex and swiftly evolving plan for context understanding and real-time synthesis of contextual information. A VERY preliminary idea-map can be seen   [here](https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png) ![alt text] ([https://github.com/dhar174/DeskBuddy/blob/main/assets/User_Input_Prompt.png] "Idea Map for Context Integration")
  
   This will include an integration of a variety of low-compute classifier steps. Not only will this allow for better understanding of context and the ability to gauage appropriateness of responses, it will also allow for performance improvement by passing certain narrow-domain tasks to much smaller fine-tuned text generation models. 
   New classification steps which may lead to different models or different prompting may include:
