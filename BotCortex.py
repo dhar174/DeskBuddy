@@ -325,7 +325,7 @@ async def init_medium_with_history():
     datasets.utils.logging.set_verbosity_warning()
     transformers.utils.logging.set_verbosity_info()
     start_time = time.time()
-    ds_config = await dsconfig()
+    ds_config = await dsconfig("Medium")
     await set_deepspeed_activation_checkpointing(ds_config)
 
     dschf = HfDeepSpeedConfig(ds_config)
@@ -453,7 +453,7 @@ async def init():
     # # model = AutoModelForCausalLM.from_pretrained(
     # #     "PygmalionAI/pygmalion-6b", use_cache=True, pad_token_id=tokenizer.eos_token_id)
     # # with init_empty_weights():
-    ds_config = await dsconfig()
+    ds_config = await dsconfig("Large")
     await set_deepspeed_activation_checkpointing(ds_config)
 
     dschf = HfDeepSpeedConfig(ds_config)
@@ -693,6 +693,7 @@ async def classify_input(text):
         print("NEEDS FOLLOW UP \n")
         start_time = time.time()
         question = await helpers.get_follow_up_question(text)
+        print("Follow up question: ", question)
         print("time to generate followup question: "+str(time.time()-start_time))
 
         if (question == ""):

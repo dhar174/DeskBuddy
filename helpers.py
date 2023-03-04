@@ -169,7 +169,7 @@ async def get_follow_up_question(txt):
     context = qgen_tokenizer.encode(txt, return_tensors="pt")
     if qgen_model is not None:
         question = qgen_model.generate(
-            context, max_length=32, early_stopping=True, return_tensors="pt")
+            context, max_length=64, early_stopping=True)
         question = qgen_tokenizer.decode(question[0])
     return question
 
