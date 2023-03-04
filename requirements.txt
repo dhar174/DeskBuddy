@@ -1,5 +1,5 @@
 absl-py==1.4.0
-accelerate @ git+https://github.com/huggingface/accelerate.git@c3ea690d48c90599f83c6a305040d06c98e58a50
+-e git+ssh://git@github.com/dhar174/accelerate.git@bfe1e52b44491530cc56a5e9ea1ca28441c87c16#egg=accelerate
 aiohttp==3.8.3
 aiosignal==1.3.1
 alabaster==0.7.13
@@ -13,6 +13,7 @@ Babel==2.11.0
 backcall==0.2.0
 bitsandbytes==0.36.0.post2
 bitsandbytes-cuda117==0.30.1
+black==22.12.0
 blinker==1.4
 blis==0.7.9
 cachetools==5.3.0
@@ -35,7 +36,7 @@ cryptography==3.4.8
 cupy-cuda111==11.5.0
 cycler==0.11.0
 cymem==2.0.7
-datasets==2.8.0
+-e git+https://github.com/huggingface/datasets@c4a4f96ef0a4ec4b25f0872f160fa1eb9d2e711c#egg=datasets
 dateparser==1.1.4
 dbus-python==1.2.18
 decorator==5.1.1
@@ -52,9 +53,12 @@ evaluate==0.4.0
 exceptiongroup==1.1.0
 execnet==1.9.0
 executing==1.2.0
+fastjsonschema==2.16.2
 fastrlock==0.8.1
 ffmpeg-python==0.2.0
 filelock==3.9.0
+fixup==0.0.0
+flake8==6.0.0
 flatbuffers==23.1.21
 fonttools==4.38.0
 frozenlist==1.3.3
@@ -69,6 +73,7 @@ gruut==2.3.4
 gruut-ipa==0.13.0
 gruut-lang-en==2.0.0
 gTTS==2.3.0
+hf-doc-builder @ git+https://github.com/huggingface/doc-builder@c3e2c82ab738912f02cf9b0c1442a7aeef252297
 hjson==3.1.0
 httplib2==0.20.2
 huggingface-hub==0.11.1
@@ -79,14 +84,18 @@ imagesize==1.4.1
 importlib-metadata==5.1.0
 importlib-resources==5.10.1
 iniconfig==2.0.0
+InstructorEmbedding==1.0.0
 intel-extension-for-pytorch==1.13.0
 intel-openmp==2023.0.0
 ipython==8.8.0
+isort==5.12.0
 jedi==0.18.2
 jeepney==0.7.1
 Jinja2==3.1.2
 joblib==1.2.0
 jsonlines==1.2.0
+jsonschema==4.17.3
+jupyter_core==5.2.0
 keyboard==0.13.5
 keyring==23.5.0
 kiwisolver==1.4.4
@@ -94,11 +103,13 @@ langcodes==3.3.0
 launchpadlib==1.10.16
 lazr.restfulclient==0.14.4
 lazr.uri==1.0.6
+libcst==0.4.9
 lxml==4.9.1
 Markdown==3.4.1
 MarkupSafe==2.1.1
 matplotlib==3.6.3
 matplotlib-inline==0.1.6
+mccabe==0.7.0
 Megatron==0.5.1
 megatron-lm @ git+https://github.com/huggingface/Megatron-LM.git@100b522bb8044d98413398f9e71563af15b83325
 mkl==2023.0.0
@@ -108,7 +119,9 @@ mpmath==1.2.1
 multidict==6.0.4
 multiprocess==0.70.14
 murmurhash==1.0.9
-networkx==3.0rc1
+mypy-extensions==0.4.3
+nbformat==5.7.3
+networkx==2.8.8
 ninja==1.11.1
 nltk==3.8.1
 nodeenv==1.7.0
@@ -125,6 +138,7 @@ optimum==1.6.1
 packaging==23.0
 pandas==1.5.3
 parso==0.8.3
+pathspec==0.9.0
 pathtools==0.1.2
 pathy==0.10.1
 pexpect==4.8.0
@@ -152,10 +166,13 @@ pycodestyle==2.10.0
 pycparser==2.21
 pydantic==1.10.4
 pydub==0.25.1
+pyflakes==3.0.1
+pygame==2.1.3
 Pygments==2.14.0
 PyGObject==3.42.1
 PyJWT==2.3.0
 pyparsing==2.4.7
+pyrsistent==0.19.3
 pyserial==3.5
 pytest==7.2.1
 pytest-forked==1.4.0
@@ -178,6 +195,7 @@ scikit-learn==1.0.2
 scipy==1.7.3
 SecretStorage==3.3.1
 semantic-version==2.10.0
+sentence-transformers==2.2.2
 sentencepiece==0.1.97
 sentry-sdk==1.14.0
 setproctitle==1.3.2
@@ -225,6 +243,7 @@ transformers==4.26.0
 # Editable install with no version control (triton==1.0.0)
 -e /home/darf3/buddy/triton/python
 typer==0.7.0
+typing-inspect==0.8.0
 typing_extensions==4.4.0
 tzdata==2022.7
 tzlocal==4.2

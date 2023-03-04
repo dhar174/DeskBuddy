@@ -1,12 +1,12 @@
-import BlenderBot1b
+import BotCortex
 
 
 def main():
-    BlenderBot1b.init()
+    BotCortex.init()
     while True:
-        print("Enter a message to send to BlenderBot1b:")
+        print("Enter a message to send to BotCortex:")
         message = input()
-        print("BlenderBot1b: " + BlenderBot1b.talk_history(message))
+        print("BotCortex: " + str(BotCortex.talk_history(message)))
 
 
 if __name__ == "__main__":
