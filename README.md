@@ -73,8 +73,8 @@
  4. Distributed hardware, possibly single-board AI computers
  
  
- #Update 3/4/2023:
- ##Major changes:
+ # Update 3/4/2023:
+ ## Major changes:
    - Added a query database to enable quick access to previously asked or common questions with known answers  
    - Input Classification. Inputs are now being classified by various levels of classification, including the following:
                     1. Is it a question?
@@ -92,7 +92,7 @@
   - Added start_bot.py to start the process
   - Improved efficiency by using asynchronous functions
 
-##Still To Be Implemented: 
+## Still To Be Implemented: 
 - Online Web Search.
 - Expansion of context database to include data curated and categorized into facts about the main user, the bot itself, and other entities (meaning not just people but any concept, ie as used in relational database terminology) as well as the relations between them. I want to keep the implementation of this simple, but if it comes down to actually using SQL or similar, then I will. These databases will include facts about entities regarding: a. Their relations to other entities b. their relations to particular topics c. the sentiments and emotions associated between the entity and other entities or topics
 - Emotional and semantic classification of inputs
@@ -102,8 +102,8 @@
 - Add command structure. Commands will be of several types, including: a. IoT/smart home commands, from lights etc to calendar scheduling. b. Commands for operating the PC itself c. Generative commands, ie commands to generate particular content (including image generation on demand using Stable Diffusion)
 - Add "Productivity Sponsor" features, such as analysis of current screen activity to prompt user to remain productive (this feature is already at 80% completion).
 
-##Future Experimental Features/Additions: 
+## Future Experimental Features/Additions: 
       - Internal Dialogue: While currently compute resources force this one onto a backburner, in the future I would like to experiment with giving the bot it's own internal (context-aware) dialogue. According to my research, this may produce a convincing simulation of real-time awareness (assuming the compute is sufficient to run in real time!) 
      - Larger Models: Currently, my compute availability limits development involving the use of larger models. However, I would very much like to make this system scalable to any level of (minimally sufficient) hardware and cloud VMs so that capability can scale (in an automatic way) with the available hardware. So that the larger the hardware it is plugged into, the more intelligent the bot will be.
 
-###If anyone would like to assist me by providing material resources, please contact me. I will happily accept donations of hardware. Funding would also be welcome, though I am not directly seeking it. However, it would free me up for this project full-time.
+### If anyone would like to assist me by providing material resources, please contact me. I will happily accept donations of hardware. Funding would also be welcome, though I am not directly seeking it. However, it would free me up for this project full-time.
