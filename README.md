@@ -6,8 +6,13 @@
  Demo Video: 
 [![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
 
-Knowledge Retrieval: 
+Knowledge Retrieval:
+
 [![Knowledge retrieval](https://i.ytimg.com/vi/jCFAuBvSspw/hqdefault.jpg)](https://youtu.be/jCFAuBvSspw)
+
+Unexpected Behaviors:
+
+[![Unexpected Behavior](https://i.ytimg.com/vi/cHEibvkdpas/hqdefault.jpg)](https://youtu.be/cHEibvkdpas)
 
 
 # Current Features as of 1.26.2023 (full setup):
