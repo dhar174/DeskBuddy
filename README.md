@@ -7,7 +7,6 @@
 [![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
 
 Knowledge Retrieval: 
-https://youtu.be/jCFAuBvSspw
 [![Knowledge retrieval](https://i.ytimg.com/vi/jCFAuBvSspw/hqdefault.jpg)](https://youtu.be/jCFAuBvSspw)
 
 
