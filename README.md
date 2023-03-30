@@ -4,7 +4,7 @@
 # Introducing C.O.O.P.E.R.! 
  
  Video: 
-[![Watch the video](https://i.ytimg.com/vi/H64mSGG_VSI/maxresdefault.jpg)](https://youtu.be/H64mSGG_VSI)
+[![Watch the video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
 
 # Current Features as of 1.26.2023 (full setup):
  1. Connects to expressive robot which syncs mouth movements with language model output 
