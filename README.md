@@ -3,7 +3,8 @@
  
 # Introducing C.O.O.P.E.R.! 
  
- Demo Video: 
+Demo Video: 
+
 [![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
 
 Knowledge Retrieval:
