@@ -1,9 +1,15 @@
 # DeskBuddy
- An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. Video coming soon.
+ An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. 
+ 
+# Introducing C.O.O.P.E.R.! 
+ 
+ Video: 
+ <iframe width="560" height="315" src="https://www.youtube.com/embed/H64mSGG_VSI" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
 
 # Current Features as of 1.26.2023 (full setup):
  1. Connects to expressive robot which syncs mouth movements with language model output 
  ![1914_1_jpg](https://user-images.githubusercontent.com/5241499/214901149-a21d500d-7cf4-4355-add9-1259e847ce6f.png)
+
 
 
  2. Robot speaks using Larynx running in a Docker container. [Github link](https://github.com/rhasspy/larynx)
