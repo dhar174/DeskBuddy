@@ -10,23 +10,6 @@ Update May 02 2023:
 Fixed COOPER's lip syncing! It is not perfect. But it does sync to a good degree, mostly accurately! I think the limitations come from the robot hardware- the lip sync starts off well aligned and gets worse as it speaks longer (the longer the response, the more apparent this is)
 I have also added an online mode - the offline mode was always intended as a backup or alternative to spending money on API calls (and will continue being developed further as an import part of COOPER). COOPER now uses the gpt-3.5-turbo model using the OpenAI API for much improved intelligence and response times. Make no mistake about it though - COOPER is still COOPER, with the same cheeky attitude!
 
-Videos from May 02 update:
-[![Watch the first May02 video:](https://i.ytimg.com/vi/yGFjkPFfEbI/hqdefault.jpg)](https://youtu.be/yGFjkPFfEbI)
-[![Watch the second May02 video:](https://i.ytimg.com/vi/Rr-90R9IxZg/hqdefault.jpg)](https://youtu.be/Rr-90R9IxZg)
-[![Watch the third May02 video:](https://i.ytimg.com/vi/x-t9CHeG57U/hqdefault.jpg)](https://youtu.be/x-t9CHeG57U)
-[![Watch the fourth May02 video:](https://i.ytimg.com/vi/dnNIkHksL-g/hqdefault.jpg)](https://youtu.be/dnNIkHksL-g)
-
-Demo Video: 
-
-[![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
-
-Knowledge Retrieval:
-
-[![Knowledge retrieval](https://i.ytimg.com/vi/jCFAuBvSspw/hqdefault.jpg)](https://youtu.be/jCFAuBvSspw)
-
-Unexpected Behaviors:
-
-[![Unexpected Behavior](https://i.ytimg.com/vi/cHEibvkdpas/hqdefault.jpg)](https://youtu.be/cHEibvkdpas)
 
 
 # Current Features as of 1.26.2023 (full setup):
@@ -135,4 +118,26 @@ Unexpected Behaviors:
       - Internal Dialogue: While currently compute resources force this one onto a backburner, in the future I would like to experiment with giving the bot it's own internal (context-aware) dialogue. According to my research, this may produce a convincing simulation of real-time awareness (assuming the compute is sufficient to run in real time!) 
      - Larger Models: Currently, my compute availability limits development involving the use of larger models. However, I would very much like to make this system scalable to any level of (minimally sufficient) hardware and cloud VMs so that capability can scale (in an automatic way) with the available hardware. So that the larger the hardware it is plugged into, the more intelligent the bot will be.
 
-### If anyone would like to assist me by providing material resources, please contact me. I will happily accept donations of hardware. Funding would also be welcome, though I am not directly seeking it. However, it would free me up for this project full-time.
+### If anyone would like to assist me by providing material compute resources, please contact me. I will happily accept donations of hardware
+
+
+#Video Demonstrations
+
+##Videos from May 02 update:
+[![Watch the first May02 video:](https://i.ytimg.com/vi/yGFjkPFfEbI/hqdefault.jpg)](https://youtu.be/yGFjkPFfEbI)
+[![Watch the second May02 video:](https://i.ytimg.com/vi/Rr-90R9IxZg/hqdefault.jpg)](https://youtu.be/Rr-90R9IxZg)
+[![Watch the third May02 video:](https://i.ytimg.com/vi/x-t9CHeG57U/hqdefault.jpg)](https://youtu.be/x-t9CHeG57U)
+[![Watch the fourth May02 video:](https://i.ytimg.com/vi/dnNIkHksL-g/hqdefault.jpg)](https://youtu.be/dnNIkHksL-g)
+
+##Demo Video: 
+
+[![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
+
+Knowledge Retrieval:
+
+[![Knowledge retrieval](https://i.ytimg.com/vi/jCFAuBvSspw/hqdefault.jpg)](https://youtu.be/jCFAuBvSspw)
+
+Unexpected Behaviors:
+
+[![Unexpected Behavior](https://i.ytimg.com/vi/cHEibvkdpas/hqdefault.jpg)](https://youtu.be/cHEibvkdpas)
+
