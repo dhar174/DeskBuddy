@@ -8,7 +8,7 @@
 
 I cannot guarantee this will run for you on your own machine. This is still an alpha project, and I plan to provide better instructions for replication as well as a graphical model replacement of the robot (a 3D face, basically) so the robot will not be required to run this. Also, with the online mode, it may run on more diverse hardware. Also, the Larynx docker server is customized by me; it is almost ready to place here and is coming soon as of May 2 2023. These scripts will not run without my custom Larynx server scripts; as of May-3-23 I am more focused on developing COOPER and adding features than worrying about reproducibility and it probably won't run for you. But a version everyone can use IS COMING!!! :-)
 
-## **Videos of COOPER in action are at the bottom of the page!**
+### **Videos of COOPER in action are at the bottom of the page!**
 
 ## Update May 02 2023:
 Fixed COOPER's lip syncing! It is not perfect. But it does sync to a good degree, mostly accurately! I think the limitations come from the robot hardware- the lip sync starts off well aligned and gets worse as it speaks longer (the longer the response, the more apparent this is)
