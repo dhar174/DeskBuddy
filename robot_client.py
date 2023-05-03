@@ -8,20 +8,20 @@ PORT = 8888
 
 
 async def request_to_server(**kwargs):
-    print("Sending request to server...")
+    # print("Sending request to server...")
     reader, writer = await asyncio.open_connection(HOST, PORT)
 
     try:
 
         writer.write(pickle.dumps(kwargs))
         await writer.drain()
-        print("Request sent, waiting for response...")
+        # print("Request sent, waiting for response...")
         data = await reader.read(1024)
-        print("Response received")
+        # print("Response received")
         results = pickle.loads(data)
         writer.close()
         await writer.wait_closed()
-        print("Connection closed")
+        # print("Connection closed")
         return results
     except asyncio.TimeoutError:
         print("Server not responding within 5 seconds")

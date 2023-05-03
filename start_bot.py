@@ -2,6 +2,7 @@ import asyncio
 import helpers
 import time
 from scipy.io.wavfile import write
+
 # import sounddevice as sd
 import keyboard
 import whisper
@@ -21,6 +22,7 @@ import robot_client as rc
 
 button_text = ""
 
+local_only = True
 
 # async def button_clicked(text):
 #     global button_text
@@ -107,14 +109,11 @@ async def main():
     global lastMessage
     global priorMessage
     global reply
-    fast_button = tk.Button(
-        root, text="Fast", command=lambda: chose_fast())
-    small_button = tk.Button(
-        root, text="Small", command=lambda: chose_small())
-    medium_button = tk.Button(
-        root, text="Medium", command=lambda: chose_medium())
-    large_button = tk.Button(
-        root, text="Large", command=lambda: chose_large())
+    global local_only
+    fast_button = tk.Button(root, text="Fast", command=lambda: chose_fast())
+    small_button = tk.Button(root, text="Small", command=lambda: chose_small())
+    medium_button = tk.Button(root, text="Medium", command=lambda: chose_medium())
+    large_button = tk.Button(root, text="Large", command=lambda: chose_large())
 
     # Place the buttons in the main window
     fast_button.pack()
@@ -122,58 +121,76 @@ async def main():
     medium_button.pack()
     large_button.pack()
 
+    local_only_tk = tk.BooleanVar()
+    local_only_tk.set(True)
+    local_only_checkbox = tk.Checkbutton(
+        root, text="Local Only", variable=local_only_tk
+    )
+    local_only_checkbox.pack()
+
     # Start the main event loop
     root.mainloop()
-
-    await BotCortex.load_all_models(button_text)
+    local_only = local_only_tk.get()
+    await BotCortex.load_all_models(button_text, local_only)
     await helpers.load_models()
 
     while True:
-
         kwargs = {"function_name": "check_for_response"}
 
         while True:
-            if (user_response not in ["No transcription", "", None, message]):
+            if user_response not in ["No transcription", "", None, message]:
                 message = user_response
                 break
-            await asyncio.sleep(.1)
+            await asyncio.sleep(0.1)
 
             user_response = await rc.request_to_server(**kwargs)
-            print("waiting for response... "+user_response)
+            # print("waiting for response... "+user_response)
 
         message = user_response
         print("last message:" + lastMessage)
-        if (message != lastMessage and message != ""):
+        if message != lastMessage and message != "":
             print("server response2: " + user_response)
             user_response = ""
             priorMessage = lastMessage
             lastMessage = message
 
             print("User: " + message)
-            if (button_text == "Large"):
-                reply = str(await BotCortex.talk_history(message))
-            elif (button_text == "Small"):
-                reply = str(await BotCortex.talk_small(message))
-            elif (button_text == "Medium"):
-                reply = str(await BotCortex.talk_medium_with_history(message))
+            if local_only:
+                print("local only")
+                if button_text == "Large":
+                    reply = str(await BotCortex.talk_history(message))
+                elif button_text == "Small":
+                    reply = str(await BotCortex.talk_small(message))
+                elif button_text == "Medium":
+                    reply = str(await BotCortex.talk_medium_with_history(message))
+                else:
+                    reply = str(await BotCortex.talk_fast(message))
             else:
-                reply = str(await BotCortex.talk_fast(message))
+                print("not local only")
+                if button_text == "Large":
+                    reply = str(await BotCortex.talk_history(message))
+                elif button_text == "Small":
+                    reply = str(await BotCortex.talk_small(message))
+                elif button_text == "Medium":
+                    reply = str(await BotCortex.talk_medium_API_with_history(message))
+                else:
+                    reply = str(await BotCortex.talk_fast(message))
             reply = reply.replace(message, "")
             reply = reply.replace("\n", " ")
 
-            print("Cid: " + reply)
+            print("Cooper: " + reply)
             kwargs = {"function_name": "reply", "message": reply}
             while True:
-                if (message != ""):
+                if message != "":
                     try:
                         print("Sending kwargs:", kwargs)
                         results = await rc.request_to_server(**kwargs)
                         break
                     except:
                         print("Error sending message to server. Trying again...")
-                        await asyncio.sleep(.1)
+                        await asyncio.sleep(0.1)
                         continue
-        await asyncio.sleep(.1)
+        await asyncio.sleep(0.1)
 
 
 if __name__ == "__main__":
