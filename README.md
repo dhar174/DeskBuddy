@@ -2,7 +2,17 @@
  An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. 
  
 # Introducing C.O.O.P.E.R.! 
- 
+
+Update May 02 2023:
+Fixed COOPER's lip syncing! It is not perfect. But it does sync to a good degree, mostly accurately! I think the limitations come from the robot hardware- the lip sync starts off well aligned and gets worse as it speaks longer (the longer the response, the more apparent this is)
+I have also added an online mode - the offline mode was always intended as a backup or alternative to spending money on API calls (and will continue being developed further as an import part of COOPER). COOPER now uses the gpt-3.5-turbo model using the OpenAI API for much improved intelligence and response times. Make no mistake about it though - COOPER is still COOPER, with the same cheeky attitude!
+
+Videos from May 02 update:
+[![Watch the first May02 video:](https://i.ytimg.com/vi/yGFjkPFfEbI/hqdefault.jpg)](https://youtu.be/yGFjkPFfEbI)
+[![Watch the second May02 video:](https://i.ytimg.com/vi/Rr-90R9IxZg/hqdefault.jpg)](https://youtu.be/Rr-90R9IxZg)
+[![Watch the third May02 video:](https://i.ytimg.com/vi/x-t9CHeG57U/hqdefault.jpg)](https://youtu.be/x-t9CHeG57U)
+[![Watch the fourth May02 video:](https://i.ytimg.com/vi/dnNIkHksL-g/hqdefault.jpg)](https://youtu.be/dnNIkHksL-g)
+
 Demo Video: 
 
 [![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
