@@ -4,7 +4,9 @@
 # Introducing C.O.O.P.E.R.! 
 
 
-## Replication Disclaimer: I cannot guarantee this will run for you on your own machine. This is still an alpha project, and I plan to provide better instructions for replication as well as a graphical model replacement of the robot (a 3D face, basically) so the robot will not be required to run this. Also, with the online mode, it may run on more diverse hardware. Also, the Larynx docker server is customized by me; it is almost ready to place here and is coming soon as of May 2 2023. These scripts will not run without my custom Larynx server scripts; as of May-3-23 I am more focused on developing COOPER and adding features than worrying about reproducibility and it probably won't run for you. But a version everyone can use IS COMING!!! :-)
+## Replication Disclaimer: 
+
+I cannot guarantee this will run for you on your own machine. This is still an alpha project, and I plan to provide better instructions for replication as well as a graphical model replacement of the robot (a 3D face, basically) so the robot will not be required to run this. Also, with the online mode, it may run on more diverse hardware. Also, the Larynx docker server is customized by me; it is almost ready to place here and is coming soon as of May 2 2023. These scripts will not run without my custom Larynx server scripts; as of May-3-23 I am more focused on developing COOPER and adding features than worrying about reproducibility and it probably won't run for you. But a version everyone can use IS COMING!!! :-)
 
 ## **Videos of COOPER in action are at the bottom of the page!**
 
