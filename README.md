@@ -125,15 +125,15 @@ I have also added an online mode - the offline mode was always intended as a bac
 ### If anyone would like to assist me by providing material compute resources, please contact me. I will happily accept donations of hardware
 
 
-#Video Demonstrations
+# Video Demonstrations
 
-##Videos from May 02 update:
+## Videos from May 02 update:
 [![Watch the first May02 video:](https://i.ytimg.com/vi/yGFjkPFfEbI/hqdefault.jpg)](https://youtu.be/yGFjkPFfEbI)
 [![Watch the second May02 video:](https://i.ytimg.com/vi/Rr-90R9IxZg/hqdefault.jpg)](https://youtu.be/Rr-90R9IxZg)
 [![Watch the third May02 video:](https://i.ytimg.com/vi/x-t9CHeG57U/hqdefault.jpg)](https://youtu.be/x-t9CHeG57U)
 [![Watch the fourth May02 video:](https://i.ytimg.com/vi/dnNIkHksL-g/hqdefault.jpg)](https://youtu.be/dnNIkHksL-g)
 
-##Older videos
+## Older videos
 
 He can see!: 
 
