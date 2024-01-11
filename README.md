@@ -139,7 +139,7 @@ I have also added an online mode - the offline mode was always intended as a bac
 
 ##Long Demo Video: 
 
-[![Watch the demo video](https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
+[![Watch the demo video][(https://i.ytimg.com/vi/H64mSGG_VSI/hqdefault.jpg)](https://youtu.be/H64mSGG_VSI)
 
 Knowledge Retrieval:
 
