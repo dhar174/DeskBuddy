@@ -12,7 +12,7 @@ I cannot guarantee this will run for you on your own machine. This is still an a
 
 ## Update May 02 2023:
 Fixed COOPER's lip syncing! It is not perfect. But it does sync to a good degree, mostly accurately! I think the limitations come from the robot hardware- the lip sync starts off well aligned and gets worse as it speaks longer (the longer the response, the more apparent this is)
-I have also added an online mode - the offline mode was always intended as a backup or alternative to spending money on API calls (and will continue being developed further as an import part of COOPER). COOPER now uses the gpt-3.5-turbo model using the OpenAI API for much improved intelligence and response times. Make no mistake about it though - COOPER is still COOPER, with the same cheeky attitude!
+I have also added an online mode - the offline mode was always intended as a backup or alternative to spending money on API calls (and will continue being developed further as an important part of COOPER). COOPER now uses the gpt-3.5-turbo model using the OpenAI API for much improved intelligence and response times. Make no mistake about it though - COOPER is still COOPER, with the same cheeky attitude!
 
 
 
