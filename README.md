@@ -1,7 +1,7 @@
 # DeskBuddy
- An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. 
+ An intelligent chatbot with context memory, emotional awareness, and question-answering capabilities that runs on local hardware. Cooper stands for Conversational Office Organizer and Personal Entertainment Robot.
  
-# Introducing C.O.O.P.E.R.! 
+# Introducing C.O.O.P.E.R.: Conversational Office Organizer and Personal Entertainment Robot!
 
 
 ## Replication Disclaimer: 
