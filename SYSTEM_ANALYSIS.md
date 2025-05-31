@@ -200,63 +200,63 @@ graph TD
 ## BotCortex.py - Simplified State Diagram
 ```mermaid
 stateDiagram-v2
-  %% --- composite states first ---------------------------------
-  state InputReceived_Classifying {
-    note right of InputReceived_Classifying
-      Uses helpers.py for classification:
-      • is_visual_question()
-      • needs_follow_up()
-      • is_question() & is_personal()
-    end note
-  }
+%% ---- composite states first ---------------------------------
+state "Input Received / Classifying" as IRC {
+  note right of IRC
+    Uses helpers.py for classification:
+    • is_visual_question()
+    • needs_follow_up()
+    • is_question() & is_personal()
+  end note
+}
 
-  state Processing_VisualQuestion {
-    note left of Processing_VisualQuestion
-      Involves:
-      • Image capture (URL or Picoh)
-      • VQA model (e.g., GIT)
-    end note
-  }
+state "Processing Visual Question" as PVQ {
+  note left of PVQ
+    Involves:
+    • Image capture (URL or Picoh)
+    • VQA model (e.g., GIT)
+  end note
+}
 
-  state Processing_FollowUpNeeded {
-    note right of Processing_FollowUpNeeded
-      Involves:
-      • Question-generation model
-    end note
-  }
+state "Processing Follow-up Needed" as PFU {
+  note right of PFU
+    Involves:
+    • Question-generation model
+  end note
+}
 
-  state Processing_MemoryQuery {
-    note left of Processing_MemoryQuery
-      Involves:
-      • Semantic search on question_file.json
-      • Sentence-Transformer embeddings
-    end note
-  }
+state "Processing Memory Query" as PMQ {
+  note left of PMQ
+    Involves:
+    • Semantic search on question_file.json
+    • Sentence-Transformer embeddings
+  end note
+}
 
-  state Processing_GeneralChat_LLM {
-    note right of Processing_GeneralChat_LLM
-      Involves:
-      • Primary LLM (local or cloud)
-      • Context: history, NER, summary, topics
-    end note
-  }
-  %% ------------------------------------------------------------
+state "Processing General Chat (LLM)" as PGC {
+  note right of PGC
+    Involves:
+    • Primary LLM (local or cloud)
+    • Context: history, NER, summary, topics
+  end note
+}
+%% --------------------------------------------------------------
 
-  [*] --> Idle_AwaitingInput
-  Idle_AwaitingInput --> InputReceived_Classifying : Input text received
+[*] --> Idle_AwaitingInput
+Idle_AwaitingInput --> IRC : "input text received"
 
-  InputReceived_Classifying --> Processing_VisualQuestion  : Classified as visual
-  InputReceived_Classifying --> Processing_FollowUpNeeded  : Needs follow-up
-  InputReceived_Classifying --> Processing_MemoryQuery     : Memory query
-  InputReceived_Classifying --> Processing_GeneralChat_LLM : General / fallback
+IRC --> PVQ : "Classified: visual"
+IRC --> PFU : "Classified: needs follow-up"
+IRC --> PMQ : "Classified: memory"
+IRC --> PGC : "Classified: general"
 
-  Processing_VisualQuestion  --> GeneratingResponse : VQA result
-  Processing_FollowUpNeeded  --> GeneratingResponse : Follow-up question
-  Processing_MemoryQuery     --> GeneratingResponse : Found / Not found
-  Processing_GeneralChat_LLM --> GeneratingResponse : LLM output
+PVQ --> GeneratingResponse : "VQA result"
+PFU --> GeneratingResponse : "follow-up question"
+PMQ --> GeneratingResponse : "found / not found"
+PGC --> GeneratingResponse : "LLM output"
 
-  GeneratingResponse --> ResponseReady      : Response finalised
-  ResponseReady      --> Idle_AwaitingInput : Response sent
+GeneratingResponse --> ResponseReady : "response finalised"
+ResponseReady --> Idle_AwaitingInput : "response sent"
 ```
 
 ## Key Data Structures
