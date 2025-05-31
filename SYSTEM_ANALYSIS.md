@@ -200,9 +200,7 @@ graph TD
 ## BotCortex.py - Simplified State Diagram
 ```mermaid
 stateDiagram-v2
-  [*] --> Idle_AwaitingInput
-  Idle_AwaitingInput --> InputReceived_Classifying : Input Text Received
-
+  %% --- composite states first ---------------------------------
   state InputReceived_Classifying {
     note right of InputReceived_Classifying
       Uses helpers.py for classification:
@@ -231,7 +229,7 @@ stateDiagram-v2
     note left of Processing_MemoryQuery
       Involves:
       • Semantic search on question_file.json
-      • Sentence Transformer for embeddings
+      • Sentence-Transformer embeddings
     end note
   }
 
@@ -242,8 +240,12 @@ stateDiagram-v2
       • Context: history, NER, summary, topics
     end note
   }
+  %% ------------------------------------------------------------
 
-  InputReceived_Classifying --> Processing_VisualQuestion  : Classified as Visual
+  [*] --> Idle_AwaitingInput
+  Idle_AwaitingInput --> InputReceived_Classifying : Input text received
+
+  InputReceived_Classifying --> Processing_VisualQuestion  : Classified: visual
   InputReceived_Classifying --> Processing_FollowUpNeeded  : Needs follow-up
   InputReceived_Classifying --> Processing_MemoryQuery     : Memory query
   InputReceived_Classifying --> Processing_GeneralChat_LLM : General / fallback
