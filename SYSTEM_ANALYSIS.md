@@ -245,7 +245,7 @@ stateDiagram-v2
   [*] --> Idle_AwaitingInput
   Idle_AwaitingInput --> InputReceived_Classifying : Input text received
 
-  InputReceived_Classifying --> Processing_VisualQuestion  : Classified: visual
+  InputReceived_Classifying --> Processing_VisualQuestion  : Classified as visual
   InputReceived_Classifying --> Processing_FollowUpNeeded  : Needs follow-up
   InputReceived_Classifying --> Processing_MemoryQuery     : Memory query
   InputReceived_Classifying --> Processing_GeneralChat_LLM : General / fallback
