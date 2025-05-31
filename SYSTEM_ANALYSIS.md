@@ -245,10 +245,10 @@ state "Processing General Chat (LLM)" as PGC {
 [*] --> Idle_AwaitingInput
 Idle_AwaitingInput --> IRC : "input text received"
 
-IRC --> PVQ : "Classified: visual"
-IRC --> PFU : "Classified: needs follow-up"
-IRC --> PMQ : "Classified: memory"
-IRC --> PGC : "Classified: general"
+IRC --> PVQ : "Classified visual"
+IRC --> PFU : "Classified needs follow-up"
+IRC --> PMQ : "Classified memory"
+IRC --> PGC : "Classified general"
 
 PVQ --> GeneratingResponse : "VQA result"
 PFU --> GeneratingResponse : "follow-up question"
