@@ -346,7 +346,6 @@ ResponseReady --> Idle_AwaitingInput : "response sent"
     *   **Purpose:** Part of the experimental `HierarchicalMemoryNetwork`, this is the learnable memory component used during the model's forward pass to store and recall information over turns in a dialogue.
 
 ## Deconstructive Analysis
-# Deconstructive Analysis of the Picoh Robot Assistant System
 
 This document provides a deconstructive analysis of the Picoh Robot Assistant system, based on its Python source code and previously generated architectural and flow diagrams.
 
