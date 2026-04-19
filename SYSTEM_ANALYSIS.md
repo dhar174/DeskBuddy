@@ -313,7 +313,7 @@ ResponseReady --> Idle_AwaitingInput : "response sent"
 *   **Data exchanged via `robot_client.py` and `buddy1.py` (TCP Server/Client)**
     *   **Location:** `robot_client.py`, `buddy1.py`
     *   **Structure:** Pickled Python dictionaries. The dictionary includes `function_name` (string) and optionally `message` (string) for calls from client to server. The server returns pickled results.
-    *   **Purpose:** Facilitates communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like getting transcriptions or sending text for Picoh to speak.
+    *   **Purpose:** Facilitates communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like getting transcriptions or sending text for Picoh to speak. **Security note:** Because `pickle` deserialization is unsafe with untrusted input, this TCP port must only be accessible to localhost or other fully trusted clients. If this interface could ever be reachable by untrusted systems or over a broader network, use a safer serialization format such as JSON instead of `pickle`.
 
 *   **`start_bot.message` / `start_bot.user_response`**
     *   **Location:** `start_bot.py`
