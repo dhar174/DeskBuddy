@@ -19,7 +19,7 @@ The system aims to provide a voice-interactive robot assistant experience throug
         *   **Follow-up Question Generation:** If the input is vague, it can generate a clarifying follow-up question using models like `voidful/context-only-question-generator` or OpenAI.
         *   **General Chat/LLM:** For other inputs, it leverages a primary Large Language Model (LLM). It maintains conversation history (`history` for local models, `history_nonlocal` for OpenAI) and can enrich the context with NER (Named Entity Recognition via spaCy), summaries (e.g., `philschmid/bart-large-cnn-samsum`), and topic extraction.
 5.  **Response Generation:** The selected AI model generates a text response.
-6.  **Text-to-Speech (TTS) & Robot Output:** The response from `BotCortex.py` is sent back to `start_bot.py`, then relayed to `buddy1.py` via an HTTP POST request to the `/reply` endpoint. `buddy1.py` uses Picoh's TTS capabilities (`picoh.say()`) to speak the response. `buddy1.py` also controls Picoh's motor movements (nods, turns, eye movements, lid blinks) to provide a more engaging interaction.
+6.  **Text-to-Speech (TTS) & Robot Output:** The response from `BotCortex.py` is sent back to `start_bot.py`, then relayed to `buddy1.py` using the same TCP+pickle request mechanism, with `function_name: "reply"` and `message: reply`. `buddy1.py` uses Picoh's TTS capabilities (`picoh.say()`) to speak the response. `buddy1.py` also controls Picoh's motor movements (nods, turns, eye movements, lid blinks) to provide a more engaging interaction.
 
 **Major Components & Interactions:**
 
