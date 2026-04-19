@@ -52,6 +52,7 @@
     *   **Location:** `robot_client.py`, `buddy1.py`
     *   **Structure:** Pickled Python dictionaries. The dictionary includes `function_name` (string) and optionally `message` (string) for calls from client to server. The server returns pickled results.
     *   **Purpose:** Facilitates communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like getting transcriptions or sending text for Picoh to speak.
+    *   **Security warning:** Because this protocol uses Python `pickle` over TCP, it must only be used on a trusted network (for example, localhost or a private, isolated network) and must not be exposed to untrusted clients. Unpickling data from untrusted sources can lead to arbitrary code execution. If remote access is required, replace `pickle` with a safer serialization format such as JSON.
 
 *   **`start_bot.message` / `start_bot.user_response`**
     *   **Location:** `start_bot.py`
