@@ -51,7 +51,7 @@ graph TD
     style start_bot_py fill:#lightgreen,stroke:#333,stroke-width:2px
     style BotCortex_py fill:#orange,stroke:#333,stroke-width:2px
     style helpers_py fill:#yellow,stroke:#333,stroke-width:2px
-    style AI_Models fill:#purple,stroke:#333,stroke-width:2px,color:white
+    style AI_Models fill:#800080,stroke:#333,stroke-width:2px,color:white
     style External_Services fill:#red,stroke:#333,stroke-width:2px,color:white
     style question_file_json fill:#pink,stroke:#333,stroke-width:2px
     style dialogue_management_py fill:#beige,stroke:#333,stroke-width:2px
