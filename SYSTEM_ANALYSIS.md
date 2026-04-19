@@ -357,7 +357,7 @@ The system aims to provide a voice-interactive robot assistant experience throug
 **Core Operation:**
 
 1.  **Voice Input:** The user interacts by speaking to the Picoh robot. The `buddy1.py` script, running as a server on a machine connected to Picoh (likely a Raspberry Pi or similar), captures audio via PyAudio when the spacebar is pressed.
-2.  **Speech-to-Text (STT):** The captured audio (`temp.wav`) is transcribed into text using the Whisper STT model within `buddy1.py`. This transcribed text is stored in the `lastTranscription` variable.
+2.  **Speech-to-Text (STT):** The captured audio, recorded to the path returned by `picoh.get_input_path()`, is transcribed into text using the Whisper STT model within `buddy1.py`. This transcribed text is stored in the `lastTranscription` variable.
 3.  **Client-Server Communication:** `start_bot.py`, the main application entry point with a Tkinter UI, runs `robot_client.py`. The client periodically polls `buddy1.py` (server) for new transcriptions using HTTP GET requests to the `/check_for_response` endpoint.
 4.  **Core Logic Processing:** Once `start_bot.py` receives new transcribed text, it passes this message to `BotCortex.py`. `BotCortex.py` is the brain of the system. It:
     *   Uses `helpers.py` to classify the input (e.g., is it a visual question, does it need a follow-up, is it a factual question for memory?).
