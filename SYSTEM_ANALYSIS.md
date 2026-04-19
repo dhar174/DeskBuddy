@@ -78,7 +78,7 @@ sequenceDiagram
     buddy1->>buddy1: Spacebar press triggers audio recording
     buddy1->>PicohHW: Start audio capture (Pyaudio)
     PicohHW-->>buddy1: Audio Stream
-    buddy1->>buddy1: Save audio to temp.wav
+    buddy1->>buddy1: Save audio to picoh.get_input_path()
     buddy1->>AIML_KB: Transcribe WAV to text (Whisper STT)
     AIML_KB-->>buddy1: lastTranscription (Text)
     deactivate buddy1
