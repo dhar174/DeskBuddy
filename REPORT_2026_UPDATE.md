@@ -60,7 +60,7 @@ In 2026, Hugging Face `pipeline` and `AutoModelForCausalLM.from_pretrained` supp
 
 ### B. OpenAI API Migration
 As noted, `openai.ChatCompletion.create` will hard-crash with any OpenAI library >= 1.0.0.
-* **Fix**: Update `BotCortex.py` and `helpers.py` to instantiate `client = openai.AsyncOpenAI()` and use `await client.chat.completions.create(...)`.
+* **Fix**: Update `BotCortex.py` to instantiate `client = openai.AsyncOpenAI()` and use `await client.chat.completions.create(...)`. (All legacy `openai.ChatCompletion.create` and `openai.Completion.create` calls reside in `BotCortex.py`; `helpers.py` contains no `openai` usage.)
 
 ### C. Asynchronous Programming
 `BotCortex.py` heavily uses `asyncio`, but often blocks the event loop with synchronous HuggingFace model calls (e.g., `model.generate()`).
