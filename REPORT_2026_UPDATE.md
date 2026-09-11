@@ -14,7 +14,7 @@ The current `architecture.md` depicts an ecosystem running `BotCortex.py` via `s
 ### A. Python Version Upgrade (Python 3.14.5)
 The most recent stable version of Python as of May 2026 is **3.14.5**. Upgrading to Python 3.14 provides faster startup, significant memory optimizations (like tighter garbage collection), improved multithreading for concurrent tasks in `BotCortex.py`, and far better debugger interfaces.
 
-* **Action**: Update local development environments and Dockerfiles (e.g., `larynx.Dockerfile`) to pull from `python:3.14-slim` or equivalent.
+* **Action**: Update local development environments and Dockerfiles. For larynx.Dockerfile, consider upgrading the base image to a newer Debian/Ubuntu release that natively supports modern Python versions, or compile Python 3.14 from source to preserve the Debian packaging environment.
 * **Code Adjustments**: Some APIs (like `asyncio` loop handling, typing annotations) have evolved since Python 3.9/3.10. Code will need to leverage native deferred typing and check `asyncio.TaskGroup` for concurrency in `BotCortex.py` and `robot_client.py`.
 
 ### B. LLM Upgrades (Replacing Pygmalion)
@@ -41,12 +41,12 @@ The `requirements.txt` is heavily locked to early-2023 packages. Most importantl
 
 ### Quality of Life & Helper Libraries
 * **Bitsandbytes**: Upgrade from `0.36.0` to latest (e.g., `>0.43.0`) for native 4-bit/8-bit support without manual compilation issues. Remove `bitsandbytes-cuda117`.
-* **CUDA Toolkits**: Switch from `cu11` specific bindings (like `nvidia-cuda-runtime-cu11==11.7.99`) to PyTorch 2.12's native `cu130` wheel integrations to support Ada and Hopper generation GPUs natively.
-* **Sentence-Transformers**: Used for semantic search querying. Upgrade to the latest stable release (e.g., `2.7.x` or `3.x`) for better FAISS integrations and embedding efficiency.
+* **CUDA Toolkits**: Switch from cu11 specific bindings (like nvidia-cuda-runtime-cu11==11.7.99) to PyTorch's native cu121 or cu124 wheel integrations to support Ada and Hopper generation GPUs natively.
+* **Sentence-Transformers**: Although present in requirements.txt, it is not currently imported in BotCortex.py (which manually implements mean pooling using transformers). Upgrading to the latest stable release (e.g., 2.7.x or 3.x) presents an opportunity to refactor and simplify the manual embedding extraction code.
 * **OpenAI API**: The project uses an extremely old `openai` pattern (`openai.ChatCompletion.create`). This needs to be rewritten to the modern `openai>=1.0.0` client instantiation standard (`client = OpenAI(api_key=...); client.chat.completions.create(...)`).
 
 ### Cleanup
-* Remove hardcoded local paths (e.g., `-e /home/darf3/buddy/triton/python` and `/home/darf3/buddy/offload`).
+* Remove hardcoded local paths in requirements.txt (e.g., -e /home/darf3/buddy/triton/python). Hardcoded paths in BotCortex.py (such as /home/darf3/buddy/offload) should be refactored to use environment variables or dynamic temporary directories.
 * Remove `intel-extension-for-pytorch` unless explicitly running on Intel Arc hardware, as PyTorch 2.x covers CPU optimizations much better now.
 
 ---
@@ -69,4 +69,4 @@ As noted, `openai.ChatCompletion.create` will hard-crash with any OpenAI library
 ---
 
 ## Conclusion
-The upgrade to 2026 standards represents a significant leap from the 2023 baseline. By moving to Python 3.14, replacing GPT-J architecture with modern counterparts like Llama 3/Phi-3, updating PyTorch to 2.12+, and stripping out brittle custom DeepSpeed code in favor of native Accelerate `device_map="auto"`, COOPER will see drastically improved reasoning, generation speed, and stability, with a lower VRAM overhead.
+The upgrade to 2026 standards represents a significant leap from the 2023 baseline. By moving to Python 3.14, replacing GPT-J architecture with modern counterparts like Llama 3/Phi-3, updating PyTorch to 2.12+, and stripping out brittle custom DeepSpeed code in favor of native Accelerate "device_map=auto", COOPER will see drastically improved reasoning, generation speed, and stability, with a lower VRAM overhead.
