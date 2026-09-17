@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "aas-core": {
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "npm exec --yes --ignore-scripts --package=agentic-awesome-skills@15.14.0 -- aas-mcp"
+      ],
+      "command": "C:\\Windows\\System32\\cmd.exe"
+    },
+	"archcore": {
+      "args": [
+		"mcp",
+        "--project",
+        "D:\\projects\\DeskBuddy"
+		],
+      "command": "C:\\Users\\darf3\\AppData\\Local\\Programs\\archcore-v0.5.7\\archcore.exe"
+    }
+  }
+}

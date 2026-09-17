@@ -1,0 +1,19 @@
+{
+  "mem0ry4ai": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "\"C:\\Users\\darf3\\AppData\\Local\\Programs\\Python\\Python312\\python.exe\" \"C:\\Users\\darf3\\mem0ry4ai\\hooks\\antigravity_pre_invocation.py\"",
+        "timeout": 30
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "\"C:\\Users\\darf3\\AppData\\Local\\Programs\\Python\\Python312\\python.exe\" \"C:\\Users\\darf3\\mem0ry4ai\\hooks\\antigravity_stop.py\"",
+        "timeout": 30
+      }
+    ]
+  }
+}
