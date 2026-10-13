@@ -3,22 +3,22 @@
 # from soft_embedding import SoftEmbedding
 import asyncio
 import json
+from deskbuddy.settings import SettingsError, load_settings
 from PIL import Image
 import cv2 as cv
 from transformers.models.gptj.modeling_gptj import GPTJBlock
 from deepspeed import OnDevice
 import deepspeed
-from transformers.deepspeed import (
+from transformers.utils import is_accelerate_available
+from transformers.integrations.deepspeed import (
+    HfDeepSpeedConfig,
     is_deepspeed_zero3_enabled,
-    is_accelerate_available,
     is_deepspeed_available,
 )
 from accelerate import Accelerator, DistributedType
 from accelerate import load_checkpoint_and_dispatch, dispatch_model, dispatch_model
 from transformers import AutoConfig, AutoModelForCausalLM, CONFIG_MAPPING, MODEL_MAPPING
 from accelerate import infer_auto_device_map, init_empty_weights
-import bitsandbytes as bnb
-import dialogue_management as dm
 import spacy
 from transformers import (
     BlenderbotTokenizer,
@@ -57,13 +57,8 @@ from accelerate.utils import get_max_memory, is_bf16_available
 import tempfile
 from accelerate import cpu_offload
 from accelerate import find_executable_batch_size
-from deepspeed.ops.transformer.inference import DeepSpeedTransformerInference
-from deepspeed.ops.sparse_attention import SparseSelfAttention
-from deepspeed import module_inject
-import deepspeed.module_inject as module_inject
 from transformers import pipeline
 import os
-from transformers.deepspeed import HfDeepSpeedConfig
 from accelerate import Accelerator
 import transformers
 import numpy as np
@@ -73,11 +68,6 @@ import openai
 
 unfound_answer = False
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-deepspeed.init_distributed("nccl")
-
-openai.api_key = os.getenv("API_KEY")
-
 
 # The list of named entities that the model should remember
 named_entities = []
@@ -180,6 +170,33 @@ search_tokenizer = None
 search_model = None
 
 
+def _max_memory_with_settings():
+    settings = load_settings()
+    memory = get_max_memory()
+    resolved_device = settings.torch_device(torch)
+    if resolved_device == "cpu":
+        memory = {"cpu": memory["cpu"]} if "cpu" in memory else {}
+    elif 0 in memory:
+        memory = {key: memory[key] for key in (0, "cpu") if key in memory}
+    limits = settings.resource_limits()
+    if limits is not None:
+        if resolved_device == "cpu":
+            limits = {key: value for key, value in limits.items() if key == "cpu"}
+        memory.update(limits)
+    return memory
+
+
+def _offload_path(settings=None):
+    settings = settings or load_settings()
+    if settings.offload_dir is None:
+        raise RuntimeError("No offload directory is configured")
+    return str(settings.offload_dir)
+
+
+def _openai_model_name():
+    return load_settings().openai_model
+
+
 async def load_all_models(button_text, local_only):
     global isquestion_tokenizer
     global isquestion_model
@@ -204,60 +221,70 @@ async def load_all_models(button_text, local_only):
     global search_tokenizer
     global search_model
     # global accelerator
+    provider = "local" if local_only else "openai"
+    settings = load_settings(overrides={"model_provider": provider})
+    if button_text == "Large":
+        settings.require_path("checkpoint_dir")
+        settings.require_path("tokenizer_dir")
+    settings.prepare_directories()
+    if provider == "openai":
+        openai.api_key = settings.openai_api_key.get_secret_value()
+    if button_text == "Large" or (provider == "openai" and button_text == "Medium"):
+        deepspeed.init_distributed("nccl")
     local_only_mode = local_only
     model_size = button_text
     print("Loading models...")
     print("button_text: ", button_text)
     start_time = time.time()
-    topic_tokenizer = AutoTokenizer.from_pretrained("knkarthick/TOPIC-DIALOGSUM")
+    topic_tokenizer = AutoTokenizer.from_pretrained(settings.topic_model_id)
 
-    topic_model = AutoModelForSeq2SeqLM.from_pretrained("knkarthick/TOPIC-DIALOGSUM")
+    topic_model = AutoModelForSeq2SeqLM.from_pretrained(settings.topic_model_id)
     print("topic model loaded")
 
     if local_only_mode:
         sumtokenizer = AutoTokenizer.from_pretrained(
-            "philschmid/bart-large-cnn-samsum", use_fast=True, truncation=True
+            settings.summary_model_id, use_fast=True, truncation=True
         )
 
-        nlp = spacy.load("en_core_web_trf")
+        nlp = spacy.load(settings.spacy_model_id)
         longsummarizer = AutoModelForSeq2SeqLM.from_pretrained(
-            "philschmid/bart-large-cnn-samsum"
+            settings.summary_model_id
         )
         shortsummarizer = AutoModelForSeq2SeqLM.from_pretrained(
-            "knkarthick/meeting-summary-samsum"
+            settings.short_summary_model_id
         )
         shortsummarizer.to("cpu")
         longsummarizer.to("cpu")
         optimizer = torch.optim.Adam(longsummarizer.parameters())
 
         titlesummarizer = AutoModelForSeq2SeqLM.from_pretrained(
-            "fabiochiu/t5-small-medium-title-generation"
+            settings.title_model_id
         )
         titlesummarizer.to("cpu")
         print("summarizers loaded")
     isquestion_tokenizer = AutoTokenizer.from_pretrained(
-        "shahrukhx01/question-vs-statement-classifier"
+        settings.question_classifier_model_id
     )
 
     isquestion_model = AutoModelForSequenceClassification.from_pretrained(
-        "shahrukhx01/question-vs-statement-classifier"
+        settings.question_classifier_model_id
     )
     print("question identifier model loaded")
     nli_classifier = pipeline(
-        model="valhalla/distilbart-mnli-12-3",
-        tokenizer="valhalla/distilbart-mnli-12-3",
+        model=settings.nli_model_id,
+        tokenizer=settings.nli_model_id,
         task="zero-shot-classification",
     )
     print("nli classifier loaded")
     command_tokenizer = AutoTokenizer.from_pretrained(
-        "gokuls/bert-tiny-Massive-intent-KD-BERT"
+        settings.command_model_id
     )
 
     command_classifier = AutoModelForSequenceClassification.from_pretrained(
-        "gokuls/bert-tiny-Massive-intent-KD-BERT"
+        settings.command_model_id
     )
     print("command classifier loaded")
-    nlp = spacy.load("en_core_web_trf")
+    nlp = spacy.load(settings.spacy_model_id)
 
     lda = LatentDirichletAllocation(n_components=10)
     if local_only_mode == True:
@@ -280,10 +307,10 @@ async def load_all_models(button_text, local_only):
             model, tokenizer = await init()
     if local_only_mode:
         qgen_tokenizer = AutoTokenizer.from_pretrained(
-            "voidful/context-only-question-generator"
+            settings.question_generator_model_id
         )
         qgen_model = AutoModelForSeq2SeqLM.from_pretrained(
-            "voidful/context-only-question-generator"
+            settings.question_generator_model_id
         )
 
         # search_tokenizer = AutoTokenizer.from_pretrained(
@@ -401,7 +428,7 @@ async def generate_summary(text):
         #     his.insert(0, system_message)
         # his.append(current_user_message)
         # print("history: " + str(history_nonlocal))
-        # response = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=his)
+        # response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
         # sum = response["choices"][0]["message"]["content"]
     # print(sum[0])
     # Decode the summary and return it
@@ -489,10 +516,18 @@ async def init_API_medium():
     global history_nonlocal
     global search_tokenizer
     global search_model
-    accelerator = Accelerator()
+    settings = load_settings()
+    settings.prepare_directories()
+    requested_device = settings.torch_device(torch)
+    accelerator = Accelerator(cpu=requested_device == "cpu")
+    if accelerator.device.type != requested_device:
+        raise SettingsError(
+            f"Accelerate selected {accelerator.device.type}, but DESKBUDDY_DEVICE "
+            f"requires {requested_device}"
+        )
 
-    model = "gpt-3.5-turbo"
-    print("API medium, gpt-3.5-turbo")
+    model = settings.openai_model
+    print("API medium, " + model)
     after_first = False
     print(os.getcwd())
     # with torch.cuda.amp.autocast():
@@ -501,11 +536,11 @@ async def init_API_medium():
     print(accelerator.state)
     device = accelerator.device
     search_tokenizer = AutoTokenizer.from_pretrained(
-        "sentence-transformers/all-mpnet-base-v2"
+        settings.embedding_model_id
     )
     with OnDevice(dtype="auto", device="meta"):
         search_model = AutoModel.from_pretrained(
-            "sentence-transformers/all-mpnet-base-v2"
+            settings.embedding_model_id
         )
 
     search_model.resize_token_embeddings(len(search_tokenizer))
@@ -533,9 +568,9 @@ async def init_API_medium():
         device_map=infer_auto_device_map(
             search_model,
             dtype=torch.float16,
-            max_memory={0: "7GiB", "cpu": "48GiB"},
+            max_memory=_max_memory_with_settings(),
         ),
-        offload_dir="/home/darf3/buddy/offload",
+        offload_dir=_offload_path(settings),
         offload_buffers=True,
     )
     accelerator.print("model loaded and dispatched successfully")
@@ -561,12 +596,21 @@ async def init_medium_with_history():
     global qgen_tokenizer
     global qgen_model
 
+    settings = load_settings()
+    checkpoint_dir = settings.require_path("checkpoint_dir")
+    settings.prepare_directories()
+    requested_device = settings.torch_device(torch)
     after_first = False
     print(os.getcwd())
     # with torch.cuda.amp.autocast():
     print(torch.cuda.is_available())
     print(torch.__version__)
-    accelerator = Accelerator()
+    accelerator = Accelerator(cpu=requested_device == "cpu")
+    if accelerator.device.type != requested_device:
+        raise SettingsError(
+            f"Accelerate selected {accelerator.device.type}, but DESKBUDDY_DEVICE "
+            f"requires {requested_device}"
+        )
     print(accelerator.state)
     device = accelerator.device
     accelerator.print(device)
@@ -592,23 +636,23 @@ async def init_medium_with_history():
         accelerator.print(get_max_memory())
         accelerator.print(is_bf16_available())
         model = AutoModelForCausalLM.from_pretrained(
-            "PygmalionAI/pygmalion-350m",
+            settings.medium_model_id,
             use_cache=True,
             offload_state_dict=True,
             output_attentions=True,
             output_hidden_states=True,
             low_cpu_mem_usage=False,
             torch_dtype="auto",
-            offload_folder="/home/darf3/buddy/offload",
+            offload_folder=_offload_path(settings),
         ).to(device)
     print("model loaded")
-    accelerator.load_state("checkpoint")
+    accelerator.load_state(str(checkpoint_dir))
     accelerator.state.deepspeed_plugin.deepspeed_config[
         "train_micro_batch_size_per_gpu"
     ] = 1
 
     tokenizer = AutoTokenizer.from_pretrained(
-        "PygmalionAI/pygmalion-350m",
+        settings.medium_model_id,
         use_fast=False,
         return_tensors="pt",
         padding_side="left",
@@ -626,9 +670,9 @@ async def init_medium_with_history():
             model,
             no_split_module_classes=["GPTJBlock"],
             dtype=torch.float16,
-            max_memory={0: "7GiB", "cpu": "48GiB"},
+            max_memory=_max_memory_with_settings(),
         ),
-        offload_dir="/home/darf3/buddy/offload",
+        offload_dir=_offload_path(settings),
         offload_buffers=True,
     )
     accelerator.print("model loaded and dispatched successfully")
@@ -885,8 +929,9 @@ async def query_memory(query):
 
 
 async def save_qdict_to_json(my_dict):
-    # Open the file for writing
-    with open("question_file.json", "w") as f:
+    settings = load_settings()
+    settings.prepare_directories()
+    with settings.data_path("question_file.json").open("w", encoding="utf-8") as f:
         # Save the key-value pairs to the file using JSON encoding
         json.dump(my_dict, f)
 
@@ -895,7 +940,10 @@ async def save_qdict_to_json(my_dict):
 
 
 async def load_qdict_from_json():
-    with open("question_file.json", "r") as f:
+    question_file = load_settings().data_path("question_file.json")
+    if not question_file.exists():
+        return {}
+    with question_file.open("r", encoding="utf-8") as f:
         # Load the key-value pairs from the file using JSON decoding
         my_dict = json.load(f)
         print("type:", type(my_dict))
@@ -917,12 +965,22 @@ async def init():
     global dschf
     global qgen_tokenizer
     global qgen_model
+    settings = load_settings()
+    checkpoint_dir = settings.require_path("checkpoint_dir")
+    tokenizer_dir = settings.require_path("tokenizer_dir")
+    settings.prepare_directories()
+    requested_device = settings.torch_device(torch)
     after_first = False
     print(os.getcwd())
     # with torch.cuda.amp.autocast():
     print(torch.cuda.is_available())
     print(torch.__version__)
-    accelerator = Accelerator()
+    accelerator = Accelerator(cpu=requested_device == "cpu")
+    if accelerator.device.type != requested_device:
+        raise SettingsError(
+            f"Accelerate selected {accelerator.device.type}, but DESKBUDDY_DEVICE "
+            f"requires {requested_device}"
+        )
     print(accelerator.state)
     device = accelerator.device
     accelerator.print(device)
@@ -985,20 +1043,18 @@ async def init():
         accelerator.print(get_max_memory())
         accelerator.print(is_bf16_available())
         model = GPTJForCausalLM.from_pretrained(
-            "./checkpoint",
+            str(checkpoint_dir),
             use_cache=True,
             offload_state_dict=True,
             output_attentions=True,
             output_hidden_states=True,
             low_cpu_mem_usage=False,
             torch_dtype="auto",
-            offload_folder="/home/darf3/buddy/offload",
+            offload_folder=_offload_path(settings),
         ).to(device)
     print("model loaded")
-    accelerator.load_state("checkpoint")
+    accelerator.load_state(str(checkpoint_dir))
 
-    # device_map = infer_auto_device_map(
-    #     model, no_split_module_classes=["GPTJBlock"], dtype=torch.half, max_memory={0: "7GiB",  "cpu": "48GiB"})
     # accelerator.print(device_map)
     # cpu_offload(
     #     model, execution_device=device, offload_buffers=True)
@@ -1018,7 +1074,7 @@ async def init():
     # accelerator.print("new model loaded successfully")
     # accelerator.print(new_model)
     tokenizer = AutoTokenizer.from_pretrained(
-        "./pygmalion-6b", use_fast=False, return_tensors="pt", padding_side="left"
+        str(tokenizer_dir), use_fast=False, return_tensors="pt", padding_side="left"
     )
 
     # vocab_file = "./pygmalion-6b/vocab.json"
@@ -1051,9 +1107,9 @@ async def init():
             model,
             no_split_module_classes=["GPTJBlock"],
             dtype=torch.float16,
-            max_memory={0: "7GiB", "cpu": "48GiB"},
+            max_memory=_max_memory_with_settings(),
         ),
-        offload_dir="/home/darf3/buddy/offload",
+        offload_dir=_offload_path(settings),
         offload_buffers=True,
     )
     accelerator.print("model loaded and dispatched successfully")
@@ -1105,11 +1161,7 @@ async def init():
     # accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = 1
 
     # accelerator.prepare(model, tokenizer)
-    # device_map = infer_auto_device_map(
-    #     model, no_split_module_classes=["GPTJBlock"], dtype=torch.half, max_memory={0: "4GiB",  "cpu": "40GiB"})
-    # accelerator.print(device_map)
-    # model = load_checkpoint_and_dispatch(
-    #     model, checkpoint="pygmalion-6b", device_map="auto", no_split_module_classes=["GPTJBlock"], offload_state_dict=True, dtype=torch.half, offload_folder="/home/darf3/buddy/main_model/offload", offload_buffers=True)
+    # Legacy checkpoint dispatch example removed; runtime paths come from settings.
     # ds_engine = deepspeed.initialize(model=model, config=ds_config)[0]
     # ds_model = ds_engine.module
     # accelerator.print(ds_model.device_map)
@@ -1162,10 +1214,7 @@ async def init():
     fp_sum = sumtokenizer.decode(fp_summary[0], skip_special_tokens=True)
     print("fp_sum")
     print(fp_sum + "\n")
-    vocab_file = "./pygmalion-6b/vocab.json"
     tokenizer.pad_token = tokenizer.eos_token
-
-    merge_file = "./pygmalion-6b/merges.txt"
 
     # inputs = tokenizer.encode(
     #     first_prompt, return_tensors="pt").to(device)
@@ -1285,7 +1334,9 @@ async def is_visual_q(txt):
     result = "\n".join(result)
     print("inp: ", result)
 
-    response = openai.Completion.create(prompt=result, model="text-curie-001")
+    response = openai.Completion.create(
+        prompt=result, model=load_settings().completion_model_id
+    )
     print("response: ", response)
     out = response["choices"][0]["text"]
     if "Response:" in out:
@@ -1343,7 +1394,7 @@ async def get_follow_up_question(txt, history):
         his.append(current_user_message)
 
         his.insert(0, system_message)
-        response = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=his)
+        response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
 
         question = response["choices"][0]["message"]["content"]
         print("followup question: ", question)
@@ -1446,12 +1497,16 @@ async def classify_input(text, history):
 
 
 async def save_history_verbatim(text):
-    with open("history_verbatim.txt", "w") as file:
+    settings = load_settings()
+    settings.prepare_directories()
+    with settings.data_path("history_verbatim.txt").open("w", encoding="utf-8") as file:
         file.write(text)
 
 
 async def save_history_summary(text):
-    with open("history_summary.txt", "a") as file:
+    settings = load_settings()
+    settings.prepare_directories()
+    with settings.data_path("history_summary.txt").open("a", encoding="utf-8") as file:
         file.write(text)
 
 
@@ -1799,14 +1854,15 @@ async def init_medium():
     global device
     print(torch.cuda.is_available())
     print(torch.__version__)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    settings = load_settings()
+    device = settings.torch_device(torch)
     print(device)
     print("Loading model medium blenderbot model...")
     # model = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
-    tokenizer = BlenderbotTokenizer.from_pretrained("facebook/blenderbot-400M-distill")
+    tokenizer = BlenderbotTokenizer.from_pretrained(settings.blenderbot_model_id)
 
     model = BlenderbotForConditionalGeneration.from_pretrained(
-        "facebook/blenderbot-400M-distill"
+        settings.blenderbot_model_id
     )
 
     model.to(device)
@@ -1828,7 +1884,7 @@ async def talk_medium_API_with_history(text):
     global history_nonlocal
     global asked_follow_up
     global unfound_answer
-    print("Using gpt-3.5-turbo model")
+    print("Using " + _openai_model_name() + " model")
     # print("history" + "\n")
     # for i in range(len(history_nonlocal)):
     #     print(str(history_nonlocal[i]) + "\n")
@@ -1879,7 +1935,7 @@ async def talk_medium_API_with_history(text):
 
         txt.insert(0, system_message)
         print("inp: ", txt)
-        response = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=txt)
+        response = openai.ChatCompletion.create(model=_openai_model_name(), messages=txt)
         print("response: ", response)
         out = response["choices"][0]["message"]["content"]
         if "Response:" in out:
@@ -1922,7 +1978,7 @@ async def talk_medium_API_with_history(text):
     # print(history_nonlocal)
     print("\n")
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo", messages=history_nonlocal
+        model=_openai_model_name(), messages=history_nonlocal
     )
     print(response)
     out = response["choices"][0]["message"]["content"]
@@ -2041,12 +2097,13 @@ async def init_small():
     global device
     print(torch.cuda.is_available())
     print(torch.__version__)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    settings = load_settings()
+    device = settings.torch_device(torch)
     print(device)
     # model = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
-    tokenizer = AutoTokenizer.from_pretrained("facebook/blenderbot_small-90M")
+    tokenizer = AutoTokenizer.from_pretrained(settings.small_model_id)
 
-    model = AutoModelForCausalLM.from_pretrained("facebook/blenderbot_small-90M")
+    model = AutoModelForCausalLM.from_pretrained(settings.small_model_id)
 
     model.to(device)
     return model, tokenizer
@@ -2088,14 +2145,15 @@ async def init_fast():
     print(torch.version.cuda)
     print(torch.__version__)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    settings = load_settings()
+    device = settings.torch_device(torch)
     print(device)
     # model = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
     tokenizer = AutoTokenizer.from_pretrained(
-        "microsoft/DialoGPT-large", padding_side="left"
+        settings.fast_model_id, padding_side="left"
     )
 
-    model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-large")
+    model = AutoModelForCausalLM.from_pretrained(settings.fast_model_id)
 
     model.to(device)
     return model, tokenizer
@@ -2216,9 +2274,8 @@ async def dsconfig(fr):
     return ds_config
 
 
-visionQA_processor = GitProcessor.from_pretrained("microsoft/git-large-vqav2")
-
-visionQA_model = GitForCausalLM.from_pretrained("microsoft/git-large-vqav2")
+visionQA_processor = None
+visionQA_model = None
 
 
 async def is_requesting_SD(txt):
@@ -2270,7 +2327,9 @@ async def is_requesting_SD(txt):
 
     result.insert(0, system_message)
     print("inp: ", result)
-    response = openai.ChatCompletion.create(model="curie", messages=result)
+    response = openai.ChatCompletion.create(
+        model=load_settings().sd_classifier_model_id, messages=result
+    )
     print("response: ", response)
     out = response["choices"][0]["message"]["content"]
     if "Response:" in out:
@@ -2290,12 +2349,24 @@ async def is_requesting_SD(txt):
 
 async def answer_visual_question(question):
     global accelerator
+    global visionQA_processor
+    global visionQA_model
+    settings = load_settings()
+    if settings.camera_source is None:
+        return "No camera or image source configured. Set DESKBUDDY_CAMERA_SOURCE."
     print(cv.__version__)
     try:
-        cam = cv.VideoCapture("http://192.168.0.191:56000/mjpeg")
-        await asyncio.sleep(1)
-
-        result, image = cam.read()
+        if isinstance(settings.camera_source, str) and "://" not in settings.camera_source:
+            image = cv.imread(settings.camera_source)
+            result = image is not None
+        else:
+            cam = cv.VideoCapture(settings.camera_source)
+            await asyncio.sleep(1)
+            result, image = cam.read()
+            cam.release()
+            cv.destroyAllWindows()
+        if not result or image is None:
+            return "No image found"
         print(question)
         # Define a transform that resizes, normalizes and converts the image to a tensor
 
@@ -2309,14 +2380,14 @@ async def answer_visual_question(question):
         image = image.convert("RGB")
         # image = transform(image)
 
-        cam.release()
-        # Destroy all the windows
-        cv.destroyAllWindows()
         # pygame.camera.init()
         # camlist = pygame.camera.list_cameras()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(settings.torch_device(torch))
         # device = torch.device("cpu")
         print("Device for VQA: " + str(device))
+        if visionQA_processor is None or visionQA_model is None:
+            visionQA_processor = GitProcessor.from_pretrained(settings.vision_model_id)
+            visionQA_model = GitForCausalLM.from_pretrained(settings.vision_model_id)
         visionQA_model.to(device)
         # Split the image into patches by reshaping and permuting the dimensions
         # patches = image.unfold(1, patch_size, patch_size).unfold(
@@ -2336,10 +2407,6 @@ async def answer_visual_question(question):
         # Check if cuda is available and move the image and model to cuda if yes
 
         # image = image.to(device)
-        if result:
-            pass
-        else:
-            return "No image found"
         pixel_values = visionQA_processor(
             images=image, return_tensors="pt"
         ).pixel_values

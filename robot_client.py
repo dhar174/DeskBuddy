@@ -1,10 +1,12 @@
 import socket
 import pickle
 import asyncio
+from deskbuddy.settings import load_settings
 
 # Connect to the TCP server and send a request
-HOST = '172.24.160.1'
-PORT = 8888
+_settings = load_settings()
+HOST = _settings.robot_host
+PORT = _settings.robot_port
 
 
 async def request_to_server(**kwargs):
