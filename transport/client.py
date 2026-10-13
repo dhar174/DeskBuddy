@@ -16,6 +16,7 @@ from transport.protocol import (
     CURRENT_PROTOCOL_VERSION,
     AuthenticationError,
     ExecutionOutcomeUnknown,
+    PayloadTooLargeError,
     ProtocolViolationError,
     RobotRequest,
     RobotResponse,
@@ -48,6 +49,7 @@ class RobotTransport(abc.ABC):
         *,
         timeout: float | None = None,
         side_effects: bool | None = None,
+        request_id: str | None = None,
     ) -> RobotResponse:
         """Send a command request and await the typed response."""
 
@@ -167,6 +169,7 @@ class RobotClient(RobotTransport):
         *,
         timeout: float | None = None,
         side_effects: bool | None = None,
+        request_id: str | None = None,
     ) -> RobotResponse:
         """Send an authenticated command and wait for a verified response.
 
@@ -201,8 +204,10 @@ class RobotClient(RobotTransport):
             if timeout is not None
             else self.config.connect_timeout + self.config.request_timeout
         )
+        lock_acquired = False
         try:
             await asyncio.wait_for(self._lock.acquire(), timeout=lock_timeout)
+            lock_acquired = True
         except asyncio.TimeoutError as exc:
             raise TransportError(
                 TransportErrorCode.TIMEOUT,
@@ -217,29 +222,23 @@ class RobotClient(RobotTransport):
                 nonlocal transmission_attempted, request
 
                 # Phase 2: Ensure connection (pre-transmission)
-                try:
-                    reader, writer = await self._ensure_connected()
-                except Exception as exc:
-                    if transmission_attempted:
-                        req_id = request.request_id if request else "unknown"
-                        raise ExecutionOutcomeUnknown(
-                            request_id=req_id,
-                            command=command,
-                            message=(
-                                f"Command '{command}' execution outcome is unknown: failed to reconnect "
-                                f"after transmission was already attempted: {exc}"
-                            ),
-                        ) from exc
-                    raise
+                reader, writer = await self._ensure_connected()
 
                 # Phase 3: Create and sign request IMMEDIATELY before transmission
                 request = RobotRequest.create(
                     command=command,
                     arguments=arguments,
                     protocol_version=CURRENT_PROTOCOL_VERSION,
+                    request_id=request_id,
                 )
                 sign_request(self.config.secret, request)
                 request_bytes = request.to_json().encode("utf-8")
+
+                if len(request_bytes) > self.config.max_payload_size:
+                    raise PayloadTooLargeError(
+                        TransportErrorCode.PAYLOAD_TOO_LARGE,
+                        f"Outgoing frame size {len(request_bytes)} exceeds maximum {self.config.max_payload_size}",
+                    )
 
                 if is_side_effecting:
                     # Side-effecting command: single transmission attempt, no blind retransmission
@@ -422,7 +421,8 @@ class RobotClient(RobotTransport):
                     f"Overall request timed out after {effective_timeout:.2f}s",
                 ) from exc
         finally:
-            self._lock.release()
+            if lock_acquired:
+                self._lock.release()
 
     # Domain convenience methods
     async def check_for_response(self, *, timeout: float | None = None) -> str:

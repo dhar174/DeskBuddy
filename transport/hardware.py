@@ -137,7 +137,11 @@ class HardwareExecutor:
                         self._unresolved_operation = None
                         op.unresolved = False
                     if not done_event.is_set():
-                        loop.call_soon_threadsafe(done_event.set)
+                        try:
+                            loop.call_soon_threadsafe(done_event.set)
+                        except RuntimeError:
+                            # Loop may be closed during tear-down
+                            pass
 
             future = self._thread_pool.submit(_worker)
 

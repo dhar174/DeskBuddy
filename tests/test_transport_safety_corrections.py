@@ -30,8 +30,6 @@ from transport import (
     ExecutionOutcomeUnknown,
     HardwareExecutor,
     RobotClient,
-    RobotRequest,
-    RobotResponse,
     RobotServer,
     TransportConfig,
     TransportError,
@@ -40,10 +38,10 @@ from transport import (
     validate_empty_arguments,
     validate_move_arguments,
     validate_reply_arguments,
+    validate_say_arguments,
     validate_timeout_override,
 )
-from transport.auth import sign_request
-from transport.framing import read_frame, write_frame
+from transport.framing import read_frame
 
 
 @pytest.fixture(autouse=True)
@@ -173,7 +171,7 @@ async def test_response_timeout_after_transmission_raises_execution_outcome_unkn
 async def test_signed_replay_rejection_surfaces_execution_outcome_unknown(
     ephemeral_server_config: TransportConfig,
 ):
-    """Verify replayed_request error response raises ExecutionOutcomeUnknown."""
+    """Verify replayed_request error response raises ExecutionOutcomeUnknown via RobotClient."""
     registry = CommandRegistry()
     registry.register("move", lambda args: "moved", validate_move_arguments)
     server = RobotServer(ephemeral_server_config, registry)
@@ -185,47 +183,25 @@ async def test_signed_replay_rejection_surfaces_execution_outcome_unknown(
             port=server.port,
             secret=ephemeral_server_config.secret,
         )
-        async with RobotClient(client_cfg):
-            # 1. First execution succeeds
-            req = RobotRequest.create("move", {"motor": 1, "position": 5.0})
-            sign_request(client_cfg.secret, req)
+        async with RobotClient(client_cfg) as client:
+            # 1. First execution succeeds with custom request_id
+            custom_id = "test-replay-uuid-456"
+            resp1 = await client.request(
+                "move", {"motor": 1, "position": 5.0}, request_id=custom_id
+            )
+            assert resp1.ok is True
+            assert resp1.result == "moved"
 
-            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-            try:
-                await write_frame(writer, req.to_json().encode("utf-8"))
-                resp1_raw = await read_frame(reader)
-                resp1 = RobotResponse.from_json(resp1_raw)
-                assert resp1.ok is True
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-            # 2. Second transmission with exact same request ID gets rejected as replay
-            # When client receives signed replayed_request, it raises ExecutionOutcomeUnknown
+            # 2. Second transmission with exact same request ID gets rejected as replay by server.
+            # Client receives signed replayed_request response and raises ExecutionOutcomeUnknown!
             with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
-                # Simulate replaying the exact request via client
-                reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
-                try:
-                    await write_frame(writer2, req.to_json().encode("utf-8"))
-                    resp2_raw = await read_frame(reader2)
-                    resp2 = RobotResponse.from_json(resp2_raw)
-                    assert resp2.ok is False
-                    assert resp2.error["code"] == TransportErrorCode.REPLAYED_REQUEST.value
-
-                    # If client received this response:
-                    if resp2.error.get("code") == TransportErrorCode.REPLAYED_REQUEST.value:
-                        raise ExecutionOutcomeUnknown(
-                            request_id=req.request_id,
-                            command="move",
-                            message="Replay rejected as duplicate.",
-                            code=TransportErrorCode.REPLAYED_REQUEST,
-                        )
-                finally:
-                    writer2.close()
-                    await writer2.wait_closed()
+                await client.request(
+                    "move", {"motor": 1, "position": 5.0}, request_id=custom_id
+                )
 
             assert exc_info.value.command == "move"
-            assert exc_info.value.request_id == req.request_id
+            assert exc_info.value.request_id == custom_id
+            assert exc_info.value.code == TransportErrorCode.REPLAYED_REQUEST
     finally:
         await server.stop()
 
@@ -236,17 +212,14 @@ async def test_signed_replay_rejection_surfaces_execution_outcome_unknown(
 @pytest.mark.asyncio
 async def test_failed_reconnection_after_transmission_raises_execution_outcome_unknown():
     """Verify that if reconnect fails after transmission was attempted, ExecutionOutcomeUnknown is raised."""
-    server_dropped = False
-
     async def fake_server_handler(reader, writer):
-        nonlocal server_dropped
         try:
             await read_frame(reader)
-            # Abruptly terminate and stop listening
-            server_dropped = True
         finally:
             writer.close()
             await writer.wait_closed()
+            # Shut down server listener so subsequent reconnect attempt fails with connection refused
+            srv.close()
 
     srv = await asyncio.start_server(fake_server_handler, "127.0.0.1", 0)
     port = srv.sockets[0].getsockname()[1]
@@ -256,15 +229,18 @@ async def test_failed_reconnection_after_transmission_raises_execution_outcome_u
         port=port,
         secret="test-secret-32-chars-long-auth-key!",
         request_timeout=1.0,
+        connect_timeout=0.2,
+        max_retries=1,
     )
     async with RobotClient(client_cfg) as client:
-        # Close server after reading so reconnection attempts fail
+        # Command with retry permitted (safe/idempotent). Attempt 0 transmits, server drops and closes.
+        # Attempt 1 attempts to reconnect, but server port is closed.
         with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
-            await client.move(1, 5.0)
+            await client.request("ping", {}, side_effects=False)
 
-        assert exc_info.value.command == "move"
+        assert exc_info.value.command == "ping"
         assert exc_info.value.request_id is not None
-        assert "execution outcome is unknown" in str(exc_info.value)
+        assert "failed to reconnect after transmission attempted" in str(exc_info.value)
 
     srv.close()
     await srv.wait_closed()
@@ -669,6 +645,156 @@ async def test_legacy_request_to_server_rejects_invalid_timeout_and_does_not_lea
         assert "timeout" not in received_args
         assert "request_timeout" not in received_args
         assert received_args == {"motor": 1, "position": 5.0}
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+# ==============================================================================
+# 13. Overall deadline expiration after transmission
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_overall_deadline_expiration_after_transmission_raises_execution_outcome_unknown(
+    ephemeral_server_config: TransportConfig,
+):
+    """Verify overall deadline expiration after transmission raises ExecutionOutcomeUnknown."""
+    registry = CommandRegistry()
+
+    async def slow_move(args):
+        await asyncio.sleep(2.0)
+        return "moved"
+
+    registry.register("move", slow_move, validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    try:
+        # read_timeout is generous (2.0s), but explicit overall timeout is 0.15s
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            read_timeout=2.0,
+            request_timeout=2.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.move(1, 5.0, timeout=0.15)
+
+            assert exc_info.value.command == "move"
+            assert exc_info.value.request_id is not None
+            assert exc_info.value.code == TransportErrorCode.TIMEOUT
+            assert "overall request timed out" in str(exc_info.value).lower()
+    finally:
+        await server.stop()
+
+
+# ==============================================================================
+# 14. No duplicate physical-command dispatch after an uncertain outcome
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_no_duplicate_physical_command_dispatch_after_uncertain_outcome(
+    ephemeral_server_config: TransportConfig,
+):
+    """Verify side-effecting commands are never automatically retransmitted after uncertain delivery."""
+    dispatches = 0
+    registry = CommandRegistry()
+
+    async def counting_say(args):
+        nonlocal dispatches
+        dispatches += 1
+        await asyncio.sleep(0.3)
+        return "spoken"
+
+    registry.register("say", counting_say, validate_say_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            read_timeout=0.1,
+            request_timeout=0.1,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.say("Alert message", timeout=0.1)
+
+            assert exc_info.value.command == "say"
+
+        # Wait to ensure no background retry was issued
+        await asyncio.sleep(0.35)
+        # Physical action must have been dispatched at most once
+        assert dispatches == 1
+    finally:
+        await server.stop()
+
+
+# ==============================================================================
+# 15. Legacy wrapper does not automatically retry ambiguous physical action
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_legacy_wrapper_does_not_retry_ambiguous_physical_action(
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify request_to_server does not automatically retry when an ambiguous outcome occurs."""
+    speech_count = 0
+    registry = CommandRegistry()
+
+    async def counted_reply(args):
+        nonlocal speech_count
+        speech_count += 1
+        await asyncio.sleep(0.5)
+        return "spoken"
+
+    registry.register("reply", counted_reply, validate_reply_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+    try:
+        await rc.close_client()
+        with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+            await rc.request_to_server(function_name="reply", message="One-time action", timeout=0.15)
+
+        assert exc_info.value.command == "reply"
+        await asyncio.sleep(0.4)
+        assert speech_count == 1
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+# ==============================================================================
+# 16. Legacy request_to_server accepts timeout=None without error
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_legacy_request_to_server_accepts_none_timeout(
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify request_to_server handles timeout=None and request_timeout=None as default timeout."""
+    registry = CommandRegistry()
+    registry.register("ping", lambda args: "pong", validate_empty_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+    try:
+        await rc.close_client()
+        res = await rc.request_to_server(function_name="ping", timeout=None)
+        assert res == "pong"
+        res2 = await rc.request_to_server(function_name="ping", request_timeout=None)
+        assert res2 == "pong"
     finally:
         await rc.close_client()
         await server.stop()

@@ -65,9 +65,9 @@ async def request_to_server(**kwargs: Any) -> Any:
     callers can distinguish physical uncertainty from successful None or ordinary failure.
     """
     call_timeout: float | None = None
-    if "timeout" in kwargs:
+    if "timeout" in kwargs and kwargs["timeout"] is not None:
         call_timeout = validate_timeout_override(kwargs["timeout"])
-    elif "request_timeout" in kwargs:
+    elif "request_timeout" in kwargs and kwargs["request_timeout"] is not None:
         call_timeout = validate_timeout_override(kwargs["request_timeout"])
 
     filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("timeout", "request_timeout")}
