@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deskbuddy"
+version = "0.1.0"
+description = "Portable configuration and bootstrap for the DeskBuddy robotic assistant"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pydantic>=2.10,<3",
+    "platformdirs>=4.3,<5",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.scripts]
+deskbuddy = "deskbuddy.cli:main"
+
+[project.urls]
+Repository = "https://github.com/dhar174/DeskBuddy"
+Issues = "https://github.com/dhar174/DeskBuddy/issues"
+
+[project.optional-dependencies]
+# Keep the module-level Completion/ChatCompletion API until the cloud migration.
+cloud = ["openai==0.28.1"]
+# Compatibility ranges retain GPT-J APIs; this issue does not replace the runtime.
+local = [
+    "torch==2.4.1",
+    "transformers>=4.36.2,<4.37",
+    "accelerate>=0.25,<0.26",
+    "numpy>=1.26,<2",
+    "sentencepiece>=0.2,<0.3",
+    "psutil>=5.9,<8",
+]
+speech = [
+    "openai-whisper==20250625",
+    "PyAudio>=0.2.14,<0.3",
+    "keyboard>=0.13.5,<0.14",
+    "scipy>=1.11,<2",
+    "aiohttp>=3.10,<4",
+]
+vision = ["opencv-python-headless>=4.9,<4.12", "Pillow>=10.4,<12"]
+# The published vendor package requires Windows comtypes unconditionally.
+picoh = [
+    "picoh==1.276; sys_platform == 'win32'",
+    "playsound==1.2.2; sys_platform == 'win32'",
+    "gruut>=2.3.4,<3; sys_platform == 'win32'",
+    "sounddevice>=0.5,<0.6; sys_platform == 'win32'",
+    "soundfile>=0.12,<0.14; sys_platform == 'win32'",
+    "scipy>=1.11,<2; sys_platform == 'win32'",
+    "keyboard>=0.13.5,<0.14; sys_platform == 'win32'",
+]
+# Experimental, opt-in Linux compatibility, not a hardware qualification promise.
+legacy = [
+    "deepspeed==0.15.4; sys_platform == 'linux'",
+    "datasets>=2.18,<3",
+    "spacy>=3.7.5,<3.8",
+    "scikit-learn>=1.5,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.4,<2", "ruff>=0.9,<1", "mypy>=1.14,<2"]
+
+[tool.uv]
+required-version = ">=0.9.26"
+default-groups = []
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "README.md" }]
+
+# DeepSpeed defaults to building ops on the resolver host (including Windows).
+# Defer optional Linux ops to its JIT runtime; lock/core install must not need Torch/CUDA.
+[tool.uv.extra-build-variables]
+deepspeed = { DS_BUILD_OPS = "0" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deskbuddy"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/deskbuddy", "pyproject.toml", "README.md", ".env.example", "deskbuddy.example.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+include = ["src/**/*.py", "tests/**/*.py", "transport/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+# Discover production packages, including PR #28's transport/ when it lands.
+# The repository root stays a non-package; flat legacy scripts migrate separately.
+files = ["."]
+exclude = ['^tests/', '^windows/', '^dist/', '^build/', '^[^/]+\.py$']
+python_version = "3.11"
+check_untyped_defs = true
+disallow_untyped_defs = true

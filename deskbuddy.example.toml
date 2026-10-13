@@ -1,0 +1,40 @@
+# Copy to the OS user config directory as deskbuddy.toml, or pass --config explicitly.
+# Environment variables override this table. Keep credentials in the environment.
+[deskbuddy]
+model_provider = "disabled" # disabled | local | openai; openai requires OPENAI_API_KEY
+local_model_endpoint = "http://127.0.0.1:11434" # future adapter contract only
+openai_model = "gpt-3.5-turbo"
+medium_model_id = "PygmalionAI/pygmalion-350m"
+fast_model_id = "microsoft/DialoGPT-large"
+small_model_id = "facebook/blenderbot_small-90M"
+blenderbot_model_id = "facebook/blenderbot-400M-distill"
+vision_model_id = "microsoft/git-large-vqav2"
+topic_model_id = "knkarthick/TOPIC-DIALOGSUM"
+summary_model_id = "philschmid/bart-large-cnn-samsum"
+short_summary_model_id = "knkarthick/meeting-summary-samsum"
+title_model_id = "fabiochiu/t5-small-medium-title-generation"
+spacy_model_id = "en_core_web_trf"
+question_classifier_model_id = "shahrukhx01/question-vs-statement-classifier"
+nli_model_id = "valhalla/distilbart-mnli-12-3"
+command_model_id = "gokuls/bert-tiny-Massive-intent-KD-BERT"
+question_generator_model_id = "voidful/context-only-question-generator"
+embedding_model_id = "sentence-transformers/all-mpnet-base-v2"
+completion_model_id = "text-curie-001"
+sd_classifier_model_id = "curie"
+qa_model_id = "distilbert-base-cased-distilled-squad"
+# data_dir = "workspace" # relative to OS user-data directory
+# cache_dir = "cache" # relative to resolved data_dir
+# offload_dir = "offload" # default: cache_dir/offload
+# checkpoint_dir = "models/checkpoint" # must exist when explicitly supplied
+# tokenizer_dir = "models/pygmalion-6b" # must exist when explicitly supplied
+# openai_api_key = "" # prefer OPENAI_API_KEY, never commit credentials
+robot_host = "127.0.0.1"
+robot_bind_address = "127.0.0.1"
+robot_port = 8888
+# robot_auth_secret = "" # prefer DESKBUDDY_ROBOT_AUTH_SECRET; Issue #4 enforces it
+robot_connect_timeout_seconds = 5.0
+robot_timeout_seconds = 5.0
+# camera_source = 0 # optional webcam index, stream URL or existing image path
+device = "auto" # auto | cpu | cuda | mps
+gpu_memory_limit = "auto" # e.g. 4096MiB; only applies to legacy Accelerate mapping
+cpu_memory_limit = "auto" # e.g. 16GiB

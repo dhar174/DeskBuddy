@@ -1,3 +1,14 @@
+import sys
+
+if "--headless" in sys.argv[1:]:
+    from deskbuddy.cli import main as headless_main
+
+    raise SystemExit(headless_main())
+
+from deskbuddy.settings import load_settings
+
+local_only = load_settings().model_provider != "openai"
+
 import asyncio
 import helpers
 import time
@@ -21,8 +32,6 @@ import tkinter as tk
 import robot_client as rc
 
 button_text = ""
-
-local_only = True
 
 # async def button_clicked(text):
 #     global button_text
@@ -122,7 +131,7 @@ async def main():
     large_button.pack()
 
     local_only_tk = tk.BooleanVar()
-    local_only_tk.set(True)
+    local_only_tk.set(local_only)
     local_only_checkbox = tk.Checkbutton(
         root, text="Local Only", variable=local_only_tk
     )

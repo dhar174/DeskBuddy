@@ -5,7 +5,6 @@ import cv2 as cv
 from transformers import ViltProcessor, ViltForQuestionAnswering
 from PIL import Image
 import numpy as np
-import pandas as pd
 from datasets import Dataset
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel
@@ -13,7 +12,7 @@ import torch.nn.functional as F
 import torch
 import json
 import BotCortex
-import torchvision.transforms as T
+from deskbuddy.settings import load_settings
 
 # from transformers import BlipProcessor, BlipForQuestionAnswering
 from transformers import (
@@ -54,9 +53,10 @@ async def load_models():
     # global qgen_model
     global accelerator
 
+    settings = load_settings()
     print("loading helper models")
     question_answerer = pipeline(
-        "question-answering", model="distilbert-base-cased-distilled-squad"
+        "question-answering", model=settings.qa_model_id
     )
     # visionQA_processor = GitProcessor.from_pretrained(
     #     "microsoft/git-large-vqav2")
@@ -65,10 +65,10 @@ async def load_models():
     #     "microsoft/git-large-vqav2")
 
     command_model = AutoModelForSequenceClassification.from_pretrained(
-        "gokuls/bert-tiny-Massive-intent-KD-BERT"
+        settings.command_model_id
     )
     command_tokenizer = AutoTokenizer.from_pretrained(
-        "gokuls/bert-tiny-Massive-intent-KD-BERT"
+        settings.command_model_id
     )
     # search_tokenizer = AutoTokenizer.from_pretrained(
     #     "sentence-transformers/all-mpnet-base-v2"

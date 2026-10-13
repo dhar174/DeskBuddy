@@ -4,7 +4,110 @@
 # Introducing C.O.O.P.E.R.: Conversational Office Organizer and Personal Entertainment Robot!
 
 
-## Replication Disclaimer: 
+## Install and validate the portable baseline
+
+Use **Python 3.11 or 3.12** and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+0.9.26 or newer. On Windows, install uv with `winget install --id=astral-sh.uv -e`;
+on Linux/macOS use the official installer linked above. From a clone of this repository:
+
+```console
+uv sync --locked --no-editable
+uv run --no-sync deskbuddy --headless
+```
+
+The first command installs the locked core as an ordinary package. It requires no
+local package checkout outside this repository, SSH access, CUDA, model weights,
+robot, microphone or camera. The second command validates settings and prints a
+small status report; it starts no network connections or models. `python -m deskbuddy`
+works in the installed environment too. To validate through the historical entry
+point: `uv run --no-sync python start_bot.py --headless`.
+
+The `src/deskbuddy` package is the incremental configuration/bootstrap boundary.
+The legacy GUI and inference modules remain at the repository root for later
+architecture work (#7). A core install proves configuration and importability;
+the full 2023 robot demonstration still requires the optional subsystems described below.
+
+### Configuration
+
+Copy `.env.example` to `.env`, change the settings you need, then run:
+
+```console
+uv run --no-sync deskbuddy --env-file .env
+uv run --no-sync deskbuddy --config deskbuddy.example.toml
+```
+
+Precedence is **explicit Python overrides > process environment > explicitly selected
+dotenv file > TOML file > defaults**. `.env` is loaded only with `--env-file` or
+`DESKBUDDY_ENV_FILE`; it is never searched for implicitly. A TOML file can be passed
+with `--config`/`DESKBUDDY_CONFIG_FILE`; otherwise the OS user config directory's
+`DeskBuddy/deskbuddy.toml` is used if present. TOML keys live under `[deskbuddy]`.
+For the legacy scripts, set these environment file selectors before starting them.
+Neither source loading nor the headless command creates files or directories.
+
+Every field uses `DESKBUDDY_<FIELD_NAME>` except the supported OpenAI credential,
+which uses **`OPENAI_API_KEY`**. The old generic `API_KEY` is ignored. OpenAI mode
+requires a nonblank key; disabled/local mode requires none. Defaults use loopback
+robot addresses, port 8888, no camera and automatic device/memory selection.
+The examples document all fields, including the robot authentication/timeouts
+contract for #4. Invalid values fail before startup with an actionable message.
+
+Application data and cache use [platformdirs](https://platformdirs.readthedocs.io/)
+OS conventions, not the checkout. Relative `data_dir` is under the OS default data
+directory; other relative setting paths (including paths from TOML) are under the
+resolved `data_dir`. File selector paths passed to the CLI are relative to the
+caller. See [setup and migration details](docs/setup.md) for locations and old-data migration.
+
+### Optional capabilities and development
+
+Install only the extras you need; repeat `--extra` to combine them:
+
+```console
+uv sync --locked --no-editable --extra cloud
+uv sync --locked --no-editable --extra local --extra vision
+uv sync --locked --no-editable --extra speech --extra picoh
+uv sync --locked --group dev
+uv run --no-sync pytest
+uv run --no-sync ruff check .
+uv run --no-sync mypy
+```
+
+| Extra/group | Purpose and prerequisites |
+| --- | --- |
+| core (default) | Settings and offline bootstrap only; no GPU or vendor libraries |
+| `cloud` | OpenAI 0.28.1 SDK compatibility with existing API calls; no local weights |
+| `local` | Torch/Transformers/Accelerate and tokenizers; large wheels, opt-in downloads |
+| `speech` | Whisper/PyAudio/keyboard/audio support; FFmpeg and PortAudio may need OS installation |
+| `vision` | Headless OpenCV and Pillow; no automatic model or camera access |
+| `picoh` | Windows vendor integration; physical hardware/resources required for actual use |
+| `legacy` | Experimental Linux DeepSpeed, spaCy, datasets and classifier compatibility |
+| `dev` group | pytest, pytest-asyncio, Ruff and mypy; never part of the default core install |
+
+`local_model_endpoint` establishes configuration for a future endpoint adapter;
+this baseline does not introduce an inference server client. Selecting `local`
+in bootstrap validates configuration and does not start inference. Legacy GUI cloud
+mode still uses local classifiers/embeddings and is not a cloud-only runtime.
+
+For an API-only diagnostic without local weights, install `--extra cloud`, set
+`DESKBUDDY_MODEL_PROVIDER=openai`, `OPENAI_API_KEY`, and `DESKBUDDY_OPENAI_MODEL`
+to a model available on your account, then run `uv run --no-sync deskbuddy --prompt
+"Hello"`. Supplying `--prompt` explicitly sends one API request and may incur API
+charges. The diagnostic has no robot actions, classifiers or conversation history;
+ordinary headless validation makes no API call. Offline tests mock this request.
+
+The legacy GUI is launched with `uv run --no-sync python start_bot.py` only after
+installing its documented extras and model assets. `activateBuddy.ps1 -Headless`
+is portable and safe for baseline validation. The default PowerShell launcher is
+explicitly legacy and starts the Windows robot server. Its transport and the Unix
+client retain the old RPC implementation until #4 lands; secret/timeout fields
+are a shared contract, with enforcement owned by #4.
+
+The old `requirements.txt` freeze has been replaced with a generated, hash-pinned
+**core dependency export**; uv plus `uv.lock` is the development authority. Do not
+reuse an old virtualenv or `windows/buddyreqs.txt`. The [dependency audit](docs/dependency-audit.md)
+records every old dependency and the [migration guide](docs/setup.md) explains
+Python compatibility, legacy limits and the unchanged Larynx Debian Dockerfile.
+
+## Historical replication disclaimer (2023 full robot demo)
 
 I cannot guarantee this will run for you on your own machine. This is still an alpha project, and I plan to provide better instructions for replication as well as a graphical model replacement of the robot (a 3D face, basically) so the robot will not be required to run this. Also, with the online mode, it may run on more diverse hardware. Also, the Larynx docker server is customized by me; it is almost ready to place here and is coming soon as of May 2 2023. These scripts will not run without my custom Larynx server scripts; as of May-3-23 I am more focused on developing COOPER and adding features than worrying about reproducibility and it probably won't run for you. But a version everyone can use IS COMING!!! :-)
 

@@ -22,9 +22,8 @@ from picoh import picoh
 # import pythonwin
 import signal
 import sys
-import aiohttp
+from deskbuddy.settings import load_settings
 
-connector = aiohttp.TCPConnector(force_close=True)
 listening = False
 
 
@@ -346,8 +345,9 @@ class MyFunctions:
 
 
 # Define a TCP server
-HOST = '0.0.0.0'
-PORT = 8888
+_settings = load_settings()
+HOST = _settings.robot_bind_address
+PORT = _settings.robot_port
 
 
 async def handle_client(reader, writer):
