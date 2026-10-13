@@ -32,10 +32,27 @@ SAFE_IDEMPOTENT_COMMANDS: frozenset[str] = frozenset(
     {"ping", "simple_test", "check_for_response", "test_timing", "hang"}
 )
 
+KNOWN_PHYSICAL_COMMANDS: frozenset[str] = frozenset(
+    {
+        "move",
+        "picoh_move",
+        "say",
+        "picoh_say",
+        "reply",
+        "base_col",
+        "basecol",
+        "wait",
+        "picoh_wait",
+    }
+)
+
 
 def is_side_effecting_command(command: str) -> bool:
     """Determine whether a command has potential side effects on physical hardware/state."""
-    return command.lower() not in SAFE_IDEMPOTENT_COMMANDS
+    cmd_lower = command.lower()
+    if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+        return True
+    return cmd_lower not in SAFE_IDEMPOTENT_COMMANDS
 
 
 class RobotTransport(abc.ABC):
@@ -149,14 +166,15 @@ class RobotClient(RobotTransport):
         ) from last_exc
 
     async def _disconnect(self) -> None:
-        if self._writer is not None:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
+        writer = self._writer
         self._reader = None
         self._writer = None
+        if writer is not None:
+            try:
+                writer.close()
+                await asyncio.shield(writer.wait_closed())
+            except Exception:
+                pass
 
     async def close(self) -> None:
         async with self._lock:
@@ -179,9 +197,17 @@ class RobotClient(RobotTransport):
         if timeout is not None:
             timeout = validate_timeout_override(timeout)
 
-        is_side_effecting = (
-            side_effects if side_effects is not None else is_side_effecting_command(command)
-        )
+        # Conservative side-effect classification:
+        # Known physical commands are unconditionally side-effecting.
+        # Explicit side_effects=True can upgrade an otherwise safe command,
+        # but side_effects=False can NEVER weaken protections on known physical commands.
+        cmd_lower = command.lower()
+        if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+            is_side_effecting = True
+        elif side_effects is not None:
+            is_side_effecting = side_effects
+        else:
+            is_side_effecting = is_side_effecting_command(command)
 
         server_cmd_timeout = compute_command_timeout(
             command, arguments, self.config.request_timeout
@@ -199,6 +225,8 @@ class RobotClient(RobotTransport):
             effective_read_timeout = read_cmd_timeout + read_grace
 
         # Phase 1: Wait to acquire lock (local queueing deadline)
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
         lock_timeout = (
             effective_timeout
             if timeout is not None
@@ -218,13 +246,47 @@ class RobotClient(RobotTransport):
             transmission_attempted = False
             request: RobotRequest | None = None
 
-            async def _execute_under_lock() -> RobotResponse:
-                nonlocal transmission_attempted, request
-
-                # Phase 2: Ensure connection (pre-transmission)
+            # Phase 2: Ensure connection (pre-transmission)
+            # Dedicated bounded budget so slow connection establishment does not
+            # consume the server execution plus response-grace deadline.
+            if timeout is not None:
+                elapsed = loop.time() - start_time
+                remaining_for_connect = timeout - elapsed
+                if remaining_for_connect <= 0:
+                    raise TransportError(
+                        TransportErrorCode.TIMEOUT,
+                        f"Request timed out after {elapsed:.2f}s before connection",
+                    )
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        self._ensure_connected(), timeout=remaining_for_connect
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TransportError(
+                        TransportErrorCode.TIMEOUT,
+                        f"Connection timed out after {remaining_for_connect:.2f}s before transmission",
+                    ) from exc
+            else:
                 reader, writer = await self._ensure_connected()
 
-                # Phase 3: Create and sign request IMMEDIATELY before transmission
+            # Phase 3: Transmission and response deadline (starts after connection succeeds)
+            if timeout is not None:
+                elapsed = loop.time() - start_time
+                remaining_for_response = timeout - elapsed
+                if remaining_for_response <= 0:
+                    raise TransportError(
+                        TransportErrorCode.TIMEOUT,
+                        f"Request timed out after {elapsed:.2f}s before transmission",
+                    )
+                post_connect_timeout = remaining_for_response
+                effective_read_timeout = min(effective_read_timeout, post_connect_timeout)
+            else:
+                post_connect_timeout = effective_timeout
+
+            async def _transmit_and_receive() -> RobotResponse:
+                nonlocal transmission_attempted, request, reader, writer
+
+                # Create and sign request IMMEDIATELY before transmission
                 request = RobotRequest.create(
                     command=command,
                     arguments=arguments,
@@ -349,6 +411,17 @@ class RobotClient(RobotTransport):
                     response = RobotResponse.from_json(response_bytes)
                 except Exception as exc:
                     await self._disconnect()
+                    if is_side_effecting and transmission_attempted:
+                        req_id = request.request_id if request else "unknown"
+                        raise ExecutionOutcomeUnknown(
+                            request_id=req_id,
+                            command=command,
+                            message=(
+                                f"Command '{command}' execution outcome is unknown: server returned malformed "
+                                f"response after request was transmitted: {exc}"
+                            ),
+                            code=TransportErrorCode.MALFORMED_REQUEST,
+                        ) from exc
                     if isinstance(exc, TransportError):
                         raise
                     raise TransportError(
@@ -365,15 +438,29 @@ class RobotClient(RobotTransport):
                 )
                 if not valid:
                     await self._disconnect()
+                    underlying: ProtocolViolationError | AuthenticationError
                     if err_code in (
                         TransportErrorCode.UNSUPPORTED_PROTOCOL,
                         TransportErrorCode.MALFORMED_REQUEST,
                     ):
-                        raise ProtocolViolationError(err_code, err_msg or "Protocol violation")
-                    raise AuthenticationError(
-                        err_code or TransportErrorCode.UNAUTHORIZED,
-                        err_msg or "Failed to authenticate server response",
-                    )
+                        underlying = ProtocolViolationError(err_code, err_msg or "Protocol violation")
+                    else:
+                        underlying = AuthenticationError(
+                            err_code or TransportErrorCode.UNAUTHORIZED,
+                            err_msg or "Failed to authenticate server response",
+                        )
+                    if is_side_effecting and transmission_attempted:
+                        req_id = request.request_id if request else "unknown"
+                        raise ExecutionOutcomeUnknown(
+                            request_id=req_id,
+                            command=command,
+                            message=(
+                                f"Command '{command}' execution outcome is unknown: server response failed "
+                                f"authentication/validation after request was transmitted: {err_msg}"
+                            ),
+                            code=err_code or TransportErrorCode.UNAUTHORIZED,
+                        ) from underlying
+                    raise underlying
 
                 # Check for explicit replayed_request or execution_outcome_unknown error codes
                 if not response.ok and response.error:
@@ -402,7 +489,7 @@ class RobotClient(RobotTransport):
                 return response
 
             try:
-                return await asyncio.wait_for(_execute_under_lock(), timeout=effective_timeout)
+                return await asyncio.wait_for(_transmit_and_receive(), timeout=post_connect_timeout)
             except asyncio.TimeoutError as exc:
                 await self._disconnect()
                 req_id = request.request_id if request else "unknown"
@@ -412,17 +499,32 @@ class RobotClient(RobotTransport):
                         command=command,
                         message=(
                             f"Command '{command}' execution outcome is unknown: overall request timed out "
-                            f"after {effective_timeout:.2f}s following transmission."
+                            f"after {post_connect_timeout:.2f}s following transmission."
                         ),
                         code=TransportErrorCode.TIMEOUT,
                     ) from exc
                 raise TransportError(
                     TransportErrorCode.TIMEOUT,
-                    f"Overall request timed out after {effective_timeout:.2f}s",
+                    f"Overall request timed out after {post_connect_timeout:.2f}s",
                 ) from exc
+        except asyncio.CancelledError:
+            req_id = request.request_id if request else "unknown"
+            logger.debug(
+                "Request cancelled for command '%s' (request_id=%s, side_effects=%s, transmitted=%s); disconnecting stream",
+                command,
+                req_id,
+                is_side_effecting,
+                transmission_attempted,
+            )
+            try:
+                await asyncio.shield(self._disconnect())
+            except Exception:
+                pass
+            raise
         finally:
             if lock_acquired:
                 self._lock.release()
+
 
     # Domain convenience methods
     async def check_for_response(self, *, timeout: float | None = None) -> str:

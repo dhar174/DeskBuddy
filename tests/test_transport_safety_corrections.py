@@ -26,9 +26,11 @@ import pytest
 
 import robot_client as rc
 from transport import (
+    AuthenticationError,
     CommandRegistry,
     ExecutionOutcomeUnknown,
     HardwareExecutor,
+    ProtocolViolationError,
     RobotClient,
     RobotServer,
     TransportConfig,
@@ -40,8 +42,9 @@ from transport import (
     validate_reply_arguments,
     validate_say_arguments,
     validate_timeout_override,
+    validate_wait_arguments,
 )
-from transport.framing import read_frame
+from transport.framing import read_frame, write_frame
 
 
 @pytest.fixture(autouse=True)
@@ -798,3 +801,418 @@ async def test_legacy_request_to_server_accepts_none_timeout(
     finally:
         await rc.close_client()
         await server.stop()
+
+
+# ==============================================================================
+# 17. External task cancellation cleanly resets stream and prevents stale response contamination
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_external_cancellation_disconnects_stream_and_prevents_stale_response_contamination(
+    ephemeral_server_config: TransportConfig,
+):
+    """Cancel a task after its request has been sent but before the response,
+    then submit a new request on the same RobotClient.
+    Verify client reconnects and accepts only the new request's authenticated response.
+    """
+    registry = CommandRegistry()
+    slow_request_started = asyncio.Event()
+    slow_request_release = asyncio.Event()
+
+    async def slow_handler(args):
+        slow_request_started.set()
+        await slow_request_release.wait()
+        return "slow_done"
+
+    registry.register("wait", slow_handler, validate_wait_arguments)
+    registry.register("ping", lambda args: "pong", validate_empty_arguments)
+
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=5.0,
+        )
+        client = RobotClient(client_cfg)
+
+        # 1. Start slow request in a task
+        task = asyncio.create_task(client.wait(5.0))
+        # Wait until the request is transmitted and server starts processing
+        await slow_request_started.wait()
+
+        # 2. Cancel the task while in-flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Client must have safely disconnected its stream
+        assert not client.is_connected
+
+        # Release slow request so server sends response into the old connection
+        slow_request_release.set()
+        await asyncio.sleep(0.05)
+
+        # 3. Submit a new request on the EXACT SAME RobotClient instance!
+        resp = await client.request("ping", {})
+        assert resp.ok is True
+        assert resp.result == "pong"
+        assert client.is_connected
+        await client.close()
+    finally:
+        slow_request_release.set()
+        await server.stop()
+
+
+# ==============================================================================
+# 18. Uncertain execution after invalid responses (malformed, wrong ID, bad HMAC)
+# ==============================================================================
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt_kind",
+    ["malformed_json", "wrong_id", "bad_hmac"],
+)
+async def test_invalid_response_after_transmission_preserves_execution_outcome_unknown(
+    corrupt_kind: str,
+    ephemeral_server_config: TransportConfig,
+):
+    """When a side-effecting command (move) has been transmitted,
+    invalid responses (malformed JSON, wrong request ID, bad HMAC) must raise
+    ExecutionOutcomeUnknown with the underlying error retained as its cause,
+    and must never retry.
+    """
+    server_received_count = 0
+    registry = CommandRegistry()
+
+    async def move_handler(args):
+        nonlocal server_received_count
+        server_received_count += 1
+        return "moved"
+
+    registry.register("move", move_handler, validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    orig_send_response = server._send_response
+
+    async def corrupt_send_response(writer, response):
+        if corrupt_kind == "malformed_json":
+            await write_frame(writer, b"{bad json", timeout=5.0)
+        elif corrupt_kind == "wrong_id":
+            response.request_id = "totally-wrong-request-id-999"
+            await orig_send_response(writer, response)
+        elif corrupt_kind == "bad_hmac":
+            response.auth = {"scheme": "hmac-sha256", "signature": "0" * 64}
+            raw = response.to_json().encode("utf-8")
+            await write_frame(writer, raw, timeout=5.0)
+
+    server._send_response = corrupt_send_response
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=2.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.move(1, 5.0)
+
+            err = exc_info.value
+            assert err.command == "move"
+            assert err.request_id is not None
+            assert err.__cause__ is not None
+            if corrupt_kind == "malformed_json":
+                assert isinstance(err.__cause__, TransportError)
+            elif corrupt_kind == "wrong_id":
+                assert isinstance(err.__cause__, ProtocolViolationError)
+            elif corrupt_kind == "bad_hmac":
+                assert isinstance(err.__cause__, AuthenticationError)
+
+        # Single transmission attempt, never retried
+        assert server_received_count == 1
+    finally:
+        await server.stop()
+
+
+# ==============================================================================
+# 19. Legacy adapter propagates ExecutionOutcomeUnknown on invalid responses
+# ==============================================================================
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt_kind",
+    ["malformed_json", "wrong_id", "bad_hmac"],
+)
+async def test_legacy_request_to_server_preserves_execution_outcome_unknown_on_invalid_response(
+    corrupt_kind: str,
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify request_to_server propagates ExecutionOutcomeUnknown when server returns invalid response
+    for a side-effecting command, and does not convert it to None or retry.
+    """
+    dispatched = 0
+    registry = CommandRegistry()
+
+    def reply_handler(args):
+        nonlocal dispatched
+        dispatched += 1
+        return "spoken"
+
+    registry.register("reply", reply_handler, validate_reply_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    orig_send_response = server._send_response
+
+    async def corrupt_send_response(writer, response):
+        if corrupt_kind == "malformed_json":
+            await write_frame(writer, b"{bad json", timeout=5.0)
+        elif corrupt_kind == "wrong_id":
+            response.request_id = "wrong-id-456"
+            await orig_send_response(writer, response)
+        elif corrupt_kind == "bad_hmac":
+            response.auth = {"scheme": "hmac-sha256", "signature": "bad" * 16}
+            await write_frame(writer, response.to_json().encode("utf-8"), timeout=5.0)
+
+    server._send_response = corrupt_send_response
+
+    monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+    try:
+        await rc.close_client()
+        with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+            await rc.request_to_server(function_name="reply", message="Hello test")
+
+        assert exc_info.value.command == "reply"
+        assert exc_info.value.__cause__ is not None
+        assert dispatched == 1
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+# ==============================================================================
+# 20. Conservative side-effect classification cannot be downgraded
+# ==============================================================================
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cmd,args",
+    [
+        ("move", {"motor": 1, "position": 5.0}),
+        ("picoh_move", {"motor": 1, "position": 5.0}),
+        ("say", {"text": "hello"}),
+        ("picoh_say", {"text": "hello"}),
+        ("reply", {"message": "hello"}),
+        ("base_col", {"r": 5, "g": 5, "b": 5}),
+        ("baseCol", {"r": 5, "g": 5, "b": 5}),
+        ("wait", {"seconds": 0.1}),
+        ("picoh_wait", {"seconds": 0.1}),
+    ],
+)
+async def test_conservative_side_effect_classification_prevents_downgrade(
+    cmd: str,
+    args: dict[str, Any],
+    ephemeral_server_config: TransportConfig,
+):
+    """Verify that passing side_effects=False for each built-in physical command
+    does not downgrade it: exactly one transmission attempt is made upon failure.
+    """
+    attempts = 0
+    registry = CommandRegistry()
+
+    def handler(a):
+        nonlocal attempts
+        attempts += 1
+        return "ok"
+
+    registry.register(cmd, handler)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    # Drop connection after read to trigger error
+    async def drop_after_receive(reader, writer):
+        nonlocal attempts
+        await read_frame(reader)
+        attempts += 1
+        writer.close()
+        await writer.wait_closed()
+
+    server._process_client_stream = drop_after_receive
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=1.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown):
+                # Explicit side_effects=False MUST NOT downgrade physical command!
+                await client.request(cmd, args, side_effects=False)
+
+        # Must have made exactly 1 transmission attempt (no blind retry)
+        assert attempts == 1
+    finally:
+        await server.stop()
+
+
+# ==============================================================================
+# 21. HardwareExecutor race-safe cancellation and completion
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_hardware_executor_completed_operation_not_reported_as_cancelled():
+    """Control the boundary between worker completion and async completion notification.
+    Cancel the awaiting task when worker has completed.
+    Assert result is accurately reported as completed, never cancelled or timed out.
+    """
+    hw_executor = HardwareExecutor(thread_name_prefix="test-hw-race")
+    gate_event = threading.Event()
+
+    def gated_op():
+        gate_event.wait(timeout=2.0)
+        return "physical_motion_done"
+
+    try:
+        task = asyncio.create_task(hw_executor.execute(gated_op))
+        # Wait until worker picks up the operation
+        for _ in range(100):
+            if hw_executor.active_operation is not None:
+                break
+            await asyncio.sleep(0.005)
+        assert hw_executor.active_operation is not None
+
+        # Release gate_event so worker finishes op.func and transitions op.state to COMPLETED
+        gate_event.set()
+
+        # Spin until worker thread sets COMPLETED
+        for _ in range(100):
+            if hw_executor.active_operation is None:
+                break
+            await asyncio.sleep(0.005)
+
+        # Cancel the task right after worker completed
+        task.cancel()
+
+        # The task must resolve with the successful result, NOT CancelledError!
+        res = await task
+        assert res == "physical_motion_done"
+        assert hw_executor.has_unresolved_operation is False
+    finally:
+        gate_event.set()
+        await hw_executor.shutdown()
+
+
+# ==============================================================================
+# 22. Direct TransportConfig construction fail-closed validation
+# ==============================================================================
+def test_direct_transport_config_validation_rejects_invalid_values():
+    """Verify TransportConfig.__post_init__ rejects NaN, Inf, non-positive timeouts,
+    invalid ports, negative retries, etc., while accepting port 0.
+    """
+    # 1. Ephemeral port 0 is accepted
+    cfg = TransportConfig(port=0, secret="secret")
+    assert cfg.port == 0
+
+    # 2. Port bounds
+    with pytest.raises(ValueError, match="port"):
+        TransportConfig(port=-1)
+    with pytest.raises(ValueError, match="port"):
+        TransportConfig(port=65536)
+    with pytest.raises(ValueError, match="port"):
+        TransportConfig(port=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="port"):
+        TransportConfig(port="8888")  # type: ignore[arg-type]
+
+    # 3. Host validation
+    with pytest.raises(ValueError, match="host"):
+        TransportConfig(host="")
+    with pytest.raises(ValueError, match="host"):
+        TransportConfig(host="   ")
+
+    # 4. Secret validation
+    with pytest.raises(TypeError, match="secret"):
+        TransportConfig(secret=123)  # type: ignore[arg-type]
+
+    # 5. Timeouts must be positive finite numbers
+    for field in ("connect_timeout", "read_timeout", "write_timeout", "request_timeout"):
+        for bad_val in (0, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, False, "5.0"):
+            with pytest.raises((ValueError, TypeError)):
+                TransportConfig(**{field: bad_val})
+
+    # 6. max_payload_size must be positive int
+    for bad_val in (0, -1, True, False, "1000"):
+        with pytest.raises(ValueError):
+            TransportConfig(max_payload_size=bad_val)  # type: ignore[arg-type]
+
+    # 7. max_clock_skew must be positive finite number
+    for bad_val in (0, -1.0, float("nan"), float("inf"), True, False):
+        with pytest.raises((ValueError, TypeError)):
+            TransportConfig(max_clock_skew=bad_val)
+
+    # 8. max_retries must be non-negative int
+    with pytest.raises(ValueError):
+        TransportConfig(max_retries=-1)
+    with pytest.raises(ValueError):
+        TransportConfig(max_retries=True)  # type: ignore[arg-type]
+
+    # 9. retry_backoff and response_grace must be non-negative finite numbers
+    for field in ("retry_backoff", "response_grace"):
+        for bad_val in (-0.1, -1.0, float("nan"), float("inf"), True, False):
+            with pytest.raises((ValueError, TypeError)):
+                TransportConfig(**{field: bad_val})
+        # 0.0 is accepted for backoff/grace
+        valid_cfg = TransportConfig(**{field: 0.0})
+        assert getattr(valid_cfg, field) == 0.0
+
+
+# ==============================================================================
+# 23. Connection establishment does not consume response deadline
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_slow_connection_does_not_starve_response_deadline(
+    ephemeral_server_config: TransportConfig,
+):
+    """Verify that under default timeouts, a slow connection establishment
+    does not consume the server execution + response grace budget.
+    """
+    registry = CommandRegistry()
+
+    # Handler executes in 0.3s
+    async def delayed_handler(args):
+        await asyncio.sleep(0.3)
+        return "delayed_success"
+
+    registry.register("ping", delayed_handler, validate_empty_arguments)
+    server_cfg = TransportConfig(
+        host="127.0.0.1",
+        port=0,
+        secret=ephemeral_server_config.secret,
+        request_timeout=0.4,
+    )
+    server = RobotServer(server_cfg, registry)
+    await server.start()
+
+    try:
+        # Client configured with connect_timeout 2.0s, request_timeout 0.4s, response_grace 0.1s
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            connect_timeout=2.0,
+            request_timeout=0.4,
+            response_grace=0.1,
+        )
+        async with RobotClient(client_cfg) as client:
+            resp = await client.request("ping", {})
+            assert resp.ok is True
+            assert resp.result == "delayed_success"
+    finally:
+        await server.stop()
+

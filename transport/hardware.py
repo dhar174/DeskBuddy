@@ -6,10 +6,15 @@ import asyncio
 import concurrent.futures
 import inspect
 import logging
+import threading
 from enum import Enum
 from typing import Any, Callable
 
-from transport.protocol import TransportError, TransportErrorCode
+from transport.protocol import (
+    ExecutionOutcomeUnknown,
+    TransportError,
+    TransportErrorCode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,7 @@ class HardwareOperation:
         self.result: Any = None
         self.exception: BaseException | None = None
         self.unresolved: bool = False
+        self.lock = threading.Lock()
 
 
 class HardwareExecutor:
@@ -71,7 +77,7 @@ class HardwareExecutor:
         """Return True if a synchronous operation was timed out/cancelled while still running."""
         return (
             self._unresolved_operation is not None
-            and self._unresolved_operation.state == OperationState.RUNNING
+            and self._unresolved_operation.state in (OperationState.RUNNING, OperationState.QUEUED)
         )
 
     @property
@@ -117,25 +123,31 @@ class HardwareExecutor:
             done_event = asyncio.Event()
 
             def _worker() -> None:
-                # If cancelled while waiting in queue, do not touch physical hardware
-                if op.state == OperationState.CANCELLED:
-                    logger.debug("Skipping cancelled queued hardware operation")
-                    return
+                with op.lock:
+                    # If cancelled while waiting in queue, do not touch physical hardware
+                    if op.state == OperationState.CANCELLED:
+                        logger.debug("Skipping cancelled queued hardware operation")
+                        return
 
-                op.state = OperationState.RUNNING
-                self._active_operation = op
+                    op.state = OperationState.RUNNING
+                    self._active_operation = op
+
                 try:
-                    op.result = op.func(*op.args, **op.kwargs)
-                    op.state = OperationState.COMPLETED
+                    res = op.func(*op.args, **op.kwargs)
+                    with op.lock:
+                        op.result = res
+                        op.state = OperationState.COMPLETED
                 except BaseException as exc:
-                    op.exception = exc
-                    op.state = OperationState.FAILED
+                    with op.lock:
+                        op.exception = exc
+                        op.state = OperationState.FAILED
                 finally:
-                    self._active_operation = None
-                    if self._unresolved_operation is op:
-                        logger.info("Unresolved hardware operation completed and cleared")
-                        self._unresolved_operation = None
-                        op.unresolved = False
+                    with op.lock:
+                        self._active_operation = None
+                        if self._unresolved_operation is op:
+                            logger.info("Unresolved hardware operation completed and cleared")
+                            self._unresolved_operation = None
+                            op.unresolved = False
                     if not done_event.is_set():
                         try:
                             loop.call_soon_threadsafe(done_event.set)
@@ -148,23 +160,47 @@ class HardwareExecutor:
             try:
                 await done_event.wait()
             except asyncio.CancelledError:
-                if op.state == OperationState.QUEUED:
-                    # Operation never started executing on worker thread
-                    op.state = OperationState.CANCELLED
-                    future.cancel()
-                    logger.debug("Successfully cancelled queued hardware operation before start")
-                    raise
-                elif op.state == OperationState.RUNNING:
-                    # Operation started and cannot be forcibly cancelled in Python thread
-                    op.unresolved = True
-                    self._unresolved_operation = op
-                    logger.warning(
-                        "Hardware operation timed out/cancelled while still running on hardware thread"
-                    )
-                    raise TransportError(
-                        TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
-                        "Hardware operation timed out while running on physical device",
-                    )
+                with op.lock:
+                    if op.state == OperationState.COMPLETED:
+                        # Operation completed on worker thread before or during cancellation
+                        return op.result
+                    elif op.state == OperationState.FAILED:
+                        # Operation failed on worker thread before or during cancellation
+                        if op.exception is not None:
+                            raise op.exception
+                        raise
+                    elif op.state == OperationState.RUNNING:
+                        # Operation started and cannot be forcibly cancelled on worker thread
+                        op.unresolved = True
+                        self._unresolved_operation = op
+                        logger.warning(
+                            "Hardware operation timed out/cancelled while still running on hardware thread"
+                        )
+                        raise ExecutionOutcomeUnknown(
+                            request_id="hardware-operation",
+                            command="hardware",
+                            message="Hardware operation timed out while running on physical device",
+                            code=TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
+                        )
+                    elif op.state == OperationState.QUEUED:
+                        cancelled = future.cancel()
+                        if cancelled:
+                            op.state = OperationState.CANCELLED
+                            logger.debug("Successfully cancelled queued hardware operation before start")
+                            raise
+                        else:
+                            # Worker thread already took work item; cannot stop execution
+                            op.unresolved = True
+                            self._unresolved_operation = op
+                            logger.warning(
+                                "Hardware operation cancellation failed; worker may be executing on physical device"
+                            )
+                            raise ExecutionOutcomeUnknown(
+                                request_id="hardware-operation",
+                                command="hardware",
+                                message="Hardware operation cancellation failed; operation may be executing on physical device",
+                                code=TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
+                            )
                 raise
 
             if op.exception is not None:

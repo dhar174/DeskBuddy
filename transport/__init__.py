@@ -2,6 +2,13 @@
 
 Provides secure, typed, frame-based JSON messaging with HMAC-SHA256 authentication
 and strict command allowlisting.
+
+Note on Packaging Architecture:
+Per PR #29 and Issue #5 baseline, the published deskbuddy package wheel/sdist
+deliberately ships only the minimal installable core (src/deskbuddy), while robot
+hardware transport and control currently run from repository checkouts.
+Relocation of the transport package into `src/deskbuddy/transport/` and exposure
+via the distribution package is tracked under Issue #7.
 """
 
 from __future__ import annotations
@@ -19,7 +26,13 @@ from transport.auth import (
     sign_response,
     verify_response,
 )
-from transport.client import RobotClient, RobotTransport
+from transport.client import (
+    KNOWN_PHYSICAL_COMMANDS,
+    SAFE_IDEMPOTENT_COMMANDS,
+    RobotClient,
+    RobotTransport,
+    is_side_effecting_command,
+)
 from transport.config import (
     ClientConfig,
     ServerConfig,
@@ -82,6 +95,7 @@ __all__ = [
     "HMACAuthenticator",
     "HardwareExecutor",
     "HardwareOperation",
+    "KNOWN_PHYSICAL_COMMANDS",
     "OperationState",
     "PayloadTooLargeError",
     "ProtocolViolationError",
@@ -91,6 +105,7 @@ __all__ = [
     "RobotResponse",
     "RobotServer",
     "RobotTransport",
+    "SAFE_IDEMPOTENT_COMMANDS",
     "ServerConfig",
     "TransportConfig",
     "TransportError",
@@ -102,6 +117,7 @@ __all__ = [
     "compute_signature",
     "create_default_registry",
     "get_default_hardware_executor",
+    "is_side_effecting_command",
     "read_frame",
     "reset_default_hardware_executor",
     "run_hardware_op",

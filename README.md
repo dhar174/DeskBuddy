@@ -354,13 +354,17 @@ All transport parameters derive from canonical DeskBuddy settings (`deskbuddy.se
 | `robot_connect_timeout_seconds` | `DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS` | `5.0` | Socket connect timeout in seconds |
 | `robot_timeout_seconds` | `DESKBUDDY_ROBOT_TIMEOUT_SECONDS` | `5.0` | Base request deadline in seconds (dynamically scales with `wait`/`say`) |
 
+## Packaging & Distribution Scope
+
+Per the PR #29 and Issue #5 architecture baseline, the built `deskbuddy` distribution artifacts (wheel and sdist) package only the minimal installable core (`src/deskbuddy/`), while robot hardware functionality and the `transport/` package operate from repository checkouts. The published wheel does not provide the robot transport. Migration of the robot transport into `src/deskbuddy/transport/` and official package distribution is tracked under Issue #7.
+
 ## Migration from Legacy Pickle RPC
 
 1. Legacy unpickling has been completely removed for security reasons across all robot server entrypoints (`buddy1.py`, `windows/buddy1.py`, and `windows/buddy2.py`). Unauthenticated or raw pickle payloads will be rejected with `malformed_request` or framing errors.
 2. Existing application code using `robot_client.request_to_server(**kwargs)` remains fully compatible:
    - `request_to_server(function_name="check_for_response")` automatically translates to the authenticated `check_for_response` command.
    - `request_to_server(function_name="reply", message=reply)` translates to the authenticated `reply` command.
-3. For new code, prefer the typed client interface:
+3. For new code from a repository checkout, prefer the typed client interface:
    ```python
    from deskbuddy.settings import load_settings
    from transport import RobotClient, TransportConfig
