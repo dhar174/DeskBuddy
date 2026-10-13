@@ -28,6 +28,7 @@ class TransportErrorCode(str, Enum):
     PAYLOAD_TOO_LARGE = "payload_too_large"
     TIMEOUT = "timeout"
     INTERNAL_ERROR = "internal_error"
+    EXECUTION_OUTCOME_UNKNOWN = "execution_outcome_unknown"
 
 
 class TransportError(Exception):
@@ -179,6 +180,20 @@ class RobotRequest:
         return cls.from_dict(parsed)
 
 
+def validate_timeout_override(timeout: Any) -> float:
+    """Validate an explicit runtime timeout override.
+
+    Must be a positive finite numeric value. Booleans and non-numeric types are rejected.
+    """
+    if timeout is None:
+        raise ValueError("Timeout override cannot be None")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise TypeError(f"Timeout override must be a numeric value, got {type(timeout).__name__}")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"Timeout override must be a positive finite number, got {timeout}")
+    return float(timeout)
+
+
 class ExecutionOutcomeUnknown(TransportError):
     """Raised when request delivery/execution state cannot be confirmed after transport loss."""
 
@@ -187,11 +202,11 @@ class ExecutionOutcomeUnknown(TransportError):
         request_id: str,
         command: str,
         message: str = (
-            "Execution outcome unknown: request was sent but connection was lost "
-            "before receiving response, and retry was rejected as duplicate."
+            "Execution outcome unknown: request was sent but outcome could not be confirmed."
         ),
+        code: TransportErrorCode | str = TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
     ) -> None:
-        super().__init__(TransportErrorCode.REPLAYED_REQUEST, message)
+        super().__init__(code, message)
         self.request_id = request_id
         self.command = command
 

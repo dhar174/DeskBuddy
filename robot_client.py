@@ -13,7 +13,11 @@ from typing import Any
 from deskbuddy.settings import load_settings
 from transport.client import RobotClient, RobotTransport
 from transport.config import ClientConfig, TransportConfig, compute_command_timeout
-from transport.protocol import ExecutionOutcomeUnknown, TransportError
+from transport.protocol import (
+    ExecutionOutcomeUnknown,
+    TransportError,
+    validate_timeout_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,26 +57,32 @@ async def request_to_server(**kwargs: Any) -> Any:
         kwargs = {"function_name": "check_for_response"}
         kwargs = {"function_name": "reply", "message": "..."}
 
-    Returns the unboxed response result on success, or None on error/timeout,
+    Returns the unboxed response result on success, or None on ordinary error/timeout,
     preserving expected legacy caller failure semantics.
-    """
-    command: str = ""
-    arguments: dict[str, Any] = {}
 
+    If a side-effecting command has an ambiguous outcome (e.g. connection lost or
+    deadline exceeded after transmission), ExecutionOutcomeUnknown is raised so
+    callers can distinguish physical uncertainty from successful None or ordinary failure.
+    """
     call_timeout: float | None = None
     if "timeout" in kwargs:
-        call_timeout = float(kwargs["timeout"])
+        call_timeout = validate_timeout_override(kwargs["timeout"])
     elif "request_timeout" in kwargs:
-        call_timeout = float(kwargs["request_timeout"])
+        call_timeout = validate_timeout_override(kwargs["request_timeout"])
 
     filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("timeout", "request_timeout")}
+
+    command: str = ""
+    arguments: dict[str, Any] = {}
 
     if "function_name" in filtered_kwargs:
         command = str(filtered_kwargs["function_name"])
         arguments = {k: v for k, v in filtered_kwargs.items() if k != "function_name"}
     elif "command" in filtered_kwargs:
         command = str(filtered_kwargs["command"])
-        arguments = dict(filtered_kwargs.get("arguments", {}) or {})
+        raw_args = filtered_kwargs.get("arguments", {})
+        if isinstance(raw_args, dict):
+            arguments = {k: v for k, v in raw_args.items() if k not in ("timeout", "request_timeout")}
         for k, v in filtered_kwargs.items():
             if k not in ("command", "arguments"):
                 arguments[k] = v
@@ -82,8 +92,6 @@ async def request_to_server(**kwargs: Any) -> Any:
 
     try:
         client = await get_robot_client()
-        if call_timeout is None:
-            call_timeout = compute_command_timeout(command, arguments, client.config.request_timeout)
         response = await client.request(command, arguments, timeout=call_timeout)
         if response.ok:
             return response.result
@@ -94,9 +102,10 @@ async def request_to_server(**kwargs: Any) -> Any:
             response.error.get("message") if response.error else "unknown error",
         )
         return None
-    except ExecutionOutcomeUnknown as exc:
-        logger.warning("Ambiguous execution outcome for '%s': %s", command, exc)
-        return None
+    except ExecutionOutcomeUnknown:
+        # Crucial: Propagate typed exception so callers recognize uncertain physical execution
+        logger.warning("Propagating ambiguous execution outcome for '%s'", command)
+        raise
     except asyncio.TimeoutError:
         logger.warning("Robot server not responding within timeout for command '%s'", command)
         return None

@@ -94,18 +94,10 @@ except ImportError as exc:
 
     picoh = MockPicoh()
 
-_hardware_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="picoh-hw-win2")
-
-
-async def run_hardware_op(func: Any, *args: Any, **kwargs: Any) -> Any:
-    """Execute hardware operation safely off the event loop thread."""
-    if inspect.iscoroutinefunction(func):
-        return await func(*args, **kwargs)
-    loop = asyncio.get_running_loop()
-    res = await loop.run_in_executor(_hardware_executor, lambda: func(*args, **kwargs))
-    if inspect.isawaitable(res):
-        return await res
-    return res
+from transport.hardware import (
+    get_default_hardware_executor,
+    run_hardware_op,
+)
 
 
 # State tracking globals
@@ -554,7 +546,7 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
     registry.register("wait", _handle_wait, validate_wait_arguments)
     registry.register("picoh_wait", _handle_wait, validate_wait_arguments)
 
-    return RobotServer(config=cfg, registry=registry)
+    return RobotServer(config=cfg, registry=registry, hardware_executor=get_default_hardware_executor())
 
 
 async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:

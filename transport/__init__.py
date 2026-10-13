@@ -31,6 +31,15 @@ from transport.framing import (
     read_frame,
     write_frame,
 )
+from transport.hardware import (
+    HardwareExecutor,
+    HardwareOperation,
+    OperationState,
+    get_default_hardware_executor,
+    reset_default_hardware_executor,
+    run_hardware_op,
+    run_hardware_sync,
+)
 from transport.protocol import (
     CURRENT_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -44,6 +53,7 @@ from transport.protocol import (
     TransportError,
     TransportErrorCode,
     TruncatedFrameError,
+    validate_timeout_override,
 )
 from transport.registry import (
     CommandRegistry,
@@ -70,6 +80,9 @@ __all__ = [
     "ExecutionOutcomeUnknown",
     "FramingError",
     "HMACAuthenticator",
+    "HardwareExecutor",
+    "HardwareOperation",
+    "OperationState",
     "PayloadTooLargeError",
     "ProtocolViolationError",
     "ReplayCache",
@@ -88,7 +101,11 @@ __all__ = [
     "compute_response_signature",
     "compute_signature",
     "create_default_registry",
+    "get_default_hardware_executor",
     "read_frame",
+    "reset_default_hardware_executor",
+    "run_hardware_op",
+    "run_hardware_sync",
     "sign_request",
     "sign_response",
     "validate_base_col_arguments",
@@ -96,6 +113,7 @@ __all__ = [
     "validate_move_arguments",
     "validate_reply_arguments",
     "validate_say_arguments",
+    "validate_timeout_override",
     "validate_wait_arguments",
     "verify_response",
     "write_frame",

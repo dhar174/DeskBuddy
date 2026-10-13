@@ -94,14 +94,10 @@ except ImportError as exc:
 
     picoh = MockPicoh()
 
-# Single-worker thread pool to serialize blocking physical hardware interactions
-_hardware_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="picoh-hw-win1")
-
-
-async def run_hardware_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
-    """Execute blocking hardware driver calls off the event loop thread in a serialized worker."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_hardware_executor, lambda: func(*args, **kwargs))
+from transport.hardware import (
+    get_default_hardware_executor,
+    run_hardware_sync,
+)
 
 # State tracking globals
 lastReplyMessage = ""
@@ -501,7 +497,7 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
     registry.register("wait", _handle_wait, validate_wait_arguments)
     registry.register("picoh_wait", _handle_wait, validate_wait_arguments)
 
-    return RobotServer(config=cfg, registry=registry)
+    return RobotServer(config=cfg, registry=registry, hardware_executor=get_default_hardware_executor())
 
 
 async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:

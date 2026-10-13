@@ -17,6 +17,7 @@ DEFAULT_MAX_PAYLOAD_SIZE: Final[int] = 65536  # 64 KiB
 DEFAULT_MAX_CLOCK_SKEW: Final[float] = 30.0  # seconds
 DEFAULT_MAX_RETRIES: Final[int] = 3
 DEFAULT_RETRY_BACKOFF: Final[float] = 0.2  # seconds
+DEFAULT_RESPONSE_GRACE: Final[float] = 2.0  # seconds
 
 
 def compute_command_timeout(
@@ -68,6 +69,7 @@ class TransportConfig:
     max_clock_skew: float = DEFAULT_MAX_CLOCK_SKEW
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_backoff: float = DEFAULT_RETRY_BACKOFF
+    response_grace: float = DEFAULT_RESPONSE_GRACE
 
     @classmethod
     def from_settings(

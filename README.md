@@ -284,7 +284,40 @@ Key security guarantees:
 - Bounded clock drift window (default: 30s) prevents replay of expired messages.
 - Server-side TTL-aware replay cache (`ReplayCache`) prevents duplicate command execution.
 - **Fail Closed on Startup**: The server strictly requires a non-empty shared secret (`robot_auth_secret`) and will abort startup before binding to a network port if unconfigured.
-- **Ambiguous Execution Semantics**: If network connection drops after a command was sent and the client reconnects to retry, the server will reject the duplicate with `replayed_request`. The client explicitly surfaces this as `ExecutionOutcomeUnknown` rather than a generic failure, alerting the caller that the physical robot may or may not have executed the command.
+- **HMAC Scope & Confidentiality**: HMAC-SHA256 guarantees authenticity and message integrity, preventing unauthorized command injection, tampering, and replay. However, HMAC **does not encrypt traffic payloads**. For multi-host deployments over non-local networks, traffic must be routed over a trusted private network, VPN, or SSH tunnel to ensure confidentiality.
+- **Ambiguous Execution Semantics (`ExecutionOutcomeUnknown`)**:
+  - A network timeout or connection reset after a command frame was transmitted does **not** prove that a physical robot action did not execute.
+  - Distinguishes definitively unsent requests (ordinary `TransportError`) from uncertain execution (`ExecutionOutcomeUnknown`).
+  - `ExecutionOutcomeUnknown` is raised whenever:
+    1. A connection drops after a side-effecting frame may have reached the socket.
+    2. A socket write or drain partially succeeds and then fails.
+    3. Read times out after a request was transmitted.
+    4. Overall request deadline expires after transmission.
+    5. Reconnection fails after an earlier transmission may have reached the server.
+    6. A retried request receives `replayed_request` or `execution_outcome_unknown`.
+  - **No Blind Retries**: Side-effecting physical actions (`move`, `say`, `reply`, `base_col`, `wait`) must **never** be automatically retried blindly when execution outcome is uncertain, to avoid hazardous repeated motor motions or speech loops.
+  - **Caller Handling**: Callers receiving `ExecutionOutcomeUnknown` should identify the command and request ID, log an actionable warning, notify the operator/user if appropriate, and avoid immediate re-dispatch without confirming physical state.
+
+## Concurrency & Hardware Timeout Contracts
+
+1. **Client Lock Contention & Timestamp Freshness**:
+   - `RobotClient.request()` serializes socket I/O across concurrent coroutines via an internal lock.
+   - Request creation and HMAC signing occur immediately before transmission, *after* acquiring the client lock. This ensures queued requests waiting behind long-running operations do not become stale or get rejected with `expired_request`.
+   - Time waiting for the client lock has its own bounded queueing deadline. If a request times out while waiting for the lock, it was definitively never transmitted.
+
+2. **Timeout Hierarchy & Network Grace**:
+   - **Server Execution Budget**: `compute_command_timeout(command, args, base_timeout)` dynamically scales for speech and wait durations.
+   - **Client Response Budget**: `server_command_timeout + bounded_network_grace` ensures the server has adequate margin to finish execution, sign, and transmit the response frame before the client deadline expires.
+   - **Connection Establishment**: Governed by `robot_connect_timeout_seconds`.
+   - **Per-Frame I/O**: Governed by bounded write/read deadlines.
+   - **Runtime Overrides**: Validated strictly before transmission. Zero, negative, NaN, infinite, boolean, and non-numeric values are rejected immediately with typed errors (`TypeError`, `ValueError`).
+
+3. **Synchronous Hardware Execution & Cancellation Limits**:
+   - Physical Picoh driver operations (`picoh.move`, `picoh.say`, `picoh.setBaseColour`) execute in a dedicated, serialized single-worker hardware executor (`HardwareExecutor`).
+   - Cancelling a coroutine awaiting hardware execution cannot forcibly terminate active C-extension or Python thread driver routines.
+   - If a synchronous operation is still running on the worker thread when the server coroutine times out, the server explicitly reports `execution_outcome_unknown` rather than falsely claiming the operation was cancelled or stopped.
+   - Conflicting physical commands dispatched while a prior hardware operation remains unresolved are rejected, preserving serialized safety and preventing concurrent hardware access.
+   - Queued executor operations that are cancelled before worker pickup are marked `CANCELLED` and never touch physical hardware.
 
 ## Command Allowlist & Validation
 
@@ -305,7 +338,7 @@ Unrestricted dynamic dispatch (`getattr(MyFunctions, ...)`) has been completely 
 - **Default Binding**: The server binds to `127.0.0.1` (loopback) by default. It must NOT be exposed directly to the public Internet.
 - **LAN Multi-Host Deployment**: When DeskBuddy and Picoh run on separate machines across a local network:
   - Configure `DESKBUDDY_ROBOT_BIND_ADDRESS` (or `DESKBUDDY_ROBOT_HOST`) to the server's private LAN IP on the host running `buddy1.py`.
-  - Ensure traffic is routed over a secure private network or VPN.
+  - Ensure traffic is routed over a secure private network, VPN, or SSH tunnel (HMAC provides authentication and integrity, not encryption).
   - Set a cryptographically strong shared secret via `DESKBUDDY_ROBOT_AUTH_SECRET`.
 
 ## Configuration Parameters

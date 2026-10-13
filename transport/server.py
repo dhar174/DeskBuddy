@@ -10,10 +10,12 @@ from typing import Any
 from transport.auth import HMACAuthenticator, sign_response
 from transport.config import TransportConfig, compute_command_timeout
 from transport.framing import read_frame, write_frame
+from transport.hardware import HardwareExecutor, get_default_hardware_executor
 from transport.protocol import (
     CURRENT_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
     AuthenticationError,
+    ExecutionOutcomeUnknown,
     PayloadTooLargeError,
     ProtocolViolationError,
     RobotRequest,
@@ -34,6 +36,7 @@ class RobotServer:
         self,
         config: TransportConfig | None = None,
         registry: CommandRegistry | None = None,
+        hardware_executor: HardwareExecutor | None = None,
         *,
         host: str | None = None,
         port: int | None = None,
@@ -58,6 +61,7 @@ class RobotServer:
             )
 
         self.registry = registry or CommandRegistry()
+        self.hardware_executor = hardware_executor or get_default_hardware_executor()
         self.authenticator = HMACAuthenticator(
             secret=self.config.secret,
             max_clock_skew=self.config.max_clock_skew,
@@ -287,10 +291,26 @@ class RobotServer:
             return RobotResponse.success(request_id=req_id, result=result)
         except asyncio.TimeoutError:
             logger.warning("Command '%s' timed out after %.2fs", request.command, cmd_timeout)
+            if self.hardware_executor and self.hardware_executor.has_unresolved_operation:
+                return RobotResponse.fail(
+                    request_id=req_id,
+                    code=TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
+                    message=(
+                        f"Command '{request.command}' execution outcome is unknown: "
+                        f"operation timed out after {cmd_timeout:.2f}s while physical hardware was still running"
+                    ),
+                )
             return RobotResponse.fail(
                 request_id=req_id,
                 code=TransportErrorCode.TIMEOUT,
                 message=f"Command '{request.command}' timed out after {cmd_timeout:.2f}s",
+            )
+        except ExecutionOutcomeUnknown as exc:
+            logger.warning("Execution outcome unknown executing command '%s': %s", request.command, exc)
+            return RobotResponse.fail(
+                request_id=req_id,
+                code=TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
+                message=exc.message,
             )
         except TransportError as exc:
             logger.warning("Transport error executing command '%s': %s", request.command, exc)
