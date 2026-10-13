@@ -80,7 +80,7 @@ uv run --no-sync mypy
 | `vision` | Headless OpenCV and Pillow; no automatic model or camera access |
 | `picoh` | Windows vendor integration; physical hardware/resources required for actual use |
 | `legacy` | Experimental Linux DeepSpeed, spaCy, datasets and classifier compatibility |
-| `dev` group | pytest, Ruff and mypy; never part of the default core install |
+| `dev` group | pytest, pytest-asyncio, Ruff and mypy; never part of the default core install |
 
 `local_model_endpoint` establishes configuration for a future endpoint adapter;
 this baseline does not introduce an inference server client. Selecting `local`

@@ -60,7 +60,7 @@ legacy = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "ruff>=0.9,<1", "mypy>=1.14,<2"]
+dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.4,<2", "ruff>=0.9,<1", "mypy>=1.14,<2"]
 
 [tool.uv]
 required-version = ">=0.9.26"
@@ -81,6 +81,8 @@ include = ["src/deskbuddy", "pyproject.toml", "README.md", ".env.example", "desk
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 target-version = "py311"

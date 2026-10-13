@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import re
 import shutil
 import subprocess
@@ -24,6 +25,15 @@ HEAVY_DISTRIBUTIONS = {
     "picoh",
     "deepspeed",
 }
+
+
+@pytest.mark.asyncio
+async def test_dev_asyncio_plugin_executes_marked_coroutines() -> None:
+    async def worker() -> str:
+        await asyncio.sleep(0)
+        return "completed"
+
+    assert await asyncio.wait_for(asyncio.create_task(worker()), timeout=1) == "completed"
 
 
 def _distribution_name(requirement: str) -> str:
