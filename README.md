@@ -67,7 +67,7 @@ uv sync --locked --no-editable --extra local --extra vision
 uv sync --locked --no-editable --extra speech --extra picoh
 uv sync --locked --group dev
 uv run --no-sync pytest
-uv run --no-sync ruff check src tests
+uv run --no-sync ruff check .
 uv run --no-sync mypy
 ```
 

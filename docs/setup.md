@@ -223,6 +223,15 @@ Merge PR #28's `pytest.ini` options into `[tool.pytest.ini_options]` and remove 
 redundant file so pytest does not shadow this configuration. The locked dev group
 includes pytest-asyncio; run the combined transport and baseline tests after rebase.
 
+Run `uv run --no-sync ruff check .` and `uv run --no-sync mypy` for production
+checks. Ruff includes `src/`, `tests/` and the future top-level `transport/`.
+Mypy discovers packages from the repository root, including `transport/` as soon
+as it exists, while excluding tests, generated build artifacts, Windows vendor
+copies and flat legacy scripts.
+Keep the repository root a non-package (no root `__init__.py`); production packages
+belong under `src/` or in the temporary `transport/` boundary. PR #28 must fix any
+lint/type errors exposed by these checks rather than disabling the transport scope.
+
 ## Larynx Docker limitation
 
 `larynx.Dockerfile` is retained byte-for-byte. It builds a Debian `.deb` under
