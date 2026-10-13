@@ -228,6 +228,128 @@ I have also added an online mode - the offline mode was always intended as a bac
 ### If anyone would like to assist me by providing material compute resources, please contact me. I will happily accept donations of hardware
 
 
+# Authenticated Robot Transport Protocol
+
+DeskBuddy uses a length-framed, HMAC-SHA256 authenticated, typed JSON transport between `start_bot.py` (`robot_client.py`) and `buddy1.py` (controlling the Ohbot Picoh robot). This replaces the legacy insecure `pickle` RPC over TCP.
+
+## Architecture & Wire Protocol
+
+- **Framing**: 4-byte big-endian unsigned integer length prefix followed by UTF-8 encoded JSON payload:
+  `[4-byte header (big-endian uint32)][JSON payload bytes]`
+- **Serialization**: Non-executable JSON serialization (`json.dumps`/`json.loads`). No Python object pickling, eval, or exec.
+- **Envelope Schemas**:
+  - `RobotRequest`:
+    - `request_id`: Unique identifier (UUID4 string)
+    - `protocol_version`: `"1.0"`
+    - `timestamp`: Unix epoch float seconds
+    - `command`: Command name string
+    - `arguments`: JSON dictionary of arguments
+    - `auth`: `{"scheme": "hmac-sha256", "signature": "<hex-digest>"}`
+  - `RobotResponse`:
+    - `request_id`: Correlated request identifier (or null if unparseable)
+    - `protocol_version`: `"1.0"`
+    - `ok`: Boolean status flag
+    - `result`: Command output on success
+    - `error`: Structured error object `{"code": "<error_code>", "message": "<sanitized_detail>"}` on failure
+
+## Machine-Readable Error Codes
+
+- `malformed_request`: Invalid framing, unparseable JSON, or missing required envelope fields.
+- `unsupported_protocol`: Protocol version not recognized by the server.
+- `unauthorized`: Missing, invalid, or tampered HMAC signature.
+- `expired_request`: Timestamp exceeds the configured clock skew threshold.
+- `replayed_request`: Request identifier has already been processed within the validity window.
+- `unsupported_command`: Command is not in the explicit allowlist.
+- `invalid_arguments`: Command arguments fail schema, type, range, or length validation.
+- `payload_too_large`: Declared frame length exceeds the configured maximum before allocating memory.
+- `timeout`: Network read, write, connect, or request deadline exceeded.
+- `internal_error`: Sanitized handler error during command execution.
+
+## Symmetric Authentication & Replay Protection
+
+Communication between the DeskBuddy client and robot server is cryptographically signed using HMAC-SHA256 with domain separation:
+- **Requests** are signed using the `deskbuddy-request-v1` domain:
+  ```
+  deskbuddy-request-v1|{protocol_version}|{request_id}|{timestamp:.6f}|{command}|{canonical_arguments_json}
+  ```
+- **Responses** are signed using the `deskbuddy-response-v1` domain:
+  ```
+  deskbuddy-response-v1|{protocol_version}|{request_id}|{timestamp:.6f}|{status}|{canonical_result_json}|{canonical_error_json}
+  ```
+  where `status` is `"1"` on success and `"0"` on failure.
+
+Key security guarantees:
+- Domain separation prevents cross-protocol reflection attacks (requests cannot be replayed as responses or vice versa).
+- Constant-time HMAC comparison prevents timing attacks (`hmac.compare_digest`).
+- Bounded clock drift window (default: 30s) prevents replay of expired messages.
+- Server-side TTL-aware replay cache (`ReplayCache`) prevents duplicate command execution.
+- **Fail Closed on Startup**: The server strictly requires a non-empty shared secret (`robot_auth_secret`) and will abort startup before binding to a network port if unconfigured.
+- **Ambiguous Execution Semantics**: If network connection drops after a command was sent and the client reconnects to retry, the server will reject the duplicate with `replayed_request`. The client explicitly surfaces this as `ExecutionOutcomeUnknown` rather than a generic failure, alerting the caller that the physical robot may or may not have executed the command.
+
+## Command Allowlist & Validation
+
+Unrestricted dynamic dispatch (`getattr(MyFunctions, ...)`) has been completely removed. Remotely invocable commands are strictly bounded:
+
+| Command | Arguments | Validation Rules | Description |
+| :--- | :--- | :--- | :--- |
+| `check_for_response` | `{}` | No arguments accepted | Polls for latest Whisper STT transcription |
+| `reply` | `{"message": str}` | String, length $\le 10,000$ | Commands Picoh to speak assistant response |
+| `simple_test` / `ping` | `{}` | No arguments accepted | Health check / connectivity ping |
+| `base_col` / `baseCol` | `{"r": int, "g": int, "b": int}` | Integers in `[0, 10]` (rejected with `invalid_arguments` if out of bounds) | Sets base LED color |
+| `say` / `picoh_say` | `{"text": str}` | String, length $\le 10,000$ | Direct Picoh speech synthesis |
+| `move` / `picoh_move` | `{"motor": str\|int, "position": float}` | Motor index 0–6 (or valid motor name) and position in `[0.0, 10.0]` (rejected with `invalid_arguments` if out of bounds) | Servomotor movement with physical safety limit |
+| `wait` / `picoh_wait` | `{"seconds": float}` | Duration in `[0.0, 60.0]` (rejected with `invalid_arguments` if out of bounds) | Pauses Picoh execution |
+
+## Safe Binding & Network Exposure
+
+- **Default Binding**: The server binds to `127.0.0.1` (loopback) by default. It must NOT be exposed directly to the public Internet.
+- **LAN Multi-Host Deployment**: When DeskBuddy and Picoh run on separate machines across a local network:
+  - Configure `DESKBUDDY_ROBOT_BIND_ADDRESS` (or `DESKBUDDY_ROBOT_HOST`) to the server's private LAN IP on the host running `buddy1.py`.
+  - Ensure traffic is routed over a secure private network or VPN.
+  - Set a cryptographically strong shared secret via `DESKBUDDY_ROBOT_AUTH_SECRET`.
+
+## Configuration Parameters
+
+All transport parameters derive from canonical DeskBuddy settings (`deskbuddy.settings.Settings`) or explicit `TransportConfig`:
+
+| Setting Field | Environment Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `robot_host` | `DESKBUDDY_ROBOT_HOST` | `127.0.0.1` | Target robot host address for clients |
+| `robot_bind_address` | `DESKBUDDY_ROBOT_BIND_ADDRESS` | `127.0.0.1` | Network interface IP to bind server socket |
+| `robot_port` | `DESKBUDDY_ROBOT_PORT` | `8888` | TCP port for robot RPC |
+| `robot_auth_secret` | `DESKBUDDY_ROBOT_AUTH_SECRET` | `""` (required) | Shared secret for HMAC-SHA256 authentication |
+| `robot_connect_timeout_seconds` | `DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS` | `5.0` | Socket connect timeout in seconds |
+| `robot_timeout_seconds` | `DESKBUDDY_ROBOT_TIMEOUT_SECONDS` | `5.0` | Base request deadline in seconds (dynamically scales with `wait`/`say`) |
+
+## Migration from Legacy Pickle RPC
+
+1. Legacy unpickling has been completely removed for security reasons across all robot server entrypoints (`buddy1.py`, `windows/buddy1.py`, and `windows/buddy2.py`). Unauthenticated or raw pickle payloads will be rejected with `malformed_request` or framing errors.
+2. Existing application code using `robot_client.request_to_server(**kwargs)` remains fully compatible:
+   - `request_to_server(function_name="check_for_response")` automatically translates to the authenticated `check_for_response` command.
+   - `request_to_server(function_name="reply", message=reply)` translates to the authenticated `reply` command.
+3. For new code, prefer the typed client interface:
+   ```python
+   from deskbuddy.settings import load_settings
+   from transport import RobotClient, TransportConfig
+
+   settings = load_settings()
+   config = TransportConfig.from_settings(settings, role="client")
+   async with RobotClient(config) as client:
+       transcription = await client.check_for_response()
+       await client.reply("Hello from DeskBuddy!")
+   ```
+
+## Running Transport Tests
+
+Unit, negative, and integration tests do not require physical robot hardware (safe mocks and ephemeral ports are utilized):
+```bash
+python -m pytest tests/ -v
+```
+
+
+
+
+
 # Video Demonstrations
 
 ## Videos from May 02 update:

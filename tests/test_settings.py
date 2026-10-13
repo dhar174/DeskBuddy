@@ -430,3 +430,100 @@ def test_camera_url_validation_does_not_echo_embedded_credentials(
         )
     assert "camera URL requires" in str(raised.value)
     assert "do-not-echo-me" not in str(raised.value)
+
+
+def test_settings_to_client_and_server_transport_config_mapping(
+    app_roots: tuple[Path, Path, Path],
+) -> None:
+    from transport.config import TransportConfig
+
+    settings = load_settings(
+        environ={
+            "DESKBUDDY_ROBOT_HOST": "192.168.1.100",
+            "DESKBUDDY_ROBOT_BIND_ADDRESS": "0.0.0.0",
+            "DESKBUDDY_ROBOT_PORT": "9123",
+            "DESKBUDDY_ROBOT_AUTH_SECRET": "canonical-auth-secret-12345",
+            "DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS": "3.5",
+            "DESKBUDDY_ROBOT_TIMEOUT_SECONDS": "42.0",
+        }
+    )
+
+    # 1. Client TransportConfig
+    client_cfg = TransportConfig.from_settings(settings, role="client")
+    assert client_cfg.host == "192.168.1.100"
+    assert client_cfg.port == 9123
+    assert client_cfg.secret == "canonical-auth-secret-12345"
+    assert client_cfg.connect_timeout == 3.5
+    assert client_cfg.read_timeout == 42.0
+    assert client_cfg.write_timeout == 42.0
+    assert client_cfg.request_timeout == 42.0
+
+    # 2. Server TransportConfig
+    server_cfg = TransportConfig.from_settings(settings, role="server")
+    assert server_cfg.host == "0.0.0.0"
+    assert server_cfg.port == 9123
+    assert server_cfg.secret == "canonical-auth-secret-12345"
+    assert server_cfg.connect_timeout == 3.5
+    assert server_cfg.read_timeout == 42.0
+    assert server_cfg.write_timeout == 42.0
+    assert server_cfg.request_timeout == 42.0
+
+    # 3. Client host and server bind address remain distinct
+    assert client_cfg.host != server_cfg.host
+    assert client_cfg.host == settings.robot_host
+    assert server_cfg.host == settings.robot_bind_address
+
+    # 4. Helper classmethods
+    assert TransportConfig.for_client(settings).host == "192.168.1.100"
+    assert TransportConfig.for_server(settings).host == "0.0.0.0"
+
+    # 5. Invalid role fails explicitly
+    with pytest.raises(ValueError, match="Invalid role"):
+        TransportConfig.from_settings(settings, role="gateway")  # type: ignore[arg-type]
+
+
+def test_settings_to_transport_config_missing_or_blank_secret_fails_closed(
+    app_roots: tuple[Path, Path, Path],
+) -> None:
+    from transport.config import TransportConfig
+    from transport.protocol import AuthenticationError
+
+    # Missing secret (None)
+    settings_none = load_settings(environ={})
+    assert settings_none.robot_auth_secret is None
+    with pytest.raises(AuthenticationError) as exc_none:
+        TransportConfig.from_settings(settings_none, role="client")
+    assert "Missing robot authentication secret" in str(exc_none.value)
+
+    # Blank / whitespace secret
+    settings_blank = load_settings(environ={"DESKBUDDY_ROBOT_AUTH_SECRET": "   "})
+    assert settings_blank.robot_auth_secret is None
+    with pytest.raises(AuthenticationError) as exc_blank:
+        TransportConfig.from_settings(settings_blank, role="server")
+    assert "Missing robot authentication secret" in str(exc_blank.value)
+
+
+@pytest.mark.parametrize(
+    ("env_var", "bad_value"),
+    [
+        ("DESKBUDDY_ROBOT_PORT", "0"),
+        ("DESKBUDDY_ROBOT_PORT", "65536"),
+        ("DESKBUDDY_ROBOT_PORT", "-1"),
+        ("DESKBUDDY_ROBOT_PORT", "not-a-port"),
+        ("DESKBUDDY_ROBOT_TIMEOUT_SECONDS", "0"),
+        ("DESKBUDDY_ROBOT_TIMEOUT_SECONDS", "-5"),
+        ("DESKBUDDY_ROBOT_TIMEOUT_SECONDS", "nan"),
+        ("DESKBUDDY_ROBOT_TIMEOUT_SECONDS", "inf"),
+        ("DESKBUDDY_ROBOT_TIMEOUT_SECONDS", "not-a-number"),
+        ("DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS", "0"),
+        ("DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS", "-1.5"),
+        ("DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS", "nan"),
+        ("DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS", "inf"),
+        ("DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS", "not-a-number"),
+    ],
+)
+def test_malformed_robot_configuration_fails_closed_without_silent_defaults(
+    env_var: str, bad_value: str, app_roots: tuple[Path, Path, Path]
+) -> None:
+    with pytest.raises(SettingsError):
+        load_settings(environ={env_var: bad_value})

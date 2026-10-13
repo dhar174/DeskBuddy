@@ -49,10 +49,11 @@
     *   **Purpose:** Stores the last message/reply that Picoh spoke, to avoid repeating the same message.
 
 *   **Data exchanged via `robot_client.py` and `buddy1.py` (TCP Server/Client)**
-    *   **Location:** `robot_client.py`, `buddy1.py`
-    *   **Structure:** Pickled Python dictionaries. The dictionary includes `function_name` (string) and optionally `message` (string) for calls from client to server. The server returns pickled results.
-    *   **Purpose:** Facilitates communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like getting transcriptions or sending text for Picoh to speak.
-    *   **Security warning:** Because this protocol uses Python `pickle` over TCP, it must only be used on a trusted network (for example, localhost or a private, isolated network) and must not be exposed to untrusted clients. Unpickling data from untrusted sources can lead to arbitrary code execution. If remote access is required, replace `pickle` with a safer serialization format such as JSON.
+    *   **Location:** `robot_client.py`, `buddy1.py`, `transport/`
+    *   **Structure:** 4-byte length-prefixed JSON schemas (`RobotRequest` / `RobotResponse`). Requests include `request_id`, `protocol_version`, `timestamp`, `command`, `arguments`, and an HMAC-SHA256 `auth` signature. Responses contain `request_id`, `protocol_version`, `ok`, `result`, and structured `error` (`code` and `message`).
+    *   **Purpose:** Facilitates secure communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like polling transcriptions or sending text for Picoh to speak.
+    *   **Security Architecture:** Replaced legacy unauthenticated pickle RPC with strict non-executable JSON framing, HMAC-SHA256 signatures, replay protection cache, bounded payload size enforcement (default 64 KiB), and an explicit command allowlist without dynamic dispatch.
+
 
 *   **`start_bot.message` / `start_bot.user_response`**
     *   **Location:** `start_bot.py`
