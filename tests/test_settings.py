@@ -129,6 +129,37 @@ def test_environment_variable_names_are_provider_specific_and_secrets_are_redact
     assert "super-secret" not in str(error.value)
 
 
+def test_canonical_robot_settings_keep_client_bind_secret_and_deadlines_distinct(
+    app_roots: tuple[Path, Path, Path],
+) -> None:
+    settings = load_settings(
+        environ={
+            "DESKBUDDY_ROBOT_HOST": "robot.example",
+            "DESKBUDDY_ROBOT_BIND_ADDRESS": "127.0.0.2",
+            "DESKBUDDY_ROBOT_PORT": "9000",
+            "DESKBUDDY_ROBOT_AUTH_SECRET": "canonical-test-secret",
+            "DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS": "2.5",
+            "DESKBUDDY_ROBOT_TIMEOUT_SECONDS": "75",
+            # PR #28 must adapt to Settings rather than maintaining these aliases.
+            "DESKBUDDY_ROBOT_SECRET": "unused-alias-secret",
+            "DESKBUDDY_ROBOT_CONNECT_TIMEOUT": "invalid-alias",
+            "DESKBUDDY_ROBOT_READ_TIMEOUT": "invalid-alias",
+            "DESKBUDDY_ROBOT_WRITE_TIMEOUT": "invalid-alias",
+            "DESKBUDDY_ROBOT_REQUEST_TIMEOUT": "invalid-alias",
+        }
+    )
+
+    assert settings.robot_host == "robot.example"
+    assert settings.robot_bind_address == "127.0.0.2"
+    assert settings.robot_port == 9000
+    assert settings.robot_auth_secret is not None
+    assert settings.robot_auth_secret.get_secret_value() == "canonical-test-secret"
+    assert settings.robot_connect_timeout_seconds == 2.5
+    assert settings.robot_timeout_seconds == 75
+    assert "canonical-test-secret" not in repr(settings)
+    assert "unused-alias-secret" not in repr(settings)
+
+
 @pytest.mark.parametrize("contents", ["", "robot_port=3000\n", "[deskbuddy]\nport = 3000\n"])
 def test_explicit_config_requires_a_valid_deskbuddy_table(
     tmp_path: Path, contents: str, app_roots: tuple[Path, Path, Path]

@@ -25,8 +25,9 @@ SDK, with a 30-second request timeout. It never imports BotCortex, local classif
 or model runtimes. It is separate from the preserved legacy conversation flow;
 headless validation without `--prompt` remains entirely offline.
 Configuration/input errors return exit code 2. Missing cloud capabilities or
-OpenAI authentication, network and request failures return exit code 1 with a
-cloud diagnostic message; provider error text and credential values are redacted.
+OpenAI authentication, network, request and malformed-response failures return
+exit code 1 with a cloud diagnostic message; provider error text, malformed
+response contents and credential values are redacted.
 
 Official compatibility references: [PyTorch releases](https://github.com/pytorch/pytorch/blob/main/RELEASE.md),
 [compatible Torch releases](https://pytorch.org/get-started/previous-versions/),
@@ -41,8 +42,12 @@ Source-file cache keys ensure subsequent non-editable syncs rebuild the package
 when its Python sources change.
 The supported uv minimum is 0.9.26. `uv sync` is also a one-command developer
 bootstrap but installs the project editable; an editable install is not required.
-Developer tools are explicitly enabled by `--group dev`. uv resolves optional
-extras into one universal lock without installing them during core synchronization.
+Developer tools are explicitly enabled by `--group dev`, including pytest-asyncio
+for the transport suite's coroutine tests. pytest-asyncio 1.4 requires pytest 8.4
+or newer; the dev group retains pytest below 9 and the lock selects compatible
+versions. Async tests use automatic discovery and function-scoped fixture loops.
+uv resolves optional extras into one universal lock without installing them during
+core synchronization.
 
 To intentionally change dependencies, edit pyproject.toml, run `uv lock`, review
 the lock diff and run `uv lock --check`. Regenerate the compatibility export with:
@@ -136,8 +141,28 @@ DeepSpeed is Linux-only and experimental because the old local checkout's versio
 is unknown. Its source build needs special handling documented in pyproject.toml;
 `tool.uv.extra-build-variables` sets `DS_BUILD_OPS=0` to defer native op compilation
 to the optional runtime instead of requiring Torch/CUDA merely to resolve the lock;
-this does not pull Torch into core. Optional local/vision/speech libraries do not
-initialize merely because `deskbuddy` is imported. BotCortex's VQA weights now load
+this does not pull Torch into core.
+
+### Legacy CUDA/NCCL profiles
+
+The retained `BotCortex.load_all_models()` dispatcher calls
+`deepspeed.init_distributed("nccl")` for **Large mode with either provider** and
+**Medium mode with OpenAI**. Those profiles require Linux, an NVIDIA CUDA device,
+a PyTorch build with NCCL support and a configured distributed launcher. They
+cannot honor `device=cpu`, `device=mps`, or `device=auto` when it resolves to CPU.
+The settings schema accepts those device preferences for other capabilities; a
+successful headless validation does not qualify these legacy profiles. Local
+Medium selects BlenderBot without this NCCL initialization, but the legacy GUI
+still imports the combined legacy dependencies and remains unqualified here.
+
+Model-runtime migration (#8) must replace this NCCL dependency or add a
+profile-specific capability guard before initialization/model loading. This is a
+documented legacy limitation, not a change to model routing in the packaging
+baseline. The packaged headless command and one-shot cloud diagnostic never enter
+these profiles and need no CUDA/NCCL installation.
+
+Optional local/vision/speech libraries do not initialize merely because `deskbuddy`
+is imported. BotCortex's VQA weights now load
 only when a configured vision question is requested. Capture, model loading and
 inference run in a worker thread; a thread lock serializes the shared VQA model,
 including first-load initialization. Failed loads publish no partial cache and
@@ -170,6 +195,33 @@ and use `load_settings()` (or an injected Settings instance) for `robot_host`,
 accessed explicitly via `.get_secret_value()` after checking for None. #4 must
 enforce missing-secret rules, authenticated transport and timeouts. #5 does not
 claim that merely configuring a secret secures the old protocol.
+
+PR #28 must adapt its transport configuration to this canonical Settings API when
+rebased onto this baseline. Keep the following names and source values:
+
+| Settings field | Transport use |
+| --- | --- |
+| `robot_host` | Client target address |
+| `robot_bind_address` | Server bind interface, independent of the client target |
+| `robot_port` | Client/server TCP port |
+| `robot_auth_secret` | Authentication secret; require a nonempty value before transport startup |
+| `robot_connect_timeout_seconds` | Connection establishment deadline |
+| `robot_timeout_seconds` | Request/I/O deadline policy |
+
+`DESKBUDDY_ROBOT_AUTH_SECRET`, `DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS`, and
+`DESKBUDDY_ROBOT_TIMEOUT_SECONDS` are the corresponding environment names.
+Replace PR #28's separate `DESKBUDDY_ROBOT_SECRET` and connect/read/write/request
+timeout environment parser with an adapter consuming Settings. Internal transport
+configuration objects may remain, but must not read a second set of environment
+variables or silently fall back on malformed values. If separate phase deadlines
+remain necessary, derive them explicitly from the validated request policy; add
+any additional user-facing settings here with validation and examples. The current
+5-second default is not a promise that long speech or wait commands will finish
+within it; PR #28 must verify timeout policy for those commands during integration.
+
+Merge PR #28's `pytest.ini` options into `[tool.pytest.ini_options]` and remove the
+redundant file so pytest does not shadow this configuration. The locked dev group
+includes pytest-asyncio; run the combined transport and baseline tests after rebase.
 
 ## Larynx Docker limitation
 
