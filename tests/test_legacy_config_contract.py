@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from deskbuddy.settings import Settings
+from deskbuddy.settings import Settings, SettingsError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BOT_CORTEX_PATH = REPOSITORY_ROOT / "BotCortex.py"
@@ -173,9 +173,12 @@ def test_vqa_weights_are_constructed_only_inside_on_demand_function() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    assert vqa_functions.get("answer_visual_question") == {"GitProcessor", "GitForCausalLM"}
+    assert vqa_functions.get("_answer_visual_question_sync") == {
+        "GitProcessor",
+        "GitForCausalLM",
+    }
     assert not any(
-        classes for name, classes in vqa_functions.items() if name != "answer_visual_question"
+        classes for name, classes in vqa_functions.items() if name != "_answer_visual_question_sync"
     )
     assert all(
         not _vqa_pretrained_classes(node)
@@ -184,43 +187,151 @@ def test_vqa_weights_are_constructed_only_inside_on_demand_function() -> None:
     )
 
 
+def _memory_test_function(
+    settings: Settings,
+    torch_module: Any,
+    available: Any,
+    gpu_available: Any = 8 * 1024**3,
+):
+    class FakePsutil:
+        @staticmethod
+        def virtual_memory() -> SimpleNamespace:
+            return SimpleNamespace(available=available)
+
+    functions = _extract_functions(
+        BOT_CORTEX_PATH,
+        {"_max_memory_with_settings", "_memory_limit_bytes"},
+        {
+            "SettingsError": SettingsError,
+            "get_max_memory": lambda: {0: gpu_available, "cpu": "40GiB"},
+            "load_settings": lambda: settings,
+            "psutil": FakePsutil,
+            "torch": torch_module,
+        },
+    )
+    return functions["_max_memory_with_settings"]
+
+
 @pytest.mark.parametrize(
-    ("device", "cuda_available", "gpu_limit", "cpu_limit", "expected"),
+    ("total_gib", "free_gib", "expected_gib"),
     [
-        ("cpu", False, "8GiB", "16GiB", {"cpu": "16GiB"}),
-        ("auto", True, "4GiB", "32GiB", {0: "4GiB", "cpu": "32GiB"}),
-        ("cpu", False, None, None, {"cpu": "40GiB"}),
+        (4, 4, 3.2),
+        (8, 8, 6.4),
+        (24, 24, 19.2),
+        (8, 2, 0.4),
+        (8, 1, 0),
     ],
 )
-def test_legacy_memory_map_respects_settings_without_importing_torch(
-    tmp_path: Path,
-    device: str,
-    cuda_available: bool,
-    gpu_limit: str | None,
-    cpu_limit: str | None,
-    expected: dict[int | str, str],
+def test_legacy_gpu_budget_reserves_twenty_percent_of_vram(
+    tmp_path: Path, total_gib: int, free_gib: int, expected_gib: float
 ) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_properties(device: int) -> SimpleNamespace:
+            assert device == 0
+            return SimpleNamespace(total_memory=total_gib * 1024**3)
+
     class FakeTorch:
-        class cuda:
-            @staticmethod
-            def is_available() -> bool:
-                return cuda_available
+        cuda = FakeCuda
 
     settings = Settings(
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
-        device=device,
-        gpu_memory_limit=gpu_limit,
-        cpu_memory_limit=cpu_limit,
+        device="auto",
     )
-    max_memory = _extract_functions(
+    budget = _memory_test_function(
+        settings,
+        FakeTorch,
+        40 * 1024**3,
+        gpu_available=free_gib * 1024**3,
+    )
+
+    assert budget() == {0: int(expected_gib * 1024**3), "cpu": "40GiB"}
+
+
+def test_explicit_gpu_budget_within_available_headroom_is_preserved(tmp_path: Path) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_properties(device: int) -> SimpleNamespace:
+            assert device == 0
+            return SimpleNamespace(total_memory=8 * 1024**3)
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        device="cuda",
+        gpu_memory_limit="4GiB",
+    )
+    budget = _memory_test_function(settings, FakeTorch, 40 * 1024**3)
+
+    assert budget() == {0: "4GiB", "cpu": "40GiB"}
+
+
+def test_explicit_gpu_budget_above_free_memory_after_reserve_fails(tmp_path: Path) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_properties(device: int) -> SimpleNamespace:
+            assert device == 0
+            return SimpleNamespace(total_memory=8 * 1024**3)
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        device="cuda",
+        gpu_memory_limit="7GiB",
+    )
+    budget = _memory_test_function(settings, FakeTorch, 40 * 1024**3)
+
+    with pytest.raises(SettingsError, match="reserving 20%"):
+        budget()
+
+
+def test_explicit_cpu_budget_does_not_touch_cuda_or_accelerate(tmp_path: Path) -> None:
+    class ForbiddenTorch:
+        def __getattr__(self, name: str) -> Any:
+            pytest.fail(f"explicit CPU mode accessed torch.{name}")
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        device="cpu",
+        gpu_memory_limit="8GiB",
+        cpu_memory_limit="16GiB",
+    )
+
+    class FakePsutil:
+        @staticmethod
+        def virtual_memory() -> SimpleNamespace:
+            return SimpleNamespace(available=40 * 1024**3)
+
+    budget = _extract_functions(
         BOT_CORTEX_PATH,
-        {"_max_memory_with_settings"},
+        {"_max_memory_with_settings", "_memory_limit_bytes"},
         {
-            "get_max_memory": lambda: {0: "7GiB", "cpu": "40GiB"},
+            "SettingsError": SettingsError,
+            "get_max_memory": lambda: pytest.fail("CPU mode queried Accelerate"),
             "load_settings": lambda: settings,
-            "torch": FakeTorch,
+            "psutil": FakePsutil,
+            "torch": ForbiddenTorch(),
         },
     )["_max_memory_with_settings"]
 
-    assert max_memory() == expected
+    assert budget() == {"cpu": "16GiB"}

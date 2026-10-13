@@ -24,6 +24,9 @@ explicit command sends one user message to the configured model using the existi
 SDK, with a 30-second request timeout. It never imports BotCortex, local classifiers
 or model runtimes. It is separate from the preserved legacy conversation flow;
 headless validation without `--prompt` remains entirely offline.
+Configuration/input errors return exit code 2. Missing cloud capabilities or
+OpenAI authentication, network and request failures return exit code 1 with a
+cloud diagnostic message; provider error text and credential values are redacted.
 
 Official compatibility references: [PyTorch releases](https://github.com/pytorch/pytorch/blob/main/RELEASE.md),
 [compatible Torch releases](https://pytorch.org/get-started/previous-versions/),
@@ -85,6 +88,8 @@ cache_dir/offload. A stream URL or nonnegative camera index requires no device
 access during validation. Explicit checkpoint/tokenizer directories and image
 files must exist. Directory creation occurs only at explicit legacy runtime
 startup/writes through `prepare_directories()`.
+Camera stream URLs require a scheme, hostname and valid port, when supplied;
+malformed URLs are rejected by bootstrap without contacting the camera.
 
 Move existing `question_file.json`, `history_verbatim.txt` and `history_summary.txt`
 from the old checkout to the configured data_dir yourself before starting the
@@ -97,14 +102,23 @@ behavior remain unchanged. Install a spaCy model matching the selected spaCy
 version separately (for the default spaCy 3.7.x, use `en_core_web_trf` 3.7.x), or
 configure `spacy_model_id` to a compatible locally installed model. The historical
 3.4.1 model wheel is not suitable for the new 3.7.x library.
+An empty or one-entry question bank skips semantic search and returns the existing
+language-model fallback signal; it never tries to embed an empty collection or
+compare two missing candidates.
 
 `device=auto` keeps CUDA-if-available/CPU fallback when the legacy runtime asks
 for a device; `cpu`, `cuda`, `mps` are explicit preferences. Unsupported hardware
 is rejected when the optional runtime resolves it, without importing Torch for
 bootstrap. GPU/CPU budgets accept `auto` or positive integer MiB/GiB values.
-Automatic Accelerate limits replace the workstation's fixed 7GiB/48GiB maps;
-explicit overrides merge with automatic limits for unspecified devices. These
-settings do not promise performance/headroom qualification or rewrite DeepSpeed.
+Automatic CUDA placement limits reserve 20% of the detected device-0 total VRAM
+from its currently free memory. A fully free 8 GiB card therefore permits at most
+6.4 GiB of placement, with a lower limit when other allocations are present;
+larger and smaller cards use the same headroom rule. Explicit GPU limits that
+exceed the remaining safe budget fail when the optional runtime resolves hardware.
+CPU-only mapping reads available RAM without probing CUDA. These limits replace
+the workstation's fixed 7GiB/48GiB maps; unspecified CPU limits remain automatic.
+They are placement guards, not a claim of measured peak inference headroom or a
+DeepSpeed runtime rewrite.
 
 ## Legacy capabilities and boundaries
 
@@ -124,7 +138,11 @@ is unknown. Its source build needs special handling documented in pyproject.toml
 to the optional runtime instead of requiring Torch/CUDA merely to resolve the lock;
 this does not pull Torch into core. Optional local/vision/speech libraries do not
 initialize merely because `deskbuddy` is imported. BotCortex's VQA weights now load
-only when a configured vision question is requested. The research-only
+only when a configured vision question is requested. Capture, model loading and
+inference run in a worker thread; a thread lock serializes the shared VQA model,
+including first-load initialization. Failed loads publish no partial cache and
+may be retried. Camera captures are released without OpenCV GUI cleanup, so the
+headless OpenCV extra remains usable. The research-only
 `dialogue_management.py`/`train_h_memory.py` are not package startup paths.
 Those historical research scripts intentionally retain working-directory-based
 `training_data.json` input and `trained_model.pth` output. Run them from a dedicated

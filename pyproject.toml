@@ -31,6 +31,7 @@ local = [
     "accelerate>=0.25,<0.26",
     "numpy>=1.26,<2",
     "sentencepiece>=0.2,<0.3",
+    "psutil>=5.9,<8",
 ]
 speech = [
     "openai-whisper==20250625",

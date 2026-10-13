@@ -343,3 +343,59 @@ def test_resource_limits_and_device_resolution_are_lazy() -> None:
     assert Settings().torch_device(FakeTorch) == "cpu"
     with pytest.raises(SettingsError, match="available CUDA device"):
         Settings(device="cuda").torch_device(FakeTorch)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http://",
+        "rtsp:///stream",
+        "://camera.example/live",
+        "123://camera.example/live",
+        "http://camera.example:not-a-port/live",
+        "http://camera.example:65536/live",
+        "http://camera.example:-1/live",
+        "http://camera.example:0/live",
+        "http://camera.example:/live",
+        "http://[::1/live",
+        "http://bad host/live",
+        "http://cam\nera.example/live",
+        "http://camera\\bad/live",
+    ],
+)
+def test_malformed_camera_urls_fail_before_runtime(
+    source: str, app_roots: tuple[Path, Path, Path]
+) -> None:
+    with pytest.raises(SettingsError, match="camera URL requires"):
+        load_settings(overrides={"camera_source": source}, environ={})
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http://camera.example/live",
+        "https://camera.example:443/mjpeg",
+        "rtsp://camera.example:554/live",
+        "rtsps://camera.example:65535/live",
+        "tcp://127.0.0.1:56000",
+        "http://[::1]:8080/live",
+        "rtsp://user:password@camera.example/live",
+    ],
+)
+def test_valid_camera_urls_need_no_hardware_or_network(
+    source: str, app_roots: tuple[Path, Path, Path]
+) -> None:
+    assert load_settings(overrides={"camera_source": source}, environ={}).camera_source == source
+
+
+def test_camera_url_validation_does_not_echo_embedded_credentials(
+    app_roots: tuple[Path, Path, Path],
+) -> None:
+    with pytest.raises(SettingsError) as raised:
+        load_settings(
+            environ={
+                "DESKBUDDY_CAMERA_SOURCE": "rtsp://user:do-not-echo-me@camera.example:bad/live"
+            }
+        )
+    assert "camera URL requires" in str(raised.value)
+    assert "do-not-echo-me" not in str(raised.value)

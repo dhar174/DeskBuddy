@@ -162,6 +162,23 @@ class Settings(BaseModel):
             return int(value)
         if isinstance(value, int) and value < 0:
             raise ValueError("camera index must be nonnegative")
+        if isinstance(value, str) and "://" in value:
+            try:
+                parsed = urlsplit(value)
+                port = parsed.port
+                if (
+                    not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme)
+                    or not parsed.hostname
+                    or any(character.isspace() for character in value)
+                    or "\\" in parsed.netloc
+                    or parsed.netloc.endswith(":")
+                    or (port is not None and not 1 <= port <= 65535)
+                ):
+                    raise ValueError
+            except ValueError:
+                raise ValueError(
+                    "camera URL requires a scheme, hostname and valid port (1 to 65535)"
+                ) from None
         return value
 
     @field_validator("gpu_memory_limit", "cpu_memory_limit", mode="before")

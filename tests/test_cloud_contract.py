@@ -134,7 +134,7 @@ def test_missing_openai_extra_has_a_direct_install_hint(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(cloud_module, "import_module", missing_sdk)
 
-    with pytest.raises(SettingsError, match=r"uv sync --locked --extra cloud"):
+    with pytest.raises(cloud_module.CloudRequestError, match=r"uv sync --locked --extra cloud"):
         cloud_module.request_reply(_openai_settings(), "hello")
 
 
@@ -147,7 +147,7 @@ def test_openai_sdk_errors_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None
     sdk = _fake_sdk(monkeypatch, fail_request)
     FakeOpenAIError = sdk.error.OpenAIError
 
-    with pytest.raises(SettingsError) as raised:
+    with pytest.raises(cloud_module.CloudRequestError) as raised:
         cloud_module.request_reply(_openai_settings(secret), "hello")
 
     assert "FakeOpenAIError" in str(raised.value)
@@ -209,3 +209,60 @@ def test_cli_rejects_offline_headless_mode_with_prompt_without_calling_cloud(
     assert raised.value.code == 2
     assert "not allowed with argument" in captured.err
     assert captured.out == ""
+
+
+@pytest.mark.parametrize("error_type", ["authentication", "timeout", "connection", "missing_sdk"])
+def test_cli_cloud_failures_are_distinct_from_invalid_configuration(
+    error_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli_module, "load_settings", lambda **kwargs: _openai_settings())
+
+    def fail_request(settings: Settings, prompt: str) -> str:
+        raise cloud_module.CloudRequestError(f"{error_type} failure (redacted)")
+
+    monkeypatch.setattr(cloud_module, "request_reply", fail_request)
+
+    status = cli_module.main(["--prompt", "hello"])
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert captured.out == ""
+    assert f"DeskBuddy cloud diagnostic failed: {error_type}" in captured.err
+    assert "Invalid DeskBuddy configuration" not in captured.err
+    assert "test-secret" not in captured.err
+
+
+def test_cli_invalid_settings_fail_before_cloud_dispatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def invalid_settings(**kwargs: Any) -> Settings:
+        raise SettingsError("model_provider=openai requires OPENAI_API_KEY")
+
+    def forbidden_request(settings: Settings, prompt: str) -> str:
+        pytest.fail("invalid settings must be rejected before SDK execution")
+
+    monkeypatch.setattr(cli_module, "load_settings", invalid_settings)
+    monkeypatch.setattr(cloud_module, "request_reply", forbidden_request)
+
+    assert cli_module.main(["--prompt", "hello"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Invalid DeskBuddy configuration" in captured.err
+    assert "OPENAI_API_KEY" in captured.err
+
+
+def test_cli_blank_prompt_is_an_input_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_module, "load_settings", lambda **kwargs: _openai_settings())
+
+    assert cli_module.main(["--prompt", "   "]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Invalid cloud diagnostic input" in captured.err
+    assert "prompt must not be blank" in captured.err
+    assert "Invalid DeskBuddy configuration" not in captured.err

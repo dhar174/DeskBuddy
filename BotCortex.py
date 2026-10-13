@@ -3,6 +3,8 @@
 # from soft_embedding import SoftEmbedding
 import asyncio
 import json
+import threading
+import psutil
 from deskbuddy.settings import SettingsError, load_settings
 from PIL import Image
 import cv2 as cv
@@ -168,22 +170,60 @@ model_size = ""
 local_only_mode = True
 search_tokenizer = None
 search_model = None
+_vqa_lock = threading.Lock()
 
 
 def _max_memory_with_settings():
     settings = load_settings()
-    memory = get_max_memory()
-    resolved_device = settings.torch_device(torch)
-    if resolved_device == "cpu":
-        memory = {"cpu": memory["cpu"]} if "cpu" in memory else {}
-    elif 0 in memory:
-        memory = {key: memory[key] for key in (0, "cpu") if key in memory}
     limits = settings.resource_limits()
+    if settings.device == "cpu":
+        memory = {"cpu": psutil.virtual_memory().available}
+        if limits is not None:
+            memory.update({key: value for key, value in limits.items() if key == "cpu"})
+        return memory
+
+    resolved_device = settings.torch_device(torch)
+    if resolved_device != "cuda":
+        memory = {"cpu": psutil.virtual_memory().available}
+        if limits is not None:
+            memory.update({key: value for key, value in limits.items() if key == "cpu"})
+        return memory
+
+    memory = get_max_memory()
+    if 0 not in memory:
+        raise SettingsError("Accelerate could not determine available memory for CUDA device 0")
+
+    available_bytes = _memory_limit_bytes(memory[0])
+    total_bytes = torch.cuda.get_device_properties(0).total_memory
+    reserve_bytes = (total_bytes * 20 + 99) // 100
+    automatic_gpu_limit = max(0, available_bytes - reserve_bytes)
+    explicit_gpu_limit = limits.pop(0, None) if limits is not None else None
+    if explicit_gpu_limit is not None:
+        if _memory_limit_bytes(explicit_gpu_limit) > automatic_gpu_limit:
+            raise SettingsError(
+                "DESKBUDDY_GPU_MEMORY_LIMIT exceeds available CUDA memory after "
+                "reserving 20% of device 0 VRAM"
+            )
+        memory[0] = explicit_gpu_limit
+    else:
+        memory[0] = automatic_gpu_limit
+
+    memory = {key: memory[key] for key in (0, "cpu") if key in memory}
     if limits is not None:
-        if resolved_device == "cpu":
-            limits = {key: value for key, value in limits.items() if key == "cpu"}
         memory.update(limits)
     return memory
+
+
+def _memory_limit_bytes(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise SettingsError("Memory limits must be integer bytes or use MiB/GiB units")
+    units = {"MiB": 1024**2, "GiB": 1024**3}
+    for suffix, scale in units.items():
+        if value.endswith(suffix) and value[: -len(suffix)].isdecimal():
+            return int(value[: -len(suffix)]) * scale
+    raise SettingsError("Memory limits must use positive integer MiB or GiB units")
 
 
 def _offload_path(settings=None):
@@ -837,6 +877,8 @@ async def get_embeddings(text_list):
 async def search_question_in_bank(qdict, question):
     # TODO: Instead of
     found = False
+    if len(qdict) < 2:
+        return "", False
     # df = pd.DataFrame.from_dict(
     #     qdict, orient='index', columns=['question'])
     # # for key in qdict.keys():
@@ -886,7 +928,7 @@ async def search_question_in_bank(qdict, question):
 
     print(results[0])
     answer = ""
-    if results[0][1] - 0.05 <= results[1][1]:
+    if len(results) > 1 and results[0][1] - 0.05 <= results[1][1]:
         answer = "I am not sure about that. Please ask me another question."
         found = True
     if results[0][1] > 0.9:
@@ -2347,102 +2389,92 @@ async def is_requesting_SD(txt):
     return is_vis
 
 
-async def answer_visual_question(question):
-    global accelerator
+def _answer_visual_question_sync(question, settings):
     global visionQA_processor
     global visionQA_model
+    try:
+        with _vqa_lock:
+            if isinstance(settings.camera_source, str) and "://" not in settings.camera_source:
+                image = cv.imread(settings.camera_source)
+                result = image is not None
+            else:
+                cam = cv.VideoCapture(settings.camera_source)
+                try:
+                    time.sleep(1)
+                    result, image = cam.read()
+                finally:
+                    cam.release()
+            if not result or image is None:
+                return "No image found"
+            print(question)
+            # Define a transform that resizes, normalizes and converts the image to a tensor
+
+            # transform = T.Compose([
+            #     T.Resize(image_size),
+            #     T.ToTensor(),
+            #     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            # ])
+            # Apply the transform to the image
+            image = Image.fromarray(image)
+            image = image.convert("RGB")
+            # image = transform(image)
+
+            # pygame.camera.init()
+            # camlist = pygame.camera.list_cameras()
+            device = torch.device(settings.torch_device(torch))
+            # device = torch.device("cpu")
+            print("Device for VQA: " + str(device))
+            if visionQA_processor is None or visionQA_model is None:
+                processor_candidate = GitProcessor.from_pretrained(settings.vision_model_id)
+                model_candidate = GitForCausalLM.from_pretrained(settings.vision_model_id)
+                model_candidate.to(device)
+                visionQA_processor, visionQA_model = processor_candidate, model_candidate
+            else:
+                visionQA_model.to(device)
+            pixel_values = visionQA_processor(
+                images=image, return_tensors="pt"
+            ).pixel_values
+
+            pixel_values = pixel_values.to(device)
+            pixel_values.shape
+            print("VQA pixel_values: " + str(pixel_values))
+            inputs = visionQA_processor(text=question, add_special_tokens=False).input_ids
+
+            inputs = [visionQA_processor.tokenizer.cls_token_id] + inputs
+            inputs = torch.tensor(inputs).unsqueeze(0)
+            # inputs = visionQA_processor(
+            #     question,
+            #     image,
+            #     return_tensors="pt"
+            # )
+            inputs = inputs.to(device)
+            print("VQA inputs: " + str(inputs))
+            # input_ids = inputs["input_ids"].tolist()[0]
+            # image = inputs.pop("pixel_values").to(model.device)
+            # outputs = visionQA_model.generate(**inputs)
+            # answer = visionQA_processor.decode(outputs[0], skip_special_tokens=True)
+            generated_ids = visionQA_model.generate(
+                pixel_values=pixel_values, input_ids=inputs, max_length=50
+            )
+            answer = visionQA_processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )
+            # logits = outputs.logits.to(device)
+            answer[0] = answer[0].replace(question, "I think it is ")
+            # idx = logits.argmax(-1).item()
+            # answer = visionQA_model.config.id2label[idx]
+            return answer[0]
+    except Exception as e:
+        print(e)
+        return "No image found" + str(e)
+
+
+async def answer_visual_question(question):
     settings = load_settings()
     if settings.camera_source is None:
         return "No camera or image source configured. Set DESKBUDDY_CAMERA_SOURCE."
     print(cv.__version__)
-    try:
-        if isinstance(settings.camera_source, str) and "://" not in settings.camera_source:
-            image = cv.imread(settings.camera_source)
-            result = image is not None
-        else:
-            cam = cv.VideoCapture(settings.camera_source)
-            await asyncio.sleep(1)
-            result, image = cam.read()
-            cam.release()
-            cv.destroyAllWindows()
-        if not result or image is None:
-            return "No image found"
-        print(question)
-        # Define a transform that resizes, normalizes and converts the image to a tensor
-
-        # transform = T.Compose([
-        #     T.Resize(image_size),
-        #     T.ToTensor(),
-        #     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        # ])
-        # Apply the transform to the image
-        image = Image.fromarray(image)
-        image = image.convert("RGB")
-        # image = transform(image)
-
-        # pygame.camera.init()
-        # camlist = pygame.camera.list_cameras()
-        device = torch.device(settings.torch_device(torch))
-        # device = torch.device("cpu")
-        print("Device for VQA: " + str(device))
-        if visionQA_processor is None or visionQA_model is None:
-            visionQA_processor = GitProcessor.from_pretrained(settings.vision_model_id)
-            visionQA_model = GitForCausalLM.from_pretrained(settings.vision_model_id)
-        visionQA_model.to(device)
-        # Split the image into patches by reshaping and permuting the dimensions
-        # patches = image.unfold(1, patch_size, patch_size).unfold(
-        #     2, patch_size, patch_size).to(device)
-        # patches = patches.contiguous().view(
-        #     1, -1, 3 * patch_size * patch_size).permute(0, 2, 1).to(device)
-
-        # # Add position embeddings to each patch (you can use any learnable embedding layer here)
-        # position_embeddings = torch.nn.Embedding(patches.size(1), patches.size(2)).to(
-        #     device)
-        # patches += position_embeddings.weight.to(device)
-
-        # # Optionally add a class token at the beginning of the sequence of patches
-        # class_token = torch.zeros(1, 1, patches.size(2)).to(device)
-        # patches = torch.cat([class_token, patches], dim=1).to(device)
-
-        # Check if cuda is available and move the image and model to cuda if yes
-
-        # image = image.to(device)
-        pixel_values = visionQA_processor(
-            images=image, return_tensors="pt"
-        ).pixel_values
-
-        pixel_values = pixel_values.to(device)
-        pixel_values.shape
-        print("VQA pixel_values: " + str(pixel_values))
-        inputs = visionQA_processor(text=question, add_special_tokens=False).input_ids
-
-        inputs = [visionQA_processor.tokenizer.cls_token_id] + inputs
-        inputs = torch.tensor(inputs).unsqueeze(0)
-        # inputs = visionQA_processor(
-        #     question,
-        #     image,
-        #     return_tensors="pt"
-        # )
-        inputs = inputs.to(device)
-        print("VQA inputs: " + str(inputs))
-        # input_ids = inputs["input_ids"].tolist()[0]
-        # image = inputs.pop("pixel_values").to(model.device)
-        # outputs = visionQA_model.generate(**inputs)
-        # answer = visionQA_processor.decode(outputs[0], skip_special_tokens=True)
-        generated_ids = visionQA_model.generate(
-            pixel_values=pixel_values, input_ids=inputs, max_length=50
-        )
-        answer = visionQA_processor.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )
-        # logits = outputs.logits.to(device)
-        answer[0] = answer[0].replace(question, "I think it is ")
-        # idx = logits.argmax(-1).item()
-        # answer = visionQA_model.config.id2label[idx]
-        return answer[0]
-    except Exception as e:
-        print(e)
-        return "No image found" + str(e)
+    return await asyncio.to_thread(_answer_visual_question_sync, question, settings)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,8 @@ from picoh import picoh
 # import pythonwin
 import signal
 import sys
-import aiohttp
 from deskbuddy.settings import load_settings
 
-connector = aiohttp.TCPConnector(force_close=True)
 listening = False
 
 

@@ -26,14 +26,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         settings = load_settings(config_file=arguments.config, env_file=arguments.env_file)
-        if arguments.prompt is not None:
-            from deskbuddy.cloud import request_reply
-
-            print(request_reply(settings, arguments.prompt))
-            return 0
     except SettingsError as error:
         print(f"Invalid DeskBuddy configuration: {error}", file=sys.stderr)
         return 2
+    if arguments.prompt is not None:
+        from deskbuddy.cloud import CloudRequestError, request_reply
+
+        try:
+            reply = request_reply(settings, arguments.prompt)
+        except SettingsError as error:
+            print(f"Invalid cloud diagnostic input: {error}", file=sys.stderr)
+            return 2
+        except CloudRequestError as error:
+            print(f"DeskBuddy cloud diagnostic failed: {error}", file=sys.stderr)
+            return 1
+        print(reply)
+        return 0
     installed: dict[str, str | None] = {}
     for capability, distribution in {
         "cloud": "openai",

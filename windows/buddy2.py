@@ -10,7 +10,6 @@ from array import array
 from random import randint, random
 from struct import pack
 
-import aiohttp
 import pyaudio
 import keyboard
 
@@ -18,7 +17,6 @@ from picoh import picoh
 import whisper
 from deskbuddy.settings import load_settings
 
-connector = aiohttp.TCPConnector(force_close=True)
 # Define a TCP server
 _settings = load_settings()
 HOST = _settings.robot_bind_address
