@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
+from pydantic import SecretStr
 
 import deskbuddy.cli as cli_module
 import deskbuddy.cloud as cloud_module
@@ -35,7 +36,7 @@ def _openai_settings(secret: str = "test-secret") -> Settings:
     return Settings(
         model_provider="openai",
         openai_model="test-chat-model",
-        openai_api_key=secret,
+        openai_api_key=SecretStr(secret),
     )
 
 
@@ -155,6 +156,45 @@ def test_openai_sdk_errors_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None
     assert "rejected key" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [],
+        {},
+        {"choices": None},
+        {"choices": []},
+        {"choices": "malformed-response-secret"},
+        {"choices": [None]},
+        {"choices": [{}]},
+        {"choices": [{"message": None}]},
+        {"choices": [{"message": {}}]},
+        {"choices": [{"message": {"content": None}}]},
+        {"choices": [{"message": {"content": 17}}]},
+        {"choices": [{"message": {"content": {"secret": "malformed-response-secret"}}}]},
+    ],
+)
+def test_malformed_openai_responses_raise_sanitized_cloud_error(
+    response: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_secret = "malformed-response-api-secret"
+    _fake_sdk(monkeypatch, lambda **kwargs: response)
+
+    with pytest.raises(cloud_module.CloudRequestError) as raised:
+        cloud_module.request_reply(_openai_settings(api_secret), "hello")
+
+    error_text = str(raised.value)
+    assert "invalid chat completion response" in error_text
+    assert api_secret not in error_text
+    assert "malformed-response-secret" not in error_text
+
+
+def test_openai_response_accepts_empty_string_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_sdk(monkeypatch, lambda **kwargs: {"choices": [{"message": {"content": ""}}]})
+
+    assert cloud_module.request_reply(_openai_settings(), "hello") == ""
+
+
 def test_cli_prompt_branch_uses_selected_provider_and_explicit_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -174,6 +214,7 @@ def test_cli_prompt_branch_uses_selected_provider_and_explicit_model(
     def fake_request(settings: Settings, prompt: str) -> str:
         received["provider"] = settings.model_provider
         received["model"] = settings.openai_model
+        assert settings.openai_api_key is not None
         received["key"] = settings.openai_api_key.get_secret_value()
         received["prompt"] = prompt
         return "offline fake response"
@@ -232,6 +273,31 @@ def test_cli_cloud_failures_are_distinct_from_invalid_configuration(
     assert f"DeskBuddy cloud diagnostic failed: {error_type}" in captured.err
     assert "Invalid DeskBuddy configuration" not in captured.err
     assert "test-secret" not in captured.err
+
+
+def test_cli_malformed_openai_response_is_sanitized_and_exits_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api_secret = "malformed-cli-api-secret"
+    response_secret = "malformed-cli-response-secret"
+    monkeypatch.setattr(cli_module, "load_settings", lambda **kwargs: _openai_settings(api_secret))
+    _fake_sdk(
+        monkeypatch,
+        lambda **kwargs: {"choices": [{"message": {"content": {"secret": response_secret}}}]},
+    )
+
+    status = cli_module.main(["--prompt", "hello"])
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert captured.out == ""
+    assert (
+        "DeskBuddy cloud diagnostic failed: OpenAI returned an invalid chat completion response"
+        in captured.err
+    )
+    assert "Traceback" not in captured.err
+    assert api_secret not in captured.err
+    assert response_secret not in captured.err
 
 
 def test_cli_invalid_settings_fail_before_cloud_dispatch(

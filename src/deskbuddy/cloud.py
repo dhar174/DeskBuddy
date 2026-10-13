@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import Any
 
 from deskbuddy.settings import Settings, SettingsError
 
 
 class CloudRequestError(RuntimeError):
     """Redacted cloud capability/request failure, distinct from invalid settings."""
+
+
+def _extract_content(response: Any) -> str:
+    """Return a string chat reply, rejecting malformed SDK response shapes safely."""
+    try:
+        choices = response["choices"]
+        if not isinstance(choices, list) or not choices:
+            raise CloudRequestError("OpenAI returned an invalid chat completion response")
+        message = choices[0]["message"]
+        content = message["content"]
+    except (KeyError, IndexError, TypeError):
+        raise CloudRequestError("OpenAI returned an invalid chat completion response") from None
+
+    if not isinstance(content, str):
+        raise CloudRequestError("OpenAI returned an invalid chat completion response")
+    return content
 
 
 def request_reply(settings: Settings, prompt: str) -> str:
@@ -40,4 +57,4 @@ def request_reply(settings: Settings, prompt: str) -> str:
         raise CloudRequestError(
             f"OpenAI request failed ({type(error).__name__}); check credentials, model and network"
         ) from None
-    return str(response["choices"][0]["message"]["content"])
+    return _extract_content(response)
