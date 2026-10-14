@@ -21,6 +21,7 @@ import asyncio
 import threading
 import time
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1071,13 +1072,12 @@ async def test_conservative_side_effect_classification_prevents_downgrade(
 # 21. HardwareExecutor race-safe cancellation and completion
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_hardware_executor_completed_operation_not_reported_as_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
-):
+async def test_hardware_executor_completed_operation_not_reported_as_cancelled():
     """Control the boundary between worker completion and async completion notification.
     Cancel the awaiting task when worker has completed.
     Assert result is accurately reported as completed, never cancelled or timed out.
-    Uses explicit synchronization, not timing-dependent polling.
+    Uses an explicit test synchronization hook on HardwareExecutor, avoiding any
+    interception of unrelated event loop callbacks.
     """
     hw_executor = HardwareExecutor(thread_name_prefix="test-hw-race")
     gate_event = threading.Event()
@@ -1087,27 +1087,24 @@ async def test_hardware_executor_completed_operation_not_reported_as_cancelled(
         return "physical_motion_done"
 
     loop = asyncio.get_running_loop()
-    orig_call_soon_threadsafe = loop.call_soon_threadsafe
-
-    notification_started = threading.Event()
+    notification_started = asyncio.Event()
     release_notification = threading.Event()
 
-    def intercepted_call_soon_threadsafe(callback, *args):
-        # Triggered by worker thread immediately after setting op.state = COMPLETED
-        # and op.result = result, before done_event.set() is scheduled on event loop.
-        notification_started.set()
+    def before_completion_hook(op: Any) -> None:
+        # Called on worker thread after op.state = COMPLETED and op.result = result,
+        # but before done_event.set() is scheduled on the event loop.
+        loop.call_soon_threadsafe(notification_started.set)
         release_notification.wait(timeout=5.0)
-        return orig_call_soon_threadsafe(callback, *args)
 
-    monkeypatch.setattr(loop, "call_soon_threadsafe", intercepted_call_soon_threadsafe)
+    hw_executor._before_completion_notify_hook = before_completion_hook
 
     try:
         task = asyncio.create_task(hw_executor.execute(gated_op))
         # Release gated_op to complete on the worker thread
         gate_event.set()
 
-        # Wait deterministically until worker completes and is about to notify the loop
-        await asyncio.to_thread(notification_started.wait, 5.0)
+        # Wait deterministically until the worker completes and enters the hook
+        await asyncio.wait_for(notification_started.wait(), timeout=5.0)
         assert notification_started.is_set()
 
         # At this exact boundary, op.state == COMPLETED on worker thread,
@@ -1115,7 +1112,7 @@ async def test_hardware_executor_completed_operation_not_reported_as_cancelled(
         # Cancel the task now!
         task.cancel()
 
-        # Release notification to allow done_event.set() to be scheduled
+        # Release the worker thread to allow done_event.set() to be scheduled
         release_notification.set()
 
         # The task must resolve with the successful result, NOT CancelledError!
@@ -1555,39 +1552,57 @@ async def test_pre_transmission_oversized_outgoing_request_is_ordinary_failure(
 ):
     """Outgoing frame exceeding max_payload_size fails before transmission,
     raising PayloadTooLargeError directly (not ExecutionOutcomeUnknown),
-    and legacy request_to_server returns None.
+    and legacy request_to_server returns None without invoking the server.
     """
+    server_invocations = 0
+
+    def say_handler(args: dict[str, Any]) -> str:
+        nonlocal server_invocations
+        server_invocations += 1
+        return "spoken"
+
     registry = CommandRegistry()
-    registry.register("move", lambda args: "moved", validate_move_arguments)
+    registry.register("say", say_handler, validate_say_arguments)
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
 
+    client_cfg = TransportConfig(
+        host="127.0.0.1",
+        port=server.port,
+        secret=ephemeral_server_config.secret,
+        max_payload_size=100,
+    )
+
+    client_for_legacy: RobotClient | None = None
     try:
-        client_cfg = TransportConfig(
-            host="127.0.0.1",
-            port=server.port,
-            secret=ephemeral_server_config.secret,
-            max_payload_size=100,
-        )
+        # 1. Typed client: outgoing oversized payload rejected before transmission
         async with RobotClient(client_cfg) as client:
-            huge_args = {"motor": 1, "position": 5.0, "extra": "x" * 200}
+            huge_args = {"text": "A" * 200}
             with pytest.raises(PayloadTooLargeError) as exc_info:
-                await client.request("move", huge_args, side_effects=True)
+                await client.request("say", huge_args, side_effects=True)
 
             assert exc_info.value.code == TransportErrorCode.PAYLOAD_TOO_LARGE
 
-        # Also verify legacy wrapper catches ordinary transport error and returns None
-        # since command was definitely never transmitted
-        monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
-        monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
-        monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+        # Server handler was not invoked because payload was rejected before transmission
+        assert server_invocations == 0
 
-        await rc.close_client()
-        # Set max_payload_size on the client used by rc
-        rc._client = RobotClient(client_cfg)
-        res = await rc.request_to_server(function_name="move", motor=1, position=5.0, extra="x" * 200)
+        # 2. Legacy wrapper: inject configured client via get_robot_client monkeypatch
+        # and verify it catches PayloadTooLargeError and returns None
+        client_for_legacy = RobotClient(client_cfg)
+        monkeypatch.setattr(
+            rc,
+            "get_robot_client",
+            AsyncMock(return_value=client_for_legacy),
+        )
+
+        res = await rc.request_to_server(function_name="say", text="A" * 200)
         assert res is None
+
+        # Confirm server was still NEVER reached (handler never invoked)
+        assert server_invocations == 0
     finally:
+        if client_for_legacy is not None:
+            await client_for_legacy.close()
         await rc.close_client()
         await server.stop()
 

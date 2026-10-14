@@ -71,6 +71,7 @@ class HardwareExecutor:
         self._async_lock = asyncio.Lock()
         self._active_operation: HardwareOperation | None = None
         self._unresolved_operation: HardwareOperation | None = None
+        self._before_completion_notify_hook: Callable[[HardwareOperation], None] | None = None
 
     @property
     def has_unresolved_operation(self) -> bool:
@@ -148,6 +149,13 @@ class HardwareExecutor:
                             logger.info("Unresolved hardware operation completed and cleared")
                             self._unresolved_operation = None
                             op.unresolved = False
+                    if self._before_completion_notify_hook is not None:
+                        try:
+                            self._before_completion_notify_hook(op)
+                        except Exception:
+                            logger.exception(
+                                "Error in HardwareExecutor _before_completion_notify_hook"
+                            )
                     if not done_event.is_set():
                         try:
                             loop.call_soon_threadsafe(done_event.set)
