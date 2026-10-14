@@ -87,10 +87,11 @@ sequenceDiagram
     loop Periodic Check
         start_bot->>client: check_for_response()
         activate client
-        client->>buddy1: TCP socket request on port 8888 (pickled dict payload)
+        client->>buddy1: Length-framed HMAC-SHA256 authenticated JSON request (check_for_response)
         activate buddy1
-        buddy1-->>client: pickled dict response with lastTranscription (if new)
+        buddy1-->>client: Framed JSON response with lastTranscription (if new)
         deactivate buddy1
+
         client-->>start_bot: message (Transcribed Text)
         deactivate client
     end
@@ -311,9 +312,10 @@ ResponseReady --> Idle_AwaitingInput : "response sent"
     *   **Purpose:** Stores the last message/reply that Picoh spoke, to avoid repeating the same message.
 
 *   **Data exchanged via `robot_client.py` and `buddy1.py` (TCP Server/Client)**
-    *   **Location:** `robot_client.py`, `buddy1.py`
-    *   **Structure:** Pickled Python dictionaries. The dictionary includes `function_name` (string) and optionally `message` (string) for calls from client to server. The server returns pickled results.
-    *   **Purpose:** Facilitates communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like getting transcriptions or sending text for Picoh to speak. **Security note:** Because `pickle` deserialization is unsafe with untrusted input, this TCP port must only be accessible to localhost or other fully trusted clients. If this interface could ever be reachable by untrusted systems or over a broader network, use a safer serialization format such as JSON instead of `pickle`.
+    *   **Location:** `robot_client.py`, `buddy1.py`, `transport/`
+    *   **Structure:** 4-byte length-prefixed JSON schemas (`RobotRequest` / `RobotResponse`). Requests include `request_id`, `protocol_version`, `timestamp`, `command`, `arguments`, and an HMAC-SHA256 `auth` signature. Responses contain `request_id`, `protocol_version`, `ok`, `result`, and structured machine-readable `error`.
+    *   **Purpose:** Facilitates secure communication between the main application logic (`start_bot.py` via `robot_client.py`) and the Picoh hardware interface server (`buddy1.py`) for actions like polling transcriptions or sending text for Picoh to speak. All requests require HMAC-SHA256 authentication, replay verification, bounded payload limits, and dispatch strictly through a verified allowlist without dynamic reflection.
+
 
 *   **`start_bot.message` / `start_bot.user_response`**
     *   **Location:** `start_bot.py`

@@ -24,10 +24,11 @@ sequenceDiagram
     loop Periodic Check
         start_bot->>client: check_for_response()
         activate client
-        client->>buddy1: TCP socket: send pickled {"function_name": "check_for_response"}
+        client->>buddy1: TCP socket: send framed authenticated JSON {"command": "check_for_response"}
         activate buddy1
-        buddy1-->>client: TCP socket: pickled response with lastTranscription (if new)
+        buddy1-->>client: TCP socket: framed JSON response with lastTranscription (if new)
         deactivate buddy1
+
         client-->>start_bot: message (Transcribed Text)
         deactivate client
     end

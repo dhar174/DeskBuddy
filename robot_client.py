@@ -1,54 +1,141 @@
-import socket
-import pickle
-import asyncio
-from deskbuddy.settings import load_settings
+"""Robot client module providing authenticated transport for DeskBuddy.
 
-# Connect to the TCP server and send a request
+Replaces the legacy pickle-based RPC with a length-framed, HMAC-authenticated
+JSON transport while maintaining backward compatibility for request_to_server callers.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from deskbuddy.settings import load_settings
+from transport.client import RobotClient, RobotTransport
+from transport.config import ClientConfig, TransportConfig, compute_command_timeout
+from transport.protocol import (
+    ExecutionOutcomeUnknown,
+    TransportError,
+    validate_timeout_override,
+)
+
+logger = logging.getLogger(__name__)
+
+# Default network configuration from canonical settings
 _settings = load_settings()
 HOST = _settings.robot_host
 PORT = _settings.robot_port
 
+_shared_client: RobotClient | None = None
+_shared_client_loop: asyncio.AbstractEventLoop | None = None
+_client_lock: asyncio.Lock | None = None
 
-async def request_to_server(**kwargs):
-    # print("Sending request to server...")
-    reader, writer = await asyncio.open_connection(HOST, PORT)
+
+def _get_client_lock() -> asyncio.Lock:
+    global _client_lock
+    if _client_lock is None:
+        _client_lock = asyncio.Lock()
+    return _client_lock
+
+
+async def get_robot_client() -> RobotClient:
+    """Return a shared singleton RobotClient instance for the running event loop."""
+    global _shared_client, _shared_client_loop
+    current_loop = asyncio.get_running_loop()
+    async with _get_client_lock():
+        if _shared_client is None or _shared_client_loop is not current_loop:
+            settings = load_settings()
+            _shared_client = RobotClient(TransportConfig.from_settings(settings, role="client"))
+            _shared_client_loop = current_loop
+        return _shared_client
+
+
+async def request_to_server(**kwargs: Any) -> Any:
+    """Send a command to the robot server and return the result.
+
+    Maintains backward compatibility with legacy calls from start_bot.py:
+        kwargs = {"function_name": "check_for_response"}
+        kwargs = {"function_name": "reply", "message": "..."}
+
+    Returns the unboxed response result on success, or None on ordinary error/timeout,
+    preserving expected legacy caller failure semantics.
+
+    If a side-effecting command has an ambiguous outcome (e.g. connection lost or
+    deadline exceeded after transmission), ExecutionOutcomeUnknown is raised so
+    callers can distinguish physical uncertainty from successful None or ordinary failure.
+    """
+    call_timeout: float | None = None
+    if "timeout" in kwargs and kwargs["timeout"] is not None:
+        call_timeout = validate_timeout_override(kwargs["timeout"])
+    elif "request_timeout" in kwargs and kwargs["request_timeout"] is not None:
+        call_timeout = validate_timeout_override(kwargs["request_timeout"])
+
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ("timeout", "request_timeout")}
+
+    command: str = ""
+    arguments: dict[str, Any] = {}
+
+    if "function_name" in filtered_kwargs:
+        command = str(filtered_kwargs["function_name"])
+        arguments = {k: v for k, v in filtered_kwargs.items() if k != "function_name"}
+    elif "command" in filtered_kwargs:
+        command = str(filtered_kwargs["command"])
+        raw_args = filtered_kwargs.get("arguments", {})
+        if isinstance(raw_args, dict):
+            arguments = {k: v for k, v in raw_args.items() if k not in ("timeout", "request_timeout")}
+        for k, v in filtered_kwargs.items():
+            if k not in ("command", "arguments"):
+                arguments[k] = v
+    else:
+        logger.error("request_to_server received neither 'function_name' nor 'command': %s", kwargs)
+        return None
 
     try:
-
-        writer.write(pickle.dumps(kwargs))
-        await writer.drain()
-        # print("Request sent, waiting for response...")
-        data = await reader.read(1024)
-        # print("Response received")
-        results = pickle.loads(data)
-        writer.close()
-        await writer.wait_closed()
-        # print("Connection closed")
-        return results
+        client = await get_robot_client()
+        response = await client.request(command, arguments, timeout=call_timeout)
+        if response.ok:
+            return response.result
+        logger.warning(
+            "Robot server returned error for '%s': [%s] %s",
+            command,
+            response.error.get("code") if response.error else "unknown",
+            response.error.get("message") if response.error else "unknown error",
+        )
+        return None
+    except ExecutionOutcomeUnknown:
+        # Crucial: Propagate typed exception so callers recognize uncertain physical execution
+        logger.warning("Propagating ambiguous execution outcome for '%s'", command)
+        raise
     except asyncio.TimeoutError:
-        print("Server not responding within 5 seconds")
-        writer.close()
-        await writer.wait_closed()
+        logger.warning("Robot server not responding within timeout for command '%s'", command)
         return None
-    except Exception as e:
-        print(f"Error sending request to server: {e}")
-        writer.close()
-        await writer.wait_closed()
+    except TransportError as exc:
+        logger.warning("Transport error executing '%s': %s", command, exc)
+        return None
+    except Exception as exc:
+        logger.error("Error sending request to robot server: %s", exc)
         return None
 
-    # try:
-    #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    #         s.connect((HOST, PORT))
 
-    #         data = pickle.dumps((kwargs))
-    #         s.sendall(data)
-    #         result = pickle.loads(s.recv(1024))
-    # except Exception as e:
-    #     print(e)
-    # return result
+async def close_client() -> None:
+    """Close the shared client connection."""
+    global _shared_client, _shared_client_loop
+    async with _get_client_lock():
+        if _shared_client is not None:
+            await _shared_client.close()
+            _shared_client = None
+            _shared_client_loop = None
 
 
-# kwargs = {"function_name": "simple_test"}
-
-# r = request_to_server(**kwargs)
-# print(r)
+__all__ = [
+    "HOST",
+    "PORT",
+    "ClientConfig",
+    "ExecutionOutcomeUnknown",
+    "RobotClient",
+    "RobotTransport",
+    "TransportConfig",
+    "close_client",
+    "get_robot_client",
+    "request_to_server",
+]

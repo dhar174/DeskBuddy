@@ -1,29 +1,103 @@
 
 import asyncio
-import pickle
+import concurrent.futures
+import os
 import socket
 import tkinter as tk
 import threading
 from random import *
 import time
-from scipy.io.wavfile import write
-# import sounddevice as sd
-import keyboard
-import whisper
 from sys import byteorder
 from array import array
 from struct import pack
-
-import pyaudio
-import wave
-
-from picoh import picoh
-# import BlenderBot1b
-# import pythonwin
 import signal
 import sys
 from deskbuddy.settings import load_settings
+from typing import Any
 
+try:
+    from scipy.io.wavfile import write
+except ImportError:
+    write = None
+
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
+try:
+    import whisper
+except ImportError:
+    whisper = None
+
+try:
+    import pyaudio
+    import wave
+except ImportError:
+    pyaudio = None
+    wave = None
+
+_ALLOW_MOCK = (
+    os.getenv("DESKBUDDY_MOCK_HARDWARE", "").lower() in ("1", "true", "yes")
+    or os.getenv("DESKBUDDY_HEADLESS", "").lower() in ("1", "true", "yes")
+    or "PYTEST_CURRENT_TEST" in os.environ
+    or "pytest" in sys.modules
+)
+
+_USING_MOCK_PICOH = False
+
+try:
+    from picoh import picoh
+except ImportError as exc:
+    if not _ALLOW_MOCK:
+        raise RuntimeError(
+            "Picoh robot hardware module could not be imported. "
+            "To run in headless or mock mode for testing, set DESKBUDDY_MOCK_HARDWARE=1 or DESKBUDDY_HEADLESS=1."
+        ) from exc
+    _USING_MOCK_PICOH = True
+
+    class MockPicoh:
+        HEADNOD = 0
+        HEADTURN = 1
+        EYETURN = 2
+        LIDBLINK = 3
+        TOPLIP = 4
+        BOTTOMLIP = 5
+        EYETILT = 6
+
+        def reset(self): pass
+        def wait(self, s): pass
+        def setEyeShape(self, shape): pass
+        def setEyeBrightness(self, val): pass
+        def say(self, text, untilDone=True): pass
+        def move(self, motor, pos): pass
+        def setBaseColour(self, r, g, b): pass
+        def get_input_path(self): return "input.wav"
+
+    picoh = MockPicoh()
+
+from transport.hardware import (
+    get_default_hardware_executor,
+    run_hardware_sync,
+)
+
+from transport import (
+    RobotServer,
+    TransportConfig,
+    CommandRegistry,
+    validate_empty_arguments,
+    validate_reply_arguments,
+    validate_base_col_arguments,
+    validate_say_arguments,
+    validate_move_arguments,
+    validate_wait_arguments,
+)
+
+# State tracking globals
+lastReplyMessage = ""
+priorReplyMessage = ""
+lastTranscription = ""
+priorTranscription = ""
 
 
 class MyFunctions:
@@ -57,16 +131,16 @@ class MyFunctions:
             if blinking:
                 # for the numbers 10 to 0 set the lidblink position.
                 for x in range(10, 0, -1):
-                    picoh.move(picoh.LIDBLINK, x)
-                    picoh.wait(0.01)
+                    await run_hardware_sync(picoh.move, getattr(picoh, "LIDBLINK", 3), x)
+                    await asyncio.sleep(0.01)
 
                 # for the numbers 0 to 10 set the lidblink position.
                 for x in range(0, 10):
-                    picoh.move(picoh.LIDBLINK, x)
-                    picoh.wait(0.01)
+                    await run_hardware_sync(picoh.move, getattr(picoh, "LIDBLINK", 3), x)
+                    await asyncio.sleep(0.01)
 
                 # wait for a random amount of time for realistic blinking
-                picoh.wait(random() * 6)
+                await asyncio.sleep(random() * 6)
             await asyncio.sleep(1)
 
     async def randomLook():
@@ -77,11 +151,11 @@ class MyFunctions:
             # if moving is True.
             if moving:
                 # Look in a random direction.
-                picoh.move(picoh.EYETILT, randint(2, 8))
-                picoh.move(picoh.EYETURN, randint(2, 8))
+                await run_hardware_sync(picoh.move, getattr(picoh, "EYETILT", 6), randint(2, 8))
+                await run_hardware_sync(picoh.move, getattr(picoh, "EYETURN", 2), randint(2, 8))
 
                 # Wait for between 0 and 5 seconds.
-                picoh.wait(random() * 5)
+                await asyncio.sleep(random() * 5)
             await asyncio.sleep(1)
 
     async def randomTurn():
@@ -91,10 +165,10 @@ class MyFunctions:
                 await asyncio.sleep(1)
             if moving:
                 # Move Picoh's HEADTURN motor to a random position between 3 and 7.
-                picoh.move(picoh.HEADTURN, randint(3, 7))
+                await run_hardware_sync(picoh.move, getattr(picoh, "HEADTURN", 1), randint(3, 7))
 
                 # wait for a random amount of time before moving again.
-                picoh.wait(random() * 4)
+                await asyncio.sleep(random() * 4)
             await asyncio.sleep(1)
 
     async def randomNod():
@@ -105,31 +179,29 @@ class MyFunctions:
             if moving:
 
                 # Move Picoh's HEADNOD motor to a random position between 4 and 7.
-                picoh.move(picoh.HEADNOD, randint(4, 7))
+                await run_hardware_sync(picoh.move, getattr(picoh, "HEADNOD", 0), randint(4, 7))
 
                 # wait for a random amount of time before moving again.
-                picoh.wait(random() * 4)
+                await asyncio.sleep(random() * 4)
             await asyncio.sleep(1)
 
     async def baseCol(r, g, b):
-
-        # Set the base to a random rgb values between 0 and 10.
-        picoh.setBaseColour(r, g, b)
+        # Set the base to rgb values between 0 and 10.
+        await run_hardware_sync(picoh.setBaseColour, r, g, b)
         return
 
-        # Wait between 10 and 20 seconds before changing again.
     async def picoh_say(text):
         print("in picoh_say")
         print(str(text))
-        picoh.say(str(text))
+        await run_hardware_sync(picoh.say, str(text))
         return
 
     async def picoh_move(motor, position):
-        picoh.move(motor, position)
+        await run_hardware_sync(picoh.move, motor, position)
         return
 
     async def picoh_wait(seconds):
-        picoh.wait(seconds)
+        await asyncio.sleep(float(seconds))
         return
 
     async def picoh_get_input_path():
@@ -157,7 +229,7 @@ class MyFunctions:
         global lastReplyMessage
         global priorReplyMessage
         print("Replying: " + text)
-        if text != lastReplyMessage and text != "" and text != None:
+        if text != lastReplyMessage and text != "" and text is not None:
             print(text)
             priorReplyMessage = lastReplyMessage
             lastReplyMessage = text
@@ -329,78 +401,92 @@ class MyFunctions:
         return None  # This is required to stop the loop
 
 
-# Define a TCP server
+# Define a TCP server configuration
 _settings = load_settings()
 HOST = _settings.robot_bind_address
 PORT = _settings.robot_port
 
 
-async def handle_client(reader, writer):
-    global lastReplyMessage
-    global priorReplyMessage
-    results = ""
-    message = ""
-    try:
-        while True:
-            data = await reader.read(1024)
-            if not data:
-                break
+def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
+    """Create and configure a RobotServer with explicit command allowlisting."""
+    cfg = config or TransportConfig.from_settings(load_settings(), role="server")
+    registry = CommandRegistry()
 
-            payload = pickle.loads(data)
-            function_name = payload['function_name']
-            # print(f"Received function call: {function_name}")
+    # Register allowed DeskBuddy operations with strict validators
+    async def _handle_check_for_response(args: dict) -> Any:
+        return await MyFunctions.check_for_response()
 
-            if 'message' in payload:
-                message = payload['message']
-                func = getattr(MyFunctions, function_name)
-                results = await func(message)
+    registry.register(
+        "check_for_response",
+        _handle_check_for_response,
+        validate_empty_arguments,
+    )
+
+    async def _handle_reply(args: dict) -> Any:
+        msg = args.get("message")
+        if msg is None:
+            msg = args.get("text", "")
+        return await MyFunctions.reply(str(msg))
+
+    registry.register("reply", _handle_reply, validate_reply_arguments)
+
+    async def _handle_simple_test(args: dict) -> Any:
+        return await MyFunctions.simple_test()
+
+    registry.register("simple_test", _handle_simple_test, validate_empty_arguments)
+    registry.register("ping", _handle_simple_test, validate_empty_arguments)
+
+    async def _handle_base_col(args: dict) -> Any:
+        return await MyFunctions.baseCol(args["r"], args["g"], args["b"])
+
+    registry.register("base_col", _handle_base_col, validate_base_col_arguments)
+    registry.register("baseCol", _handle_base_col, validate_base_col_arguments)
+
+    async def _handle_say(args: dict) -> Any:
+        return await MyFunctions.picoh_say(args["text"])
+
+    registry.register("say", _handle_say, validate_say_arguments)
+    registry.register("picoh_say", _handle_say, validate_say_arguments)
+
+    async def _handle_move(args: dict) -> Any:
+        motor = args["motor"]
+        if isinstance(motor, str):
+            motor_map = {
+                "HEADNOD": getattr(picoh, "HEADNOD", 0),
+                "HEADTURN": getattr(picoh, "HEADTURN", 1),
+                "EYETURN": getattr(picoh, "EYETURN", 2),
+                "LIDBLINK": getattr(picoh, "LIDBLINK", 3),
+                "TOPLIP": getattr(picoh, "TOPLIP", 4),
+                "BOTTOMLIP": getattr(picoh, "BOTTOMLIP", 5),
+                "EYETILT": getattr(picoh, "EYETILT", 6),
+            }
+            motor_clean = motor.strip().upper()
+            if motor_clean in motor_map:
+                motor = motor_map[motor_clean]
             else:
-                func = getattr(MyFunctions, function_name)
-                results = await func()
+                motor = int(motor)
+        return await MyFunctions.picoh_move(motor, float(args["position"]))
 
-            writer.write(pickle.dumps(results))
-            await writer.drain()
-            for i in range(10):
-                if (i == 9):
-                    await asyncio.sleep(0.1)
+    registry.register("move", _handle_move, validate_move_arguments)
+    registry.register("picoh_move", _handle_move, validate_move_arguments)
 
-        writer.close()
-        await writer.wait_closed()
-        return None
-    except Exception as e:
-        print(f"Error handling client: {e}")
-        return None
+    async def _handle_wait(args: dict) -> Any:
+        return await MyFunctions.picoh_wait(float(args["seconds"]))
+
+    registry.register("wait", _handle_wait, validate_wait_arguments)
+    registry.register("picoh_wait", _handle_wait, validate_wait_arguments)
+
+    return RobotServer(config=cfg, registry=registry, hardware_executor=get_default_hardware_executor())
 
 
-async def start_server():
-    try:
-        server = await asyncio.start_server(handle_client, HOST, PORT)
-    except Exception as e:
-        print(f"Error starting server: {e}")
-        return
-    async with server:
-        print(f"Server started on {HOST}:{PORT}")
-        await server.serve_forever()
-    # with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    #     s.bind((HOST, PORT))
-    #     s.listen()
-    #     print(f"Server started on {HOST}:{PORT}")
-    #     while True:
-    #         # Wait for a new connection
+async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:
+    """Start the authenticated, framed robot server. Propagates startup failures."""
+    if server is None:
+        server = create_robot_server(config)
+    await server.start()
+    print(f"Server started on {server.host}:{server.port}")
+    await server.serve_forever()
 
-    #         try:
-    #             conn, addr = s.accept()
-
-    #             # print(f"1New connection from {addr[0]}:{addr[1]}")
-    #             # Spawn a new thread to handle the connection
-    #             # t = threading.Thread(target=handle_client, args=(conn, addr))
-    #             # t.start()
-    #             # await handle_client(conn, addr)
-    #             loop.create_task(handle_client(conn, addr))
-    #         except KeyboardInterrupt:
-    #             print("Server stopped")
-    #             break
-    #         await asyncio.sleep(0.1)
 
 
 # Create the main window
@@ -417,7 +503,8 @@ defaultEyeshape = "Eyeball"
 
 THRESHOLD = 500
 CHUNK_SIZE = 1024
-FORMAT = pyaudio.paInt16
+FORMAT = pyaudio.paInt16 if pyaudio is not None else 2
+
 RATE = 44100
 
 
@@ -453,45 +540,25 @@ RATE = 44100
 #     # Save the recorded audio as a WAV file
 
 
-# Reset Picoh and wait for a second for motors to move to reset positions.
-picoh.reset()
-picoh.wait(1)
-picoh.setEyeShape(defaultEyeshape)
+def init_hardware():
+    """Initialize physical Picoh hardware or mock adapter safely."""
+    global moving, blinking, listening
+    if _USING_MOCK_PICOH and not _ALLOW_MOCK:
+        raise RuntimeError("Running with MockPicoh is not permitted in production mode.")
+    try:
+        picoh.reset()
+        picoh.wait(1)
+        picoh.setEyeShape(defaultEyeshape)
+        moving = True
+        blinking = True
+        listening = True
+        picoh.say("Hello my name is Cooper. Please give me a few moments to start up.")
+    except Exception as exc:
+        print(f"Hardware initialization failed or running in headless/mock mode: {exc}")
+        moving = False
+        blinking = False
+        listening = False
 
-# Set the moving and blinking global variables to True.
-
-
-moving = True
-blinking = True
-listening = True
-
-# servertask = threading.Thread(target=start_server, daemon=True)
-# t0 = threading.Thread(target=MyFunctions.listen,
-#                       daemon=True, name='Listen')
-
-
-# # t0 = threading.Thread(target=MyFunctions.listen, args=())
-
-# # Create a thread for blinking.
-# t1 = threading.Thread(target=MyFunctions.blinkLids)
-
-# # Create a thread to make eyes look around randomly.
-# t2 = threading.Thread(target=MyFunctions.randomLook)
-
-# # Create a thread for random head nod positions.
-# t3 = threading.Thread(target=MyFunctions.randomNod)
-
-# # Create a thread for random head turn positions.
-# t4 = threading.Thread(target=MyFunctions.randomTurn)
-
-# Create a thread for random base colour.
-# t5 = threading.Thread(target=baseCol, args=())
-picoh.say(
-    "Hello my name is Cooper. Please give me a few moments to start up.")
-
-# Start the threads.
-
-# t5.start()
 
 
 def signal_handler(signal, frame):
@@ -535,6 +602,7 @@ async def main():
     # asyncio.ensure_future(MyFunctions.randomNod())
     # asyncio.ensure_future(MyFunctions.randomTurn())
     # loop.run_forever()
+    init_hardware()
     server_task = asyncio.create_task(start_server())
     listen_task = asyncio.create_task(MyFunctions.listen())
     blink_task = asyncio.create_task(MyFunctions.blinkLids())
@@ -543,17 +611,11 @@ async def main():
     turn_task = asyncio.create_task(MyFunctions.randomTurn())
 
     await asyncio.gather(server_task, listen_task)
-    # t0.start()
-    # t1.start()
-    # t2.start()
-    # t3.start()
-    # t4.start()
 
-
-# Start the main event loop.
 
 if __name__ == "__main__":
-    model = whisper.load_model("base")
+    if whisper is not None:
+        model = whisper.load_model("base")
     loop = asyncio.get_event_loop()
 
     lastReplyMessage = ""
@@ -561,16 +623,10 @@ if __name__ == "__main__":
     lastTranscription = ""
     priorTranscription = ""
     CHUNK_SIZE = 1024
-    FORMAT = pyaudio.paInt16
+    if pyaudio is not None:
+        FORMAT = pyaudio.paInt16
     RATE = 44100
 
-    # picoh.say(
-    #     "Hi there! How are you doing today? Don't answer that, I still need a few more seconds to start up.")
-    # picoh.say(
-    #     "few more seconds to start up.")
-    # # servertask.start()
-    # # t5 = threading.Thread(target=start_server, args=())
-    # # t5.start()
-    # picoh.say("Okee dokee. I am ready to talk!")
     asyncio.run(main())
     loop.run_forever()
+

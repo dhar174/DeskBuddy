@@ -152,7 +152,11 @@ async def main():
                 break
             await asyncio.sleep(0.1)
 
-            user_response = await rc.request_to_server(**kwargs)
+            try:
+                user_response = await rc.request_to_server(**kwargs)
+            except rc.ExecutionOutcomeUnknown as exc:
+                print(f"Ambiguous execution outcome while checking for response: {exc}")
+                user_response = None
             # print("waiting for response... "+user_response)
 
         message = user_response
@@ -195,7 +199,14 @@ async def main():
                         print("Sending kwargs:", kwargs)
                         results = await rc.request_to_server(**kwargs)
                         break
-                    except:
+                    except rc.ExecutionOutcomeUnknown as exc:
+                        print(
+                            f"Ambiguous execution outcome for command '{exc.command}' "
+                            f"(request_id={exc.request_id}): {exc}. "
+                            "Will not automatically retry physical speech action."
+                        )
+                        break
+                    except Exception:
                         print("Error sending message to server. Trying again...")
                         await asyncio.sleep(0.1)
                         continue
