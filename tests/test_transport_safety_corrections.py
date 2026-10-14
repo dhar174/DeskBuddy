@@ -30,12 +30,17 @@ from transport import (
     CommandRegistry,
     ExecutionOutcomeUnknown,
     HardwareExecutor,
+    PayloadTooLargeError,
     ProtocolViolationError,
     RobotClient,
+    RobotRequest,
+    RobotResponse,
     RobotServer,
     TransportConfig,
     TransportError,
     TransportErrorCode,
+    TruncatedFrameError,
+    is_well_formed_signature,
     reset_default_hardware_executor,
     validate_empty_arguments,
     validate_move_arguments,
@@ -314,13 +319,12 @@ async def test_synchronous_hardware_op_continuing_after_coroutine_timeout(
         return await hw_executor.execute(fake_blocking_hardware)
 
     registry.register("move", blocking_handler, validate_move_arguments)
-    server = RobotServer(ephemeral_server_config, registry, hardware_executor=hw_executor)
+    server_cfg = ephemeral_server_config.with_overrides(request_timeout=0.15)
+    server = RobotServer(server_cfg, registry, hardware_executor=hw_executor)
     await server.start()
 
     try:
-        # 1. Start command with short server execution timeout
-        # Base timeout 0.15s
-        server.config.request_timeout = 0.15
+        # 1. Start command with short server execution timeout (0.15s)
 
         client_cfg = TransportConfig(
             host="127.0.0.1",
@@ -1067,10 +1071,13 @@ async def test_conservative_side_effect_classification_prevents_downgrade(
 # 21. HardwareExecutor race-safe cancellation and completion
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_hardware_executor_completed_operation_not_reported_as_cancelled():
+async def test_hardware_executor_completed_operation_not_reported_as_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Control the boundary between worker completion and async completion notification.
     Cancel the awaiting task when worker has completed.
     Assert result is accurately reported as completed, never cancelled or timed out.
+    Uses explicit synchronization, not timing-dependent polling.
     """
     hw_executor = HardwareExecutor(thread_name_prefix="test-hw-race")
     gate_event = threading.Event()
@@ -1079,26 +1086,37 @@ async def test_hardware_executor_completed_operation_not_reported_as_cancelled()
         gate_event.wait(timeout=2.0)
         return "physical_motion_done"
 
+    loop = asyncio.get_running_loop()
+    orig_call_soon_threadsafe = loop.call_soon_threadsafe
+
+    notification_started = threading.Event()
+    release_notification = threading.Event()
+
+    def intercepted_call_soon_threadsafe(callback, *args):
+        # Triggered by worker thread immediately after setting op.state = COMPLETED
+        # and op.result = result, before done_event.set() is scheduled on event loop.
+        notification_started.set()
+        release_notification.wait(timeout=5.0)
+        return orig_call_soon_threadsafe(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", intercepted_call_soon_threadsafe)
+
     try:
         task = asyncio.create_task(hw_executor.execute(gated_op))
-        # Wait until worker picks up the operation
-        for _ in range(100):
-            if hw_executor.active_operation is not None:
-                break
-            await asyncio.sleep(0.005)
-        assert hw_executor.active_operation is not None
-
-        # Release gate_event so worker finishes op.func and transitions op.state to COMPLETED
+        # Release gated_op to complete on the worker thread
         gate_event.set()
 
-        # Spin until worker thread sets COMPLETED
-        for _ in range(100):
-            if hw_executor.active_operation is None:
-                break
-            await asyncio.sleep(0.005)
+        # Wait deterministically until worker completes and is about to notify the loop
+        await asyncio.to_thread(notification_started.wait, 5.0)
+        assert notification_started.is_set()
 
-        # Cancel the task right after worker completed
+        # At this exact boundary, op.state == COMPLETED on worker thread,
+        # but the event loop task is still awaiting done_event.wait().
+        # Cancel the task now!
         task.cancel()
+
+        # Release notification to allow done_event.set() to be scheduled
+        release_notification.set()
 
         # The task must resolve with the successful result, NOT CancelledError!
         res = await task
@@ -1106,6 +1124,7 @@ async def test_hardware_executor_completed_operation_not_reported_as_cancelled()
         assert hw_executor.has_unresolved_operation is False
     finally:
         gate_event.set()
+        release_notification.set()
         await hw_executor.shutdown()
 
 
@@ -1178,6 +1197,7 @@ def test_direct_transport_config_validation_rejects_invalid_values():
 @pytest.mark.asyncio
 async def test_slow_connection_does_not_starve_response_deadline(
     ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Verify that under default timeouts, a slow connection establishment
     does not consume the server execution + response grace budget.
@@ -1199,8 +1219,25 @@ async def test_slow_connection_does_not_starve_response_deadline(
     server = RobotServer(server_cfg, registry)
     await server.start()
 
+    # Controlled connection delay of 0.3s
+    orig_open_connection = asyncio.open_connection
+
+    async def slow_open_connection(*args, **kwargs):
+        await asyncio.sleep(0.3)
+        return await orig_open_connection(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open_connection)
+
     try:
-        # Client configured with connect_timeout 2.0s, request_timeout 0.4s, response_grace 0.1s
+        # Client configured with connect_timeout 2.0s, request_timeout 0.4s, response_grace 0.1s.
+        # Total response budget = 0.4s + 0.1s = 0.5s.
+        # Connection delay is 0.3s (within connect_timeout 2.0s).
+        # Handler duration is 0.3s (within response budget 0.5s).
+        # Total wall time is ~0.6s > 0.5s.
+        # Under defective implementation where connection consumed response budget,
+        # only 0.5s - 0.3s = 0.2s remained, so 0.3s handler timed out and failed.
+        # Under corrected implementation, response deadline starts after connection,
+        # so the handler completes within its 0.5s response budget.
         client_cfg = TransportConfig(
             host="127.0.0.1",
             port=server.port,
@@ -1215,4 +1252,430 @@ async def test_slow_connection_does_not_starve_response_deadline(
             assert resp.result == "delayed_success"
     finally:
         await server.stop()
+
+
+# ==============================================================================
+# 24. HMAC signature encoding and format validation
+# ==============================================================================
+@pytest.mark.parametrize(
+    "invalid_sig",
+    [
+        "not-hex" * 10,
+        "0" * 63,
+        "0" * 65,
+        "g" * 64,
+        "\u03c0" * 64,
+        "   " + "0" * 61,
+        "0" * 60 + "\U0001F600",
+        "",
+        12345,
+    ],
+)
+def test_is_well_formed_signature_rejects_malformed_values(invalid_sig: Any):
+    assert is_well_formed_signature(invalid_sig) is False
+
+
+def test_is_well_formed_signature_accepts_valid_hex():
+    assert is_well_formed_signature("a" * 64) is True
+    assert is_well_formed_signature("0123456789abcdef" * 4) is True
+    assert is_well_formed_signature("ABCDEF0123456789" * 4) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_sig",
+    [
+        "\u03c0" * 64,
+        "g" * 64,
+        "0" * 63,
+        "0" * 65,
+    ],
+)
+async def test_server_rejects_malformed_request_signatures_without_crashing(
+    bad_sig: str,
+    ephemeral_server_config: TransportConfig,
+):
+    """Server rejects non-ASCII and malformed request signatures as structured unauthorized failures
+    without raising TypeError or crashing the connection handler.
+    """
+    registry = CommandRegistry()
+    registry.register("ping", lambda args: "pong", validate_empty_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        req = RobotRequest.create(command="ping", arguments={})
+        req.auth = {"scheme": "hmac-sha256", "signature": bad_sig}
+        raw_bytes = req.to_json().encode("utf-8")
+        await write_frame(writer, raw_bytes, timeout=2.0)
+
+        resp_bytes = await read_frame(reader, timeout=2.0)
+        resp = RobotResponse.from_json(resp_bytes)
+        assert resp.ok is False
+        assert resp.error is not None
+        assert resp.error["code"] == TransportErrorCode.UNAUTHORIZED.value
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_sig",
+    [
+        "\u03c0" * 64,
+        "z" * 64,
+        "bad_length",
+    ],
+)
+async def test_malformed_response_signature_preserves_execution_outcome_unknown(
+    bad_sig: str,
+    ephemeral_server_config: TransportConfig,
+):
+    """After a side-effecting command has been transmitted, a malformed response signature
+    must raise ExecutionOutcomeUnknown with AuthenticationError as the chained cause.
+    """
+    registry = CommandRegistry()
+    dispatched = 0
+
+    def move_handler(args):
+        nonlocal dispatched
+        dispatched += 1
+        return "moved"
+
+    registry.register("move", move_handler, validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    async def corrupt_send_response(writer, response):
+        response.auth = {"scheme": "hmac-sha256", "signature": bad_sig}
+        await write_frame(writer, response.to_json().encode("utf-8"), timeout=5.0)
+
+    server._send_response = corrupt_send_response
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=2.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.move(1, 5.0)
+
+            err = exc_info.value
+            assert err.command == "move"
+            assert err.__cause__ is not None
+            assert isinstance(err.__cause__, AuthenticationError)
+
+        assert dispatched == 1
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_legacy_request_to_server_preserves_execution_outcome_unknown_on_malformed_sig(
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify request_to_server propagates ExecutionOutcomeUnknown when server response
+    contains a non-ASCII / malformed HMAC signature, and does not return None.
+    """
+    registry = CommandRegistry()
+    registry.register("say", lambda args: "spoken", validate_say_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    async def corrupt_send_response(writer, response):
+        response.auth = {"scheme": "hmac-sha256", "signature": "\u03c0" * 64}
+        await write_frame(writer, response.to_json().encode("utf-8"), timeout=5.0)
+
+    server._send_response = corrupt_send_response
+
+    monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+    try:
+        await rc.close_client()
+        with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+            await rc.request_to_server(function_name="say", text="hello")
+
+        assert exc_info.value.command == "say"
+        assert isinstance(exc_info.value.__cause__, AuthenticationError)
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+# ==============================================================================
+# 25. Response framing error preserves execution uncertainty
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_oversized_response_after_side_effect_raises_execution_outcome_unknown(
+    ephemeral_server_config: TransportConfig,
+):
+    """When server sends an oversized response frame header exceeding max_payload_size,
+    the client raises ExecutionOutcomeUnknown with PayloadTooLargeError as cause.
+    """
+    import struct
+    registry = CommandRegistry()
+    dispatched = 0
+
+    def move_handler(args):
+        nonlocal dispatched
+        dispatched += 1
+        return "moved"
+
+    registry.register("move", move_handler, validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    async def oversized_send_response(writer, response):
+        header = struct.pack(">I", 70000)
+        writer.write(header)
+        await writer.drain()
+
+    server._send_response = oversized_send_response
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=2.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.move(1, 5.0)
+
+            err = exc_info.value
+            assert err.command == "move"
+            assert err.code == TransportErrorCode.PAYLOAD_TOO_LARGE
+            assert isinstance(err.__cause__, PayloadTooLargeError)
+
+        assert dispatched == 1
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_response_framing_truncated_frame_causes_execution_outcome_unknown(
+    ephemeral_server_config: TransportConfig,
+):
+    """When a side-effecting command receives a truncated frame from the server,
+    client raises ExecutionOutcomeUnknown chaining TruncatedFrameError.
+    """
+    import struct
+    dispatched = 0
+    registry = CommandRegistry()
+
+    def move_handler(args):
+        nonlocal dispatched
+        dispatched += 1
+        return "moved"
+
+    registry.register("move", move_handler, validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    async def truncated_send_response(writer, response):
+        # Send declared length 100, but only 10 bytes then close connection
+        header = struct.pack(">I", 100)
+        writer.write(header + b"0123456789")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server._send_response = truncated_send_response
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            request_timeout=2.0,
+        )
+        async with RobotClient(client_cfg) as client:
+            with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+                await client.move(1, 5.0)
+
+            err = exc_info.value
+            assert err.command == "move"
+            assert isinstance(err.__cause__, TruncatedFrameError)
+
+        assert dispatched == 1
+    finally:
+        await server.stop()
+
+
+
+@pytest.mark.asyncio
+async def test_legacy_request_to_server_preserves_execution_outcome_unknown_on_oversized_response(
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify request_to_server propagates ExecutionOutcomeUnknown on oversized response."""
+    import struct
+    registry = CommandRegistry()
+    registry.register("move", lambda args: "moved", validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    async def oversized_send_response(writer, response):
+        writer.write(struct.pack(">I", 99999))
+        await writer.drain()
+
+    server._send_response = oversized_send_response
+
+    monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+    try:
+        await rc.close_client()
+        with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
+            await rc.request_to_server(function_name="move", motor=1, position=5.0)
+
+        assert exc_info.value.command == "move"
+        assert exc_info.value.code == TransportErrorCode.PAYLOAD_TOO_LARGE
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_pre_transmission_oversized_outgoing_request_is_ordinary_failure(
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Outgoing frame exceeding max_payload_size fails before transmission,
+    raising PayloadTooLargeError directly (not ExecutionOutcomeUnknown),
+    and legacy request_to_server returns None.
+    """
+    registry = CommandRegistry()
+    registry.register("move", lambda args: "moved", validate_move_arguments)
+    server = RobotServer(ephemeral_server_config, registry)
+    await server.start()
+
+    try:
+        client_cfg = TransportConfig(
+            host="127.0.0.1",
+            port=server.port,
+            secret=ephemeral_server_config.secret,
+            max_payload_size=100,
+        )
+        async with RobotClient(client_cfg) as client:
+            huge_args = {"motor": 1, "position": 5.0, "extra": "x" * 200}
+            with pytest.raises(PayloadTooLargeError) as exc_info:
+                await client.request("move", huge_args, side_effects=True)
+
+            assert exc_info.value.code == TransportErrorCode.PAYLOAD_TOO_LARGE
+
+        # Also verify legacy wrapper catches ordinary transport error and returns None
+        # since command was definitely never transmitted
+        monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
+        monkeypatch.setenv("DESKBUDDY_ROBOT_PORT", str(server.port))
+        monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", ephemeral_server_config.secret)
+
+        await rc.close_client()
+        # Set max_payload_size on the client used by rc
+        rc._client = RobotClient(client_cfg)
+        res = await rc.request_to_server(function_name="move", motor=1, position=5.0, extra="x" * 200)
+        assert res is None
+    finally:
+        await rc.close_client()
+        await server.stop()
+
+
+# ==============================================================================
+# 26. Configuration immutability and override validation
+# ==============================================================================
+def test_transport_config_is_immutable():
+    """Verify TransportConfig instances are frozen and cannot be mutated."""
+    import dataclasses
+    cfg = TransportConfig(secret="test_secret")
+
+    with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+        cfg.max_clock_skew = float("nan")  # type: ignore[misc]
+
+    with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+        cfg.port = -1  # type: ignore[misc]
+
+    with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+        cfg.host = ""  # type: ignore[misc]
+
+    with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+        cfg.connect_timeout = 0.0  # type: ignore[misc]
+
+
+def test_transport_config_with_overrides_validates_and_preserves_original():
+    """Verify with_overrides produces a validated copy and leaves original unchanged."""
+    cfg = TransportConfig(secret="initial_secret", port=8888, connect_timeout=5.0)
+
+    # Valid overrides
+    cfg2 = cfg.with_overrides(port=9999, connect_timeout=10.0)
+    assert cfg2.port == 9999
+    assert cfg2.connect_timeout == 10.0
+    assert cfg.port == 8888
+    assert cfg.connect_timeout == 5.0
+
+    # Byte secret conversion
+    cfg_bytes = cfg.with_overrides(secret=b"bytes_secret")
+    assert cfg_bytes.secret == "bytes_secret"
+
+    # Invalid overrides fail closed
+    with pytest.raises(ValueError, match="port"):
+        cfg.with_overrides(port=-1)
+
+    with pytest.raises(ValueError, match="max_clock_skew"):
+        cfg.with_overrides(max_clock_skew=float("nan"))
+
+    with pytest.raises(ValueError, match="connect_timeout"):
+        cfg.with_overrides(connect_timeout=-5.0)
+
+
+def test_client_and_server_constructors_validate_overrides_without_mutating_caller_config():
+    """Verify RobotClient and RobotServer constructor overrides fail closed on invalid
+    values and do not mutate caller-owned configuration objects.
+    """
+    base_cfg = TransportConfig(secret="valid_secret", port=8888, host="127.0.0.1")
+
+    # Invalid port in constructor override
+    with pytest.raises(ValueError, match="port"):
+        RobotClient(base_cfg, port=70000)
+
+    with pytest.raises(ValueError, match="port"):
+        RobotServer(base_cfg, port=-1)
+
+    # Invalid host in constructor override
+    with pytest.raises(ValueError, match="host"):
+        RobotClient(base_cfg, host="")
+
+    with pytest.raises(ValueError, match="host"):
+        RobotServer(base_cfg, host="   ")
+
+    # Empty secret in constructor override
+    with pytest.raises(AuthenticationError):
+        RobotClient(base_cfg, secret="")
+
+    with pytest.raises(AuthenticationError):
+        RobotServer(base_cfg, secret="")
+
+    # Caller's base_cfg is completely unaffected
+    assert base_cfg.port == 8888
+    assert base_cfg.host == "127.0.0.1"
+    assert base_cfg.secret == "valid_secret"
+
+    # Independent valid client and server configs from same base
+    client = RobotClient(base_cfg, port=1111)
+    server = RobotServer(base_cfg, port=2222)
+    assert client.config.port == 1111
+    assert server.config.port == 2222
+    assert base_cfg.port == 8888
+
 

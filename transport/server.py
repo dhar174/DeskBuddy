@@ -42,17 +42,11 @@ class RobotServer:
         port: int | None = None,
         secret: str | bytes | None = None,
     ) -> None:
-        if config is None:
-            self.config = TransportConfig.from_settings(role="server")
-        else:
-            self.config = config
-
-        if host is not None:
-            self.config.host = host
-        if port is not None:
-            self.config.port = port
-        if secret is not None:
-            self.config.secret = secret if isinstance(secret, str) else secret.decode("utf-8")
+        base_config = (
+            TransportConfig.from_settings(role="server") if config is None else config
+        )
+        # Overrides produce a re-validated copy; the caller's config is never mutated.
+        self.config = base_config.with_overrides(host=host, port=port, secret=secret)
 
         if not self.config.secret or not self.config.secret.strip():
             raise AuthenticationError(
@@ -190,7 +184,17 @@ class RobotServer:
                     break
 
                 # 2. Process payload and produce typed response
-                response = await self._process_request_payload(payload_bytes)
+                try:
+                    response = await self._process_request_payload(payload_bytes)
+                except Exception as exc:
+                    logger.exception(
+                        "Unexpected error processing request from %s: %s", client_addr, exc
+                    )
+                    response = RobotResponse.fail(
+                        request_id=None,
+                        code=TransportErrorCode.INTERNAL_ERROR,
+                        message="Internal server error while processing request",
+                    )
 
                 # 3. Write framed response back to client
                 try:
@@ -245,8 +249,18 @@ class RobotServer:
                 message=f"Unsupported protocol version '{request.protocol_version}'",
             )
 
-        # 3. Authenticate request
-        valid, err_code, err_msg = self.authenticator.authenticate(request)
+        # 3. Authenticate request (fail closed: any unexpected error is an auth failure)
+        try:
+            valid, err_code, err_msg = self.authenticator.authenticate(request)
+        except Exception:
+            logger.warning(
+                "Authentication check raised unexpectedly for request %r; rejecting", req_id
+            )
+            valid, err_code, err_msg = (
+                False,
+                TransportErrorCode.UNAUTHORIZED,
+                "Authentication failed",
+            )
         if not valid:
             logger.warning(
                 "Authentication rejected for request %s: [%s] %s",

@@ -92,17 +92,11 @@ class RobotClient(RobotTransport):
         port: int | None = None,
         secret: str | bytes | None = None,
     ) -> None:
-        if config is None:
-            self.config = TransportConfig.from_settings(role="client")
-        else:
-            self.config = config
-
-        if host is not None:
-            self.config.host = host
-        if port is not None:
-            self.config.port = port
-        if secret is not None:
-            self.config.secret = secret if isinstance(secret, str) else secret.decode("utf-8")
+        base_config = (
+            TransportConfig.from_settings(role="client") if config is None else config
+        )
+        # Overrides produce a re-validated copy; the caller's config is never mutated.
+        self.config = base_config.with_overrides(host=host, port=port, secret=secret)
 
         if not self.config.secret or not self.config.secret.strip():
             raise AuthenticationError(
@@ -329,18 +323,23 @@ class RobotClient(RobotTransport):
                             ),
                         ) from exc
                     except TransportError as exc:
+                        # Any framing/transport failure after possible transmission
+                        # (oversized response header, timeout, invalid frame, ...)
+                        # leaves the physical outcome unknown. Never downgrade it.
                         await self._disconnect()
                         if exc.code == TransportErrorCode.TIMEOUT:
-                            raise ExecutionOutcomeUnknown(
-                                request_id=request.request_id,
-                                command=command,
-                                message=(
-                                    f"Command '{command}' execution outcome is unknown: read timed out "
-                                    f"after request was transmitted."
-                                ),
-                                code=TransportErrorCode.TIMEOUT,
-                            ) from exc
-                        raise
+                            detail = "read timed out after request was transmitted."
+                        else:
+                            detail = (
+                                f"response framing failed after request was transmitted "
+                                f"({type(exc).__name__}: {exc.message})."
+                            )
+                        raise ExecutionOutcomeUnknown(
+                            request_id=request.request_id,
+                            command=command,
+                            message=f"Command '{command}' execution outcome is unknown: {detail}",
+                            code=exc.code,
+                        ) from exc
                     except asyncio.TimeoutError as exc:
                         await self._disconnect()
                         raise ExecutionOutcomeUnknown(
@@ -429,13 +428,23 @@ class RobotClient(RobotTransport):
                         f"Server returned malformed response: {exc}",
                     ) from exc
 
-                # Authenticate server response
-                valid, err_code, err_msg = verify_response(
-                    self.config.secret,
-                    response,
-                    expected_request_id=request.request_id,
-                    max_clock_skew=self.config.max_clock_skew,
-                )
+                # Authenticate server response. Any unexpected verification error is
+                # treated as an authentication failure, never as a trusted response.
+                verify_exc: Exception | None = None
+                try:
+                    valid, err_code, err_msg = verify_response(
+                        self.config.secret,
+                        response,
+                        expected_request_id=request.request_id,
+                        max_clock_skew=self.config.max_clock_skew,
+                    )
+                except Exception as exc:
+                    verify_exc = exc
+                    valid, err_code, err_msg = (
+                        False,
+                        TransportErrorCode.UNAUTHORIZED,
+                        "Server response authentication could not be verified",
+                    )
                 if not valid:
                     await self._disconnect()
                     underlying: ProtocolViolationError | AuthenticationError
@@ -449,6 +458,8 @@ class RobotClient(RobotTransport):
                             err_code or TransportErrorCode.UNAUTHORIZED,
                             err_msg or "Failed to authenticate server response",
                         )
+                    if verify_exc is not None:
+                        underlying.__cause__ = verify_exc
                     if is_side_effecting and transmission_attempted:
                         req_id = request.request_id if request else "unknown"
                         raise ExecutionOutcomeUnknown(

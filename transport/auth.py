@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 
 from transport.protocol import (
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -22,6 +22,31 @@ DEFAULT_MAX_CLOCK_SKEW_SECONDS: Final[float] = 30.0
 DEFAULT_REPLAY_CACHE_MAX_ENTRIES: Final[int] = 10000
 REQUEST_DOMAIN_PREFIX: Final[str] = "deskbuddy-request-v1"
 RESPONSE_DOMAIN_PREFIX: Final[str] = "deskbuddy-response-v1"
+# Hex-encoded HMAC-SHA256 digest length (32 bytes -> 64 hex characters).
+SIGNATURE_HEX_LENGTH: Final[int] = hashlib.sha256().digest_size * 2
+_ASCII_HEX_CHARS: Final[frozenset[str]] = frozenset("0123456789abcdefABCDEF")
+# Errors that canonicalization/signing of attacker-controlled fields may raise
+# (e.g. lone surrogates in JSON strings cannot be UTF-8 encoded).
+_SIGNING_MATERIAL_ERRORS: Final = (UnicodeError, TypeError, ValueError, OverflowError)
+
+
+def is_well_formed_signature(signature: object) -> TypeGuard[str]:
+    """Return True only for exactly 64 ASCII hexadecimal characters.
+
+    Format validation runs before ``hmac.compare_digest`` so that malformed
+    values (non-ASCII text, wrong length, non-hex characters, non-strings) are
+    rejected as ordinary authentication failures instead of raising
+    ``TypeError`` from the comparison. This check depends only on the
+    attacker-supplied value, never on the secret or the expected digest.
+    """
+    if not isinstance(signature, str) or len(signature) != SIGNATURE_HEX_LENGTH:
+        return False
+    return all(ch in _ASCII_HEX_CHARS for ch in signature)
+
+
+def signatures_match(provided: str, expected: str) -> bool:
+    """Constant-time comparison of two well-formed hex signatures."""
+    return hmac.compare_digest(provided.encode("ascii"), expected.encode("ascii"))
 
 
 def canonical_json_string(value: Any) -> str:
@@ -169,11 +194,22 @@ def verify_response(
         )
 
     sig = response.auth.get("signature")
-    if not isinstance(sig, str) or not sig:
-        return False, TransportErrorCode.UNAUTHORIZED, "Missing or invalid response signature"
+    if not is_well_formed_signature(sig):
+        return (
+            False,
+            TransportErrorCode.UNAUTHORIZED,
+            "Missing or malformed response signature (expected 64 ASCII hex characters)",
+        )
 
-    expected_sig = compute_response_signature(secret_bytes, response)
-    if not hmac.compare_digest(sig, expected_sig):
+    try:
+        expected_sig = compute_response_signature(secret_bytes, response)
+    except _SIGNING_MATERIAL_ERRORS:
+        return (
+            False,
+            TransportErrorCode.UNAUTHORIZED,
+            "Response authentication material could not be canonicalized",
+        )
+    if not signatures_match(sig, expected_sig):
         return (
             False,
             TransportErrorCode.UNAUTHORIZED,
@@ -280,8 +316,12 @@ class HMACAuthenticator:
             )
 
         signature = request.auth.get("signature")
-        if not isinstance(signature, str) or not signature:
-            return False, TransportErrorCode.UNAUTHORIZED, "Missing or invalid signature"
+        if not is_well_formed_signature(signature):
+            return (
+                False,
+                TransportErrorCode.UNAUTHORIZED,
+                "Missing or malformed signature (expected 64 ASCII hex characters)",
+            )
 
         # Check clock skew / expiry
         skew = abs(now - request.timestamp)
@@ -293,8 +333,15 @@ class HMACAuthenticator:
             )
 
         # Constant-time signature verification
-        expected_sig = compute_signature(self._secret_bytes, request)
-        if not hmac.compare_digest(signature, expected_sig):
+        try:
+            expected_sig = compute_signature(self._secret_bytes, request)
+        except _SIGNING_MATERIAL_ERRORS:
+            return (
+                False,
+                TransportErrorCode.UNAUTHORIZED,
+                "Request authentication material could not be canonicalized",
+            )
+        if not signatures_match(signature, expected_sig):
             return (
                 False,
                 TransportErrorCode.UNAUTHORIZED,

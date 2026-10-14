@@ -52,11 +52,12 @@ def compute_command_timeout(
     return base_timeout
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TransportConfig:
     """Explicit network, timeout, and authentication configuration for robot transport.
 
     Constructed from validated DeskBuddy Settings or direct arguments.
+    Immutable to prevent runtime configuration tampering or validation bypasses.
     """
 
     host: str = DEFAULT_HOST
@@ -109,14 +110,64 @@ class TransportConfig:
         if isinstance(self.response_grace, bool) or not isinstance(self.response_grace, (int, float)) or not math.isfinite(self.response_grace) or self.response_grace < 0:
             raise ValueError(f"response_grace must be a non-negative finite number, got {self.response_grace!r}")
 
-        # Normalize numeric float fields to float
-        self.connect_timeout = float(self.connect_timeout)
-        self.read_timeout = float(self.read_timeout)
-        self.write_timeout = float(self.write_timeout)
-        self.request_timeout = float(self.request_timeout)
-        self.max_clock_skew = float(self.max_clock_skew)
-        self.retry_backoff = float(self.retry_backoff)
-        self.response_grace = float(self.response_grace)
+        # Normalize numeric float fields to float via object.__setattr__ for frozen dataclass
+        object.__setattr__(self, "connect_timeout", float(self.connect_timeout))
+        object.__setattr__(self, "read_timeout", float(self.read_timeout))
+        object.__setattr__(self, "write_timeout", float(self.write_timeout))
+        object.__setattr__(self, "request_timeout", float(self.request_timeout))
+        object.__setattr__(self, "max_clock_skew", float(self.max_clock_skew))
+        object.__setattr__(self, "retry_backoff", float(self.retry_backoff))
+        object.__setattr__(self, "response_grace", float(self.response_grace))
+
+    def with_overrides(
+        self,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+        secret: str | bytes | None = None,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        write_timeout: float | None = None,
+        request_timeout: float | None = None,
+        max_payload_size: int | None = None,
+        max_clock_skew: float | None = None,
+        max_retries: int | None = None,
+        retry_backoff: float | None = None,
+        response_grace: float | None = None,
+        **overrides: Any,
+    ) -> TransportConfig:
+        """Return a new validated, immutable TransportConfig with overrides applied.
+
+        The original configuration object is never modified. All overrides are
+        validated fail-closed by __post_init__.
+        """
+        secret_str = self.secret
+        if secret is not None:
+            if isinstance(secret, bytes):
+                secret_str = secret.decode("utf-8")
+            elif isinstance(secret, str):
+                secret_str = secret
+            else:
+                raise TypeError(f"secret must be a string or bytes, got {type(secret).__name__}")
+
+        data: dict[str, Any] = {
+            "host": self.host if host is None else host,
+            "port": self.port if port is None else port,
+            "secret": secret_str,
+            "connect_timeout": self.connect_timeout if connect_timeout is None else connect_timeout,
+            "read_timeout": self.read_timeout if read_timeout is None else read_timeout,
+            "write_timeout": self.write_timeout if write_timeout is None else write_timeout,
+            "request_timeout": self.request_timeout if request_timeout is None else request_timeout,
+            "max_payload_size": self.max_payload_size if max_payload_size is None else max_payload_size,
+            "max_clock_skew": self.max_clock_skew if max_clock_skew is None else max_clock_skew,
+            "max_retries": self.max_retries if max_retries is None else max_retries,
+            "retry_backoff": self.retry_backoff if retry_backoff is None else retry_backoff,
+            "response_grace": self.response_grace if response_grace is None else response_grace,
+        }
+        for k, v in overrides.items():
+            if v is not None:
+                data[k] = v
+        return TransportConfig(**data)
 
     @classmethod
     def from_settings(
