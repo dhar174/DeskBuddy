@@ -1,6 +1,6 @@
 # DeskBuddy Verification Gates & Acceptance Criteria
 
-This document defines the quality and verification gates that must be satisfied before any code, configuration, or model change is accepted into the `DeskBuddy` repository.
+Gate 1 is the routine CPU-only pull request check. Gates 2 and 3 qualify the actual runtime, model, and hardware for changes that affect those capabilities.
 
 ---
 
@@ -26,7 +26,7 @@ This document defines the quality and verification gates that must be satisfied 
 **Objective**: Verify that the development environment is properly configured, dependencies import cleanly, and headless mock hardware adapters are active.
 
 ### Acceptance Criteria:
-1. **Import Side-Effects**: Importing `BotCortex`, `helpers`, or `buddy1` must NOT trigger unhandled hardware errors, device lockouts, or network crashes when hardware is disconnected.
+1. **Import Side Effects**: The packaged headless entry point must validate configuration without initializing models, external services, or devices. Exercise legacy startup paths with mocked optional dependencies.
 2. **Headless Mock Availability**: The mock hardware adapter (`MockPicoh`) and loopback socket bridge must initialize cleanly without physical USB controllers connected.
 3. **Configuration Sanity**: Environment variables (`OPENAI_API_KEY`, etc.) are checked gracefully; missing keys trigger fallback warnings rather than hard crashes.
 
@@ -34,22 +34,19 @@ This document defines the quality and verification gates that must be satisfied 
 
 ## Gate 1: Contract & Unit Tests
 
-**Objective**: Ensure that all algorithmic, classification, networking, and memory components pass automated unit and contract tests.
+**Objective**: Run the locked CPU-only unit and deterministic integration tests plus lint, formatting, and type checks.
 
-### Required Checks:
-```powershell
-python -m pytest tests/ -v
-```
+Follow the [testing guide](../../docs/testing.md) for commands, supported Python versions, check scopes, and opt-in integration tests.
 
 ### Acceptance Criteria:
 1. **Classification Intent Contracts**:
-   - `helpers.is_question`, `is_chat_or_command`, `is_personal`, `is_visual_question`, and `needs_follow_up` must achieve $\ge 95\%$ accuracy on standard test suites in `tests/test_classifiers.py`.
+   - Use deterministic classifier fakes to verify intent-label handling, routing, and fallbacks.
 2. **Conversation History Contracts**:
    - Multi-turn buffer formatting maintains valid alternating roles (`user`, `assistant`).
    - Rolling context trimming truncates history beyond maximum turn limits without losing the system persona prompt.
-3. **TCP Socket Protocol Framing**:
-   - Pickled payload serialization and deserialization across client-server boundaries pass under both immediate and fragmented TCP packet delivery.
-   - Client timeout handlers successfully catch socket stalls and recover without crashing.
+3. **Authenticated Robot Transport (Issue #4)**:
+   - Exercise typed, length-framed JSON on loopback, including fragmented frames, bidirectional HMAC authentication, and rejection of malformed, unauthorized, and replayed requests.
+   - Verify timeout and disconnect handling. If execution of a physical command is uncertain, surface that outcome without blindly retrying it.
 4. **Knowledge Base Atomic Persistence**:
    - Concurrent or interrupted writes to `question_file.json` never produce corrupted or partial JSON files.
 
@@ -68,6 +65,8 @@ python -m pytest tests/ -v
    - Event loop lag during continuous robot background tasks (blinking, looking) must stay below **$20\text{ ms}$**.
 3. **Semantic Lookup Latency**:
    - Q&A vector search in `question_file.json` must complete in **$<50\text{ ms}$**.
+4. **Real Classifier Qualification**:
+   - Measure the target of **at least 95% accuracy** for `helpers.is_question`, `is_chat_or_command`, `is_personal`, `is_visual_question`, and `needs_follow_up` on a labeled utterance set using provisioned model weights.
 
 ---
 

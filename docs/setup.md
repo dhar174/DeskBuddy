@@ -185,19 +185,11 @@ change is attempted. `windows/buddyreqs.txt` is retired; use the optional extras
 bootstrap; its default legacy hardware mode uses the installed speech/Picoh extras.
 It no longer activates a machine-specific virtualenv or changes to a personal path.
 
-## Issue #4 integration contract
+## Issue #4 transport configuration
 
-Robot constants in robot_client.py/buddy1.py and Windows copies read settings;
-all transport operations remain owned by #4. When merging #4, retain these imports
-and use `load_settings()` (or an injected Settings instance) for `robot_host`,
-`robot_bind_address`, `robot_port`, `robot_auth_secret`,
-`robot_connect_timeout_seconds`, and `robot_timeout_seconds`. Secret values are
-accessed explicitly via `.get_secret_value()` after checking for None. #4 must
-enforce missing-secret rules, authenticated transport and timeouts. #5 does not
-claim that merely configuring a secret secures the old protocol.
-
-PR #28 must adapt its transport configuration to this canonical Settings API when
-rebased onto this baseline. Keep the following names and source values:
+The robot client, server, and Windows copies use canonical DeskBuddy settings
+for the authenticated JSON transport introduced in PR #28. The transport
+requires a nonempty shared secret before client or server startup.
 
 | Settings field | Transport use |
 | --- | --- |
@@ -210,27 +202,13 @@ rebased onto this baseline. Keep the following names and source values:
 
 `DESKBUDDY_ROBOT_AUTH_SECRET`, `DESKBUDDY_ROBOT_CONNECT_TIMEOUT_SECONDS`, and
 `DESKBUDDY_ROBOT_TIMEOUT_SECONDS` are the corresponding environment names.
-Replace PR #28's separate `DESKBUDDY_ROBOT_SECRET` and connect/read/write/request
-timeout environment parser with an adapter consuming Settings. Internal transport
-configuration objects may remain, but must not read a second set of environment
-variables or silently fall back on malformed values. If separate phase deadlines
-remain necessary, derive them explicitly from the validated request policy; add
-any additional user-facing settings here with validation and examples. The current
-5-second default is not a promise that long speech or wait commands will finish
-within it; PR #28 must verify timeout policy for those commands during integration.
+The transport derives phase deadlines from validated settings and applies
+command-specific timeouts for long speech and wait commands. The current
+5-second default is the base timeout.
 
-Merge PR #28's `pytest.ini` options into `[tool.pytest.ini_options]` and remove the
-redundant file so pytest does not shadow this configuration. The locked dev group
-includes pytest-asyncio; run the combined transport and baseline tests after rebase.
-
-Run `uv run --no-sync ruff check .` and `uv run --no-sync mypy` for production
-checks. Ruff includes `src/`, `tests/` and the future top-level `transport/`.
-Mypy discovers packages from the repository root, including `transport/` as soon
-as it exists, while excluding tests, generated build artifacts, Windows vendor
-copies and flat legacy scripts.
-Keep the repository root a non-package (no root `__init__.py`); production packages
-belong under `src/` or in the temporary `transport/` boundary. PR #28 must fix any
-lint/type errors exposed by these checks rather than disabling the transport scope.
+See the [testing guide](testing.md) for the locked CPU-only checks and loopback
+transport tests. Keep the repository root a non-package (no root `__init__.py`);
+production packages belong under `src/` or in the temporary `transport/` boundary.
 
 ## Larynx Docker limitation
 
