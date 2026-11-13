@@ -40,11 +40,13 @@ def test_robot_request_malformed_json_rejection():
 def test_robot_request_missing_required_fields():
     # Missing command
     with pytest.raises(ProtocolViolationError) as exc_info:
-        RobotRequest.from_dict({
-            "request_id": "123",
-            "protocol_version": "1.0",
-            "timestamp": time.time(),
-        })
+        RobotRequest.from_dict(
+            {
+                "request_id": "123",
+                "protocol_version": "1.0",
+                "timestamp": time.time(),
+            }
+        )
     assert exc_info.value.code == TransportErrorCode.MALFORMED_REQUEST
 
     # Non-dict payload
@@ -92,25 +94,30 @@ def test_robot_response_malformed_rejection():
 def test_robot_request_edge_cases():
     # Boolean timestamp must be rejected
     with pytest.raises(ProtocolViolationError):
-        RobotRequest.from_dict({
-            "request_id": "123",
-            "protocol_version": "1.0",
-            "timestamp": True,
-            "command": "ping",
-        })
+        RobotRequest.from_dict(
+            {
+                "request_id": "123",
+                "protocol_version": "1.0",
+                "timestamp": True,
+                "command": "ping",
+            }
+        )
 
     # Blank command must be rejected
     with pytest.raises(ProtocolViolationError):
-        RobotRequest.from_dict({
-            "request_id": "123",
-            "protocol_version": "1.0",
-            "timestamp": time.time(),
-            "command": "   ",
-        })
+        RobotRequest.from_dict(
+            {
+                "request_id": "123",
+                "protocol_version": "1.0",
+                "timestamp": time.time(),
+                "command": "   ",
+            }
+        )
 
 
 def test_transport_error_custom_code():
     from transport.protocol import TransportError
+
     # Custom string code must not raise ValueError
     err = TransportError("custom_vendor_error", "Something vendor-specific failed")
     assert err.code == "custom_vendor_error"
@@ -120,10 +127,12 @@ def test_transport_error_custom_code():
 def test_robot_request_non_finite_timestamps():
     for bad_ts in [float("nan"), float("inf"), float("-inf")]:
         with pytest.raises(ProtocolViolationError) as exc_info:
-            RobotRequest.from_dict({
-                "request_id": "123",
-                "protocol_version": "1.0",
-                "timestamp": bad_ts,
-                "command": "ping",
-            })
+            RobotRequest.from_dict(
+                {
+                    "request_id": "123",
+                    "protocol_version": "1.0",
+                    "timestamp": bad_ts,
+                    "command": "ping",
+                }
+            )
         assert "finite" in exc_info.value.message

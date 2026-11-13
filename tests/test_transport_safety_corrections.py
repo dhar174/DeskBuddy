@@ -79,7 +79,10 @@ async def test_failure_before_transmission_raises_ordinary_transport_error():
             await client.request("move", {"motor": 1, "position": 5.0})
 
         assert not isinstance(exc_info.value, ExecutionOutcomeUnknown)
-        assert exc_info.value.code in (TransportErrorCode.INTERNAL_ERROR, TransportErrorCode.TIMEOUT)
+        assert exc_info.value.code in (
+            TransportErrorCode.INTERNAL_ERROR,
+            TransportErrorCode.TIMEOUT,
+        )
 
 
 # ==============================================================================
@@ -204,9 +207,7 @@ async def test_signed_replay_rejection_surfaces_execution_outcome_unknown(
             # 2. Second transmission with exact same request ID gets rejected as replay by server.
             # Client receives signed replayed_request response and raises ExecutionOutcomeUnknown!
             with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
-                await client.request(
-                    "move", {"motor": 1, "position": 5.0}, request_id=custom_id
-                )
+                await client.request("move", {"motor": 1, "position": 5.0}, request_id=custom_id)
 
             assert exc_info.value.command == "move"
             assert exc_info.value.request_id == custom_id
@@ -221,6 +222,7 @@ async def test_signed_replay_rejection_surfaces_execution_outcome_unknown(
 @pytest.mark.asyncio
 async def test_failed_reconnection_after_transmission_raises_execution_outcome_unknown():
     """Verify that if reconnect fails after transmission was attempted, ExecutionOutcomeUnknown is raised."""
+
     async def fake_server_handler(reader, writer):
         try:
             await read_frame(reader)
@@ -285,7 +287,9 @@ async def test_legacy_wrapper_preserves_execution_outcome_unknown(
         # Side-effecting reply command times out after transmission:
         # request_to_server MUST raise ExecutionOutcomeUnknown!
         with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
-            await rc.request_to_server(function_name="reply", message="Test ambiguous", timeout=0.15)
+            await rc.request_to_server(
+                function_name="reply", message="Test ambiguous", timeout=0.15
+            )
 
         assert exc_info.value.command == "reply"
         assert exc_info.value.request_id is not None
@@ -769,7 +773,9 @@ async def test_legacy_wrapper_does_not_retry_ambiguous_physical_action(
     try:
         await rc.close_client()
         with pytest.raises(ExecutionOutcomeUnknown) as exc_info:
-            await rc.request_to_server(function_name="reply", message="One-time action", timeout=0.15)
+            await rc.request_to_server(
+                function_name="reply", message="One-time action", timeout=0.15
+            )
 
         assert exc_info.value.command == "reply"
         await asyncio.sleep(0.4)
@@ -1158,7 +1164,17 @@ def test_direct_transport_config_validation_rejects_invalid_values():
 
     # 5. Timeouts must be positive finite numbers
     for field in ("connect_timeout", "read_timeout", "write_timeout", "request_timeout"):
-        for bad_val in (0, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, False, "5.0"):
+        for bad_val in (
+            0,
+            0.0,
+            -1.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            "5.0",
+        ):
             with pytest.raises((ValueError, TypeError)):
                 TransportConfig(**{field: bad_val})
 
@@ -1263,7 +1279,7 @@ async def test_slow_connection_does_not_starve_response_deadline(
         "g" * 64,
         "\u03c0" * 64,
         "   " + "0" * 61,
-        "0" * 60 + "\U0001F600",
+        "0" * 60 + "\U0001f600",
         "",
         12345,
     ],
@@ -1420,6 +1436,7 @@ async def test_oversized_response_after_side_effect_raises_execution_outcome_unk
     the client raises ExecutionOutcomeUnknown with PayloadTooLargeError as cause.
     """
     import struct
+
     registry = CommandRegistry()
     dispatched = 0
 
@@ -1468,6 +1485,7 @@ async def test_response_framing_truncated_frame_causes_execution_outcome_unknown
     client raises ExecutionOutcomeUnknown chaining TruncatedFrameError.
     """
     import struct
+
     dispatched = 0
     registry = CommandRegistry()
 
@@ -1510,7 +1528,6 @@ async def test_response_framing_truncated_frame_causes_execution_outcome_unknown
         await server.stop()
 
 
-
 @pytest.mark.asyncio
 async def test_legacy_request_to_server_preserves_execution_outcome_unknown_on_oversized_response(
     ephemeral_server_config: TransportConfig,
@@ -1518,6 +1535,7 @@ async def test_legacy_request_to_server_preserves_execution_outcome_unknown_on_o
 ):
     """Verify request_to_server propagates ExecutionOutcomeUnknown on oversized response."""
     import struct
+
     registry = CommandRegistry()
     registry.register("move", lambda args: "moved", validate_move_arguments)
     server = RobotServer(ephemeral_server_config, registry)
@@ -1613,6 +1631,7 @@ async def test_pre_transmission_oversized_outgoing_request_is_ordinary_failure(
 def test_transport_config_is_immutable():
     """Verify TransportConfig instances are frozen and cannot be mutated."""
     import dataclasses
+
     cfg = TransportConfig(secret="test_secret")
 
     with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
@@ -1692,5 +1711,3 @@ def test_client_and_server_constructors_validate_overrides_without_mutating_call
     assert client.config.port == 1111
     assert server.config.port == 2222
     assert base_cfg.port == 8888
-
-

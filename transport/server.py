@@ -42,9 +42,7 @@ class RobotServer:
         port: int | None = None,
         secret: str | bytes | None = None,
     ) -> None:
-        base_config = (
-            TransportConfig.from_settings(role="server") if config is None else config
-        )
+        base_config = TransportConfig.from_settings(role="server") if config is None else config
         # Overrides produce a re-validated copy; the caller's config is never mutated.
         self.config = base_config.with_overrides(host=host, port=port, secret=secret)
 
@@ -240,9 +238,7 @@ class RobotServer:
 
         # 2. Validate protocol version
         if request.protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
-            logger.warning(
-                "Unsupported protocol version '%s' requested", request.protocol_version
-            )
+            logger.warning("Unsupported protocol version '%s' requested", request.protocol_version)
             return RobotResponse.fail(
                 request_id=req_id,
                 code=TransportErrorCode.UNSUPPORTED_PROTOCOL,
@@ -320,7 +316,9 @@ class RobotServer:
                 message=f"Command '{request.command}' timed out after {cmd_timeout:.2f}s",
             )
         except ExecutionOutcomeUnknown as exc:
-            logger.warning("Execution outcome unknown executing command '%s': %s", request.command, exc)
+            logger.warning(
+                "Execution outcome unknown executing command '%s': %s", request.command, exc
+            )
             return RobotResponse.fail(
                 request_id=req_id,
                 code=TransportErrorCode.EXECUTION_OUTCOME_UNKNOWN,
@@ -346,9 +344,7 @@ class RobotServer:
                 message="Internal server error during command execution",
             )
 
-    async def _send_response(
-        self, writer: asyncio.StreamWriter, response: RobotResponse
-    ) -> None:
+    async def _send_response(self, writer: asyncio.StreamWriter, response: RobotResponse) -> None:
         if self.config.secret:
             sign_response(self.config.secret, response)
         raw_json = response.to_json().encode("utf-8")

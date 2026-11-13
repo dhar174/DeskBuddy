@@ -74,7 +74,15 @@ async def test_arbitrary_function_names_cannot_be_invoked(ephemeral_server_confi
         )
         async with RobotClient(client_cfg) as client:
             # Try to invoke arbitrary functions
-            for target in ["shutdown_robot", "os.system", "eval", "exec", "__import__", "listen", "record"]:
+            for target in [
+                "shutdown_robot",
+                "os.system",
+                "eval",
+                "exec",
+                "__import__",
+                "listen",
+                "record",
+            ]:
                 resp = await client.request(target, {})
                 assert resp.ok is False
                 assert resp.error["code"] == TransportErrorCode.UNSUPPORTED_COMMAND
@@ -84,7 +92,9 @@ async def test_arbitrary_function_names_cannot_be_invoked(ephemeral_server_confi
 
 
 @pytest.mark.asyncio
-async def test_dunder_attributes_cannot_be_reached_via_dispatch(ephemeral_server_config: TransportConfig):
+async def test_dunder_attributes_cannot_be_reached_via_dispatch(
+    ephemeral_server_config: TransportConfig,
+):
     registry = CommandRegistry()
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
@@ -99,7 +109,14 @@ async def test_dunder_attributes_cannot_be_reached_via_dispatch(ephemeral_server
             request_timeout=2.0,
         )
         async with RobotClient(client_cfg) as client:
-            for dunder in ["__class__", "__dict__", "__init__", "__globals__", "__subclasses__", "mro"]:
+            for dunder in [
+                "__class__",
+                "__dict__",
+                "__init__",
+                "__globals__",
+                "__subclasses__",
+                "mro",
+            ]:
                 resp = await client.request(dunder, {})
                 assert resp.ok is False
                 assert resp.error["code"] == TransportErrorCode.UNSUPPORTED_COMMAND
@@ -226,6 +243,7 @@ async def test_code_injection_strings_never_evaluated(ephemeral_server_config: T
         return {"handled": True}
 
     from transport.registry import validate_reply_arguments
+
     registry = CommandRegistry()
     registry.register("reply", reply_handler, validate_reply_arguments)
 

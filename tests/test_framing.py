@@ -159,7 +159,9 @@ async def test_frame_exact_boundary_exceeding_by_one_byte():
     with pytest.raises(PayloadTooLargeError) as exc_info:
         await read_frame(reader, max_payload_size=limit)
     assert exc_info.value.code == TransportErrorCode.PAYLOAD_TOO_LARGE
-    assert f"Frame size {limit + 1} bytes exceeds maximum allowed {limit} bytes" in str(exc_info.value)
+    assert f"Frame size {limit + 1} bytes exceeds maximum allowed {limit} bytes" in str(
+        exc_info.value
+    )
 
 
 @pytest.mark.asyncio
