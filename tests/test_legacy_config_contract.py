@@ -80,6 +80,8 @@ def test_question_bank_save_targets_user_data_not_cwd(
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     monkeypatch.chdir(checkout)
+    sentinel = checkout / "question_file.json"
+    sentinel.write_text("production data sentinel", encoding="utf-8")
     data_dir = tmp_path / "user-data"
     settings = _settings_at(data_dir, tmp_path / "user-cache")
     save = _extract_functions(
@@ -92,7 +94,7 @@ def test_question_bank_save_targets_user_data_not_cwd(
     asyncio.run(save(qdict))
 
     assert json.loads((data_dir / "question_file.json").read_text(encoding="utf-8")) == qdict
-    assert not (checkout / "question_file.json").exists()
+    assert sentinel.read_text(encoding="utf-8") == "production data sentinel"
 
 
 @pytest.mark.parametrize(

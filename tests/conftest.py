@@ -11,11 +11,14 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
+from tests.support.legacy_runtime import HEAVY_MODULES
 from transport.config import TransportConfig
 
 TEST_SECRET = "test-deskbuddy-secret-32-chars-long-abc!"
 OPTIONAL_MARKERS = ("hardware", "model_weights", "external_service")
 OPTIONAL_TESTS = Path(__file__).resolve().parent / "optional"
+# The robot adapter imports tkinter but does not open a GUI for loopback tests.
+BLOCKED_RUNTIME_IMPORTS = HEAVY_MODULES - {"tkinter"}
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -89,8 +92,21 @@ def pytest_configure(config: pytest.Config) -> None:
     env.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
     env.setenv("DESKBUDDY_MOCK_HARDWARE", "1")
     env.setenv("UV_OFFLINE", "1")
-    # The legacy adapter tries the real driver before falling back to MockPicoh.
-    env.setitem(sys.modules, "picoh", None)
+    # Block optional runtimes even on a workstation with extras installed.
+    # Legacy adapters can still take their ImportError fallback, and tests can
+    # explicitly substitute a fake module. Fail if a plugin loaded a runtime
+    # before this hook: hiding a module cannot undo its import side effects.
+    preloaded = {
+        module.partition(".")[0]
+        for module, loaded in sys.modules.copy().items()
+        if loaded is not None and module.partition(".")[0] in BLOCKED_RUNTIME_IMPORTS
+    }
+    if preloaded:
+        raise pytest.UsageError(
+            f"Gate 1 runtime imported before isolation: {', '.join(sorted(preloaded))}"
+        )
+    for module in BLOCKED_RUNTIME_IMPORTS:
+        env.setitem(sys.modules, module, None)
 
     active = True
 

@@ -424,3 +424,51 @@ def load_start_bot_dispatch(
         {"BotCortex": fake_cortex},
     )
     return ns["dispatch_reply"], rec, fake_cortex
+
+
+def load_start_bot_main(
+    cortex: dict[str, Any],
+    robot_client: Any,
+    *,
+    local_only: bool,
+) -> Callable[[], Any]:
+    """Load the legacy desktop loop without importing its GUI or runtime."""
+
+    async def skip_startup(*args: Any) -> None:
+        pass
+
+    async def yield_without_delay(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    class LocalOnlyOption:
+        def set(self, value: bool) -> None:
+            self.value = value
+
+        def get(self) -> bool:
+            return self.value
+
+    def widget(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(pack=lambda: None)
+
+    ns = extract_module_functions(
+        START_BOT_PATH,
+        {"main", "dispatch_reply"},
+        {
+            "tk": SimpleNamespace(Button=widget, Checkbutton=widget, BooleanVar=LocalOnlyOption),
+            "root": SimpleNamespace(mainloop=lambda: None),
+            "BotCortex": SimpleNamespace(**{**cortex, "load_all_models": skip_startup}),
+            "helpers": SimpleNamespace(load_models=skip_startup),
+            "rc": robot_client,
+            "asyncio": SimpleNamespace(sleep=yield_without_delay),
+            "local_only": local_only,
+            "button_text": "Medium",
+            "user_response": "",
+            "message": "",
+            "lastMessage": "",
+            "lastReply": "",
+            "priorMessage": "",
+            "priorReply": "",
+            "reply": "",
+        },
+    )
+    return ns["main"]
