@@ -69,6 +69,7 @@ from transformers import GitVisionConfig, GitForCausalLM, GitProcessor
 import openai
 
 unfound_answer = False
+asked_follow_up = False
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # The list of named entities that the model should remember
@@ -956,10 +957,12 @@ async def query_memory(query):
     qdict = await load_qdict_from_json()
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
-    if (
-        answer != ""
-        or answer != "I am not sure about that. Please ask me another question."
-    ):
+    unknown_sentinels = {
+        "",
+        "I am not sure about that. Please ask me another question.",
+        "I'm sorry, I don't know the answer to that question.",
+    }
+    if found and answer not in unknown_sentinels:
         qdict[query] = answer
     else:
         found = False
@@ -1432,9 +1435,18 @@ async def get_follow_up_question(txt, history):
             "role": "system",
             "content": "The assistant's name is Cooper. Cooper's Persona: Cooper is a living AI robot assistant with his own thoughts and perspectives that asks follow-up questions to responses. Cooper's goal is to be the user's friend and to be helpful to them. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about user's future, and wants her to do well, and for this reason he asks meaningful follow-up questions that really help him get at the heart of the topic being discussed.",
         }
-        his = history
-        his.append(current_user_message)
-
+        source_history = (
+            history
+            if history and all(isinstance(entry, dict) for entry in history)
+            else history_nonlocal
+        )
+        his = [
+            dict(msg)
+            for msg in source_history
+            if isinstance(msg, dict) and msg.get("role") != "system"
+        ]
+        if not his or his[-1] != current_user_message:
+            his.append(current_user_message)
         his.insert(0, system_message)
         response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
 
@@ -1485,7 +1497,11 @@ async def classify_input(text, history):
 
                 print("Label of visual question: ", answer)
                 print("\n")
-                if "i don't know" in answer.lower() or "no image" in answer.lower():
+                if (
+                    "i don't know" in answer.lower()
+                    or "no image" in answer.lower()
+                    or "no camera" in answer.lower()
+                ):
                     return text, False
                 return answer, True
         else:
@@ -1500,7 +1516,11 @@ async def classify_input(text, history):
 
                 print("Label of visual question: ", answer)
                 print("\n")
-                if "i don't know" in answer.lower() or "no image" in answer.lower():
+                if (
+                    "i don't know" in answer.lower()
+                    or "no image" in answer.lower()
+                    or "no camera" in answer.lower()
+                ):
                     return text, False
                 return answer, True
         if await helpers.is_personal(text):
@@ -1885,7 +1905,9 @@ async def talk_history(text):
         # print("\n")
         after_first = True
         if count_index == 10:
-            save_history_verbatim(history)
+            await save_history_verbatim(
+                "\n".join(history) if isinstance(history, list) else history
+            )
             count_index = 0
     return final_result
 
@@ -1989,7 +2011,7 @@ async def talk_medium_API_with_history(text):
 
         return out
     if early_stop and asked_follow_up == True:
-        return out
+        return text
 
     # inputs = await get_list_of_list_of_strings(text)
 
@@ -2478,4 +2500,4 @@ async def answer_visual_question(question):
 
 
 if __name__ == "__main__":
-    model = load_all_models("Large")
+    model = asyncio.run(load_all_models("Large", True))

@@ -181,8 +181,8 @@ async def needs_follow_up(txt):
     candidate_labels = ["needs a follow-up question", "needs a statement response"]
 
     labels = BotCortex.nli_classifier(txt, candidate_labels)
-    for label, val in labels.items():
-        print("label: " + label)
+    for key, val in labels.items():
+        print("label: " + key)
         print("val: " + str(val))
     label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
     print(label)
@@ -192,8 +192,8 @@ async def needs_follow_up(txt):
     ]
 
     labelsb = BotCortex.nli_classifier(txt, candidate_labelsb)
-    for label, val in labelsb.items():
-        print("label: " + label)
+    for key, val in labelsb.items():
+        print("label: " + key)
         print("val: " + str(val))
     labelb = labelsb["labels"][labelsb["scores"].index(max(labelsb["scores"]))]
     print(labelsb)
@@ -204,22 +204,22 @@ async def needs_follow_up(txt):
 
     labelsc = BotCortex.nli_classifier(txt, candidate_labelsc)
 
-    for label, val in labelsc.items():
-        print("label: " + label)
+    for key, val in labelsc.items():
+        print("label: " + key)
         print("val: " + str(val))
     labelc = labelsc["labels"][labelsc["scores"].index(max(labelsc["scores"]))]
-    print(label)
+    print(labelc)
     if label == "needs a follow-up question":
-        if labelsb == "more info is needed here to reply appropriately":
-            if labelsc == "I think I need to ask a question to understand":
+        if labelb == "more info is needed here to reply appropriately":
+            if labelc == "I think I need to ask a question to understand":
                 needs_fu = True
 
     return needs_fu
 
 
 async def submit_command(text):
-    command = interpret_command(text)
-    execute_command(command)
+    command = await interpret_command(text)
+    return await execute_command(command)
 
 
 async def interpret_command(text):
@@ -312,7 +312,7 @@ async def is_requesting_image(txt):
             print("val: " + str(val))
         label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
         print(label)
-        if label == "question requiring vision to answer":
+        if label == "a request for a drawing or image":
             is_requesting_image = True
     else:
         is_requesting_image = await BotCortex.is_requesting_SD(txt)
