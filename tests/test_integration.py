@@ -11,7 +11,9 @@ from transport import (
 
 
 @pytest.mark.asyncio
-async def test_integration_transcription_polling_and_speech_reply(ephemeral_server_config: TransportConfig):
+async def test_integration_transcription_polling_and_speech_reply(
+    ephemeral_server_config: TransportConfig,
+):
     # Set simulated transcription and reply messages in buddy1 module
     buddy1.lastTranscription = "Hello DeskBuddy, what is the weather?"
     buddy1.priorTranscription = ""
@@ -247,7 +249,9 @@ async def test_request_to_server_custom_timeout_and_wait_scaling(
         await rc.close_client()
 
         # Sending timeout=5.0 with reply must succeed and not trigger invalid_arguments
-        res = await rc.request_to_server(function_name="reply", message="Testing timeout param", timeout=5.0)
+        res = await rc.request_to_server(
+            function_name="reply", message="Testing timeout param", timeout=5.0
+        )
         assert res is None  # reply returns None on success
 
         # Wait command via request_to_server

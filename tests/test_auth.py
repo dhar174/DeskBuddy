@@ -219,7 +219,9 @@ def test_response_tampered_result_rejected(test_secret: str):
 
 def test_response_tampered_error_rejected(test_secret: str):
     req_id = "req-tamper-error"
-    resp = RobotResponse.fail(request_id=req_id, code=TransportErrorCode.INVALID_ARGUMENTS, message="bad input")
+    resp = RobotResponse.fail(
+        request_id=req_id, code=TransportErrorCode.INVALID_ARGUMENTS, message="bad input"
+    )
     sign_response(test_secret, resp)
 
     # Tamper with error message
@@ -287,4 +289,3 @@ def test_response_future_timestamp_rejected(test_secret: str):
     assert valid is False
     assert err_code == TransportErrorCode.EXPIRED_REQUEST
     assert "skew:" in err_msg
-

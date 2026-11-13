@@ -41,16 +41,17 @@ Your responsibility is quality assurance, automated test architecture, synthetic
      * `MockCamera`: yields test image frames for VQA validation without requiring live webcams.
 2. **Automated Test Suites (`tests/`)**:
    - Author production-grade `pytest` test suites covering:
-     * Intent classification accuracy across sample utterances (`tests/test_classifiers.py`).
+     * Intent-label handling and routing with deterministic classifier fakes. Real-model accuracy belongs to Gate 2.
      * History buffering, context window trimming, and persona formatting (`tests/test_dialogue_history.py`).
-     * TCP protocol serialization and timeout resilience (`tests/test_network_protocol.py`).
+     * Length-framed, HMAC-authenticated JSON and timeout behavior using loopback transport tests.
      * Knowledge base semantic search thresholds and atomic file writes (`tests/test_knowledge_base.py`).
      * Asynchronous event loop non-blocking behavior (`tests/test_async_concurrency.py`).
 3. **Regression & Acceptance Gates (Gate 1)**:
    - Execute verification sweeps before approving code changes:
      ```powershell
-     python -m pytest tests/ -v
+     uv run --no-sync pytest
      ```
+   - Use [the testing guide](../../../docs/testing.md) for locked setup and the complete Gate 1 checks.
    - Ensure zero flaky tests and assert that all error paths (disconnects, empty inputs, malformed JSON) fail safely with informative logging.
 
 ## Key Invariants

@@ -76,9 +76,9 @@ class HardwareExecutor:
     @property
     def has_unresolved_operation(self) -> bool:
         """Return True if a synchronous operation was timed out/cancelled while still running."""
-        return (
-            self._unresolved_operation is not None
-            and self._unresolved_operation.state in (OperationState.RUNNING, OperationState.QUEUED)
+        return self._unresolved_operation is not None and self._unresolved_operation.state in (
+            OperationState.RUNNING,
+            OperationState.QUEUED,
         )
 
     @property
@@ -194,7 +194,9 @@ class HardwareExecutor:
                         cancelled = future.cancel()
                         if cancelled:
                             op.state = OperationState.CANCELLED
-                            logger.debug("Successfully cancelled queued hardware operation before start")
+                            logger.debug(
+                                "Successfully cancelled queued hardware operation before start"
+                            )
                             raise
                         else:
                             # Worker thread already took work item; cannot stop execution

@@ -93,7 +93,9 @@ async def test_server_rejects_unsupported_command(ephemeral_server_config: Trans
 
 
 @pytest.mark.asyncio
-async def test_server_handler_exception_returns_internal_error(ephemeral_server_config: TransportConfig):
+async def test_server_handler_exception_returns_internal_error(
+    ephemeral_server_config: TransportConfig,
+):
     registry = CommandRegistry()
 
     def crash_handler(args):
@@ -137,7 +139,9 @@ async def test_client_connect_timeout_when_server_not_running():
 
 
 @pytest.mark.asyncio
-async def test_multiple_sequential_requests_on_single_connection(ephemeral_server_config: TransportConfig):
+async def test_multiple_sequential_requests_on_single_connection(
+    ephemeral_server_config: TransportConfig,
+):
     registry = CommandRegistry()
     count = 0
 
@@ -168,7 +172,9 @@ async def test_multiple_sequential_requests_on_single_connection(ephemeral_serve
 
 
 @pytest.mark.asyncio
-async def test_server_rejects_unsupported_protocol_version(ephemeral_server_config: TransportConfig):
+async def test_server_rejects_unsupported_protocol_version(
+    ephemeral_server_config: TransportConfig,
+):
     from transport.auth import sign_request
     from transport.framing import read_frame, write_frame
 
@@ -271,7 +277,9 @@ async def test_server_rejects_invalid_command_arguments(ephemeral_server_config:
 
 
 @pytest.mark.asyncio
-async def test_server_handles_truncated_socket_frame_without_crashing(ephemeral_server_config: TransportConfig):
+async def test_server_handles_truncated_socket_frame_without_crashing(
+    ephemeral_server_config: TransportConfig,
+):
     from transport.framing import HEADER_STRUCT
 
     registry = CommandRegistry()
@@ -410,7 +418,9 @@ async def test_client_overall_request_timeout(ephemeral_server_config: Transport
 
 
 @pytest.mark.asyncio
-async def test_client_correlation_rejects_null_or_mismatched_request_id(ephemeral_server_config: TransportConfig):
+async def test_client_correlation_rejects_null_or_mismatched_request_id(
+    ephemeral_server_config: TransportConfig,
+):
     from transport.framing import read_frame, write_frame
 
     async def bad_responder(reader, writer):
@@ -447,7 +457,9 @@ async def test_client_correlation_rejects_null_or_mismatched_request_id(ephemera
 @pytest.mark.asyncio
 async def test_check_for_response_raises_on_error(ephemeral_server_config: TransportConfig):
     registry = CommandRegistry()
-    registry.register("check_for_response", lambda args: 12345, validate_empty_arguments)  # Non-string result
+    registry.register(
+        "check_for_response", lambda args: 12345, validate_empty_arguments
+    )  # Non-string result
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
 
@@ -468,7 +480,9 @@ async def test_check_for_response_raises_on_error(ephemeral_server_config: Trans
 
 
 @pytest.mark.asyncio
-async def test_check_for_response_raises_on_server_failure(ephemeral_server_config: TransportConfig):
+async def test_check_for_response_raises_on_server_failure(
+    ephemeral_server_config: TransportConfig,
+):
     registry = CommandRegistry()
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
@@ -499,6 +513,7 @@ async def test_client_wait_convenience_method(ephemeral_server_config: Transport
         return "waited"
 
     from transport.registry import validate_wait_arguments
+
     registry = CommandRegistry()
     registry.register("wait", wait_handler, validate_wait_arguments)
     server = RobotServer(ephemeral_server_config, registry)
@@ -519,7 +534,9 @@ async def test_client_wait_convenience_method(ephemeral_server_config: Transport
 
 
 @pytest.mark.asyncio
-async def test_convenience_methods_support_timeout_parameter(ephemeral_server_config: TransportConfig):
+async def test_convenience_methods_support_timeout_parameter(
+    ephemeral_server_config: TransportConfig,
+):
     registry = CommandRegistry()
     from transport.registry import (
         validate_base_col_arguments,
@@ -527,6 +544,7 @@ async def test_convenience_methods_support_timeout_parameter(ephemeral_server_co
         validate_reply_arguments,
         validate_say_arguments,
     )
+
     registry.register("reply", lambda args: "spoken", validate_reply_arguments)
     registry.register("say", lambda args: "said", validate_say_arguments)
     registry.register("move", lambda args: "moved", validate_move_arguments)
@@ -720,7 +738,11 @@ async def test_client_rejects_tampered_response_error(ephemeral_server_config: T
             req_bytes = await read_frame(reader)
             req = RobotRequest.from_json(req_bytes)
             # Sign fail response
-            resp = RobotResponse.fail(request_id=req.request_id, code=TransportErrorCode.INVALID_ARGUMENTS, message="original")
+            resp = RobotResponse.fail(
+                request_id=req.request_id,
+                code=TransportErrorCode.INVALID_ARGUMENTS,
+                message="original",
+            )
             sign_response(ephemeral_server_config.secret, resp)
             # Attacker tampers with error message
             resp.error["message"] = "tampered"
@@ -750,7 +772,9 @@ async def test_client_rejects_tampered_response_error(ephemeral_server_config: T
 
 
 @pytest.mark.asyncio
-async def test_client_rejects_response_signed_with_wrong_secret(ephemeral_server_config: TransportConfig):
+async def test_client_rejects_response_signed_with_wrong_secret(
+    ephemeral_server_config: TransportConfig,
+):
     from transport.auth import sign_response
     from transport.framing import read_frame, write_frame
 
@@ -868,6 +892,7 @@ async def test_timeout_scaling_wait_extends_beyond_base_deadline(
         return f"waited_{sec}"
 
     from transport.registry import validate_wait_arguments
+
     registry.register("wait", mock_wait, validate_wait_arguments)
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
@@ -903,6 +928,7 @@ async def test_timeout_scaling_speech_reply_extends_beyond_base_deadline(
         return "spoken"
 
     from transport.registry import validate_reply_arguments
+
     registry.register("reply", mock_speech_reply, validate_reply_arguments)
     server = RobotServer(ephemeral_server_config, registry)
     await server.start()
@@ -967,8 +993,11 @@ async def test_concurrent_duplicate_requests_stress_replay_cache(
         responses = await asyncio.gather(*(send_worker() for _ in range(8)))
         successes = [r for r in responses if r.ok]
         replays = [
-            r for r in responses
-            if not r.ok and r.error and r.error.get("code") == TransportErrorCode.REPLAYED_REQUEST.value
+            r
+            for r in responses
+            if not r.ok
+            and r.error
+            and r.error.get("code") == TransportErrorCode.REPLAYED_REQUEST.value
         ]
 
         # Exactly 1 request must succeed; remaining 7 must be detected as replays
@@ -1015,6 +1044,3 @@ async def test_robot_script_start_server_startup_failures_propagate(
             await win_buddy2.start_server(conflict_cfg)
     finally:
         await occupying_server.stop()
-
-
-

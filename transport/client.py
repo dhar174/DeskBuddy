@@ -92,9 +92,7 @@ class RobotClient(RobotTransport):
         port: int | None = None,
         secret: str | bytes | None = None,
     ) -> None:
-        base_config = (
-            TransportConfig.from_settings(role="client") if config is None else config
-        )
+        base_config = TransportConfig.from_settings(role="client") if config is None else config
         # Overrides produce a re-validated copy; the caller's config is never mutated.
         self.config = base_config.with_overrides(host=host, port=port, secret=secret)
 
@@ -155,7 +153,9 @@ class RobotClient(RobotTransport):
                     await asyncio.sleep(backoff + jitter)
 
         raise TransportError(
-            TransportErrorCode.TIMEOUT if isinstance(last_exc, asyncio.TimeoutError) else TransportErrorCode.INTERNAL_ERROR,
+            TransportErrorCode.TIMEOUT
+            if isinstance(last_exc, asyncio.TimeoutError)
+            else TransportErrorCode.INTERNAL_ERROR,
             f"Failed to connect to {self.config.host}:{self.config.port} after {max_attempts} attempts: {last_exc}",
         ) from last_exc
 
@@ -206,9 +206,7 @@ class RobotClient(RobotTransport):
         server_cmd_timeout = compute_command_timeout(
             command, arguments, self.config.request_timeout
         )
-        read_cmd_timeout = compute_command_timeout(
-            command, arguments, self.config.read_timeout
-        )
+        read_cmd_timeout = compute_command_timeout(command, arguments, self.config.read_timeout)
         if timeout is not None:
             effective_timeout = timeout
             effective_read_timeout = timeout
@@ -394,7 +392,9 @@ class RobotClient(RobotTransport):
                             )
                             break
                         except (EOFError, ConnectionError, TruncatedFrameError) as exc:
-                            logger.debug("Connection dropped during attempt %d: %s", send_attempt, exc)
+                            logger.debug(
+                                "Connection dropped during attempt %d: %s", send_attempt, exc
+                            )
                             await self._disconnect()
                             if send_attempt == 1:
                                 raise TransportError(
@@ -452,7 +452,9 @@ class RobotClient(RobotTransport):
                         TransportErrorCode.UNSUPPORTED_PROTOCOL,
                         TransportErrorCode.MALFORMED_REQUEST,
                     ):
-                        underlying = ProtocolViolationError(err_code, err_msg or "Protocol violation")
+                        underlying = ProtocolViolationError(
+                            err_code, err_msg or "Protocol violation"
+                        )
                     else:
                         underlying = AuthenticationError(
                             err_code or TransportErrorCode.UNAUTHORIZED,
@@ -536,15 +538,18 @@ class RobotClient(RobotTransport):
             if lock_acquired:
                 self._lock.release()
 
-
     # Domain convenience methods
     async def check_for_response(self, *, timeout: float | None = None) -> str:
         """Poll the robot server for speech transcription."""
         response = await self.request("check_for_response", {}, timeout=timeout, side_effects=False)
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
-                response.error.get("message", "check_for_response failed") if response.error else "check_for_response failed",
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("message", "check_for_response failed")
+                if response.error
+                else "check_for_response failed",
             )
         if not isinstance(response.result, str):
             raise TransportError(
@@ -555,11 +560,17 @@ class RobotClient(RobotTransport):
 
     async def reply(self, message: str, *, timeout: float | None = None) -> Any:
         """Send a reply text message for Picoh to speak."""
-        response = await self.request("reply", {"message": message}, timeout=timeout, side_effects=True)
+        response = await self.request(
+            "reply", {"message": message}, timeout=timeout, side_effects=True
+        )
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
-                response.error.get("message", "Reply command failed") if response.error else "Reply failed",
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("message", "Reply command failed")
+                if response.error
+                else "Reply failed",
             )
         return response.result
 
@@ -573,11 +584,17 @@ class RobotClient(RobotTransport):
 
     async def base_col(self, r: int, g: int, b: int, *, timeout: float | None = None) -> None:
         """Set Picoh base LED color (r, g, b in [0, 10])."""
-        response = await self.request("base_col", {"r": r, "g": g, "b": b}, timeout=timeout, side_effects=True)
+        response = await self.request(
+            "base_col", {"r": r, "g": g, "b": b}, timeout=timeout, side_effects=True
+        )
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
-                response.error.get("message", "base_col failed") if response.error else "base_col failed",
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("message", "base_col failed")
+                if response.error
+                else "base_col failed",
             )
 
     async def say(self, text: str, *, timeout: float | None = None) -> None:
@@ -585,24 +602,36 @@ class RobotClient(RobotTransport):
         response = await self.request("say", {"text": text}, timeout=timeout, side_effects=True)
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
                 response.error.get("message", "say failed") if response.error else "say failed",
             )
 
-    async def move(self, motor: int | str, position: float, *, timeout: float | None = None) -> None:
+    async def move(
+        self, motor: int | str, position: float, *, timeout: float | None = None
+    ) -> None:
         """Direct servo move with safety range checking."""
-        response = await self.request("move", {"motor": motor, "position": position}, timeout=timeout, side_effects=True)
+        response = await self.request(
+            "move", {"motor": motor, "position": position}, timeout=timeout, side_effects=True
+        )
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
                 response.error.get("message", "move failed") if response.error else "move failed",
             )
 
     async def wait(self, seconds: float, *, timeout: float | None = None) -> None:
         """Pause Picoh execution with deadline aligned to requested duration."""
-        response = await self.request("wait", {"seconds": float(seconds)}, timeout=timeout, side_effects=True)
+        response = await self.request(
+            "wait", {"seconds": float(seconds)}, timeout=timeout, side_effects=True
+        )
         if not response.ok:
             raise TransportError(
-                response.error.get("code", TransportErrorCode.INTERNAL_ERROR) if response.error else TransportErrorCode.INTERNAL_ERROR,
+                response.error.get("code", TransportErrorCode.INTERNAL_ERROR)
+                if response.error
+                else TransportErrorCode.INTERNAL_ERROR,
                 response.error.get("message", "wait failed") if response.error else "wait failed",
             )
