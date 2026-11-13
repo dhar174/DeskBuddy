@@ -88,7 +88,9 @@ class FakeTokenMatrix:
     def __getitem__(self, item: Any) -> Any:
         if isinstance(item, tuple) and len(item) == 2:
             row_sel, col_sel = item
-            selected_rows = self._rows[row_sel] if isinstance(row_sel, slice) else [self._rows[row_sel]]
+            selected_rows = (
+                self._rows[row_sel] if isinstance(row_sel, slice) else [self._rows[row_sel]]
+            )
             sliced = [row[col_sel] for row in selected_rows]
             return FakeTokenMatrix(sliced)
         if isinstance(item, int):

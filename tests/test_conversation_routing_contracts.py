@@ -403,6 +403,40 @@ def test_talk_medium_api_clarification_returns_followup_without_unbound_out_or_a
     assert_no_new_heavy_imports(loaded_before)
 
 
+def test_talk_history_nonlocal_clarification_does_not_corrupt_local_history_on_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_before = install_heavy_import_guard(monkeypatch)
+    recorder = CallRecorder()
+    openai_sdk = FakeOpenAISDK(
+        recorder,
+        chat_reply="Which app crashed?",
+        completion_reply="False",
+    )
+    nli = FakeNLIClassifier(recorder, routes=_nli_routes(follow_up=True))
+    ns, _ = load_botcortex_runtime(
+        recorder=recorder,
+        local_only_mode=False,
+        nli_classifier=nli,
+        is_question=False,
+        openai_sdk=openai_sdk,
+    )
+
+    reply1 = asyncio.run(ns["talk_history"]("It crashed"))
+    assert reply1 == "Which app crashed?"
+    assert ns["asked_follow_up"] is True
+    assert all(isinstance(entry, str) for entry in ns["history"])
+    chat_calls = recorder.for_target("openai.ChatCompletion.create")
+    assert len(chat_calls) == 1
+    assert all(isinstance(msg, dict) for msg in chat_calls[0].kwargs["messages"])
+
+    nli.routes = _nli_routes(follow_up=False)
+    reply2 = asyncio.run(ns["talk_history"]("My browser crashed"))
+    assert reply2 == "LOCAL_MODEL_REPLY"
+    assert recorder.count("chat_model.generate") == 1
+    assert_no_new_heavy_imports(loaded_before)
+
+
 # ---------------------------------------------------------------------------
 # F. Local / cloud selection contracts (start_bot.dispatch_reply & load_all_models)
 # ---------------------------------------------------------------------------

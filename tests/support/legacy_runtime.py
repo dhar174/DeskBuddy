@@ -290,20 +290,22 @@ def load_botcortex_runtime(
         init_distributed=lambda backend: rec.record("deepspeed.init_distributed", backend)
     )
     fake_auto_tok = SimpleNamespace(
-        from_pretrained=lambda model_id, **_kw: rec.record("AutoTokenizer.from_pretrained", model_id)
-        or FakeTokenizer(rec, name=f"tok:{model_id}")
+        from_pretrained=lambda model_id, **_kw: (
+            rec.record("AutoTokenizer.from_pretrained", model_id)
+            or FakeTokenizer(rec, name=f"tok:{model_id}")
+        )
     )
     fake_seq2seq = SimpleNamespace(
-        from_pretrained=lambda model_id, **_kw: rec.record(
-            "AutoModelForSeq2SeqLM.from_pretrained", model_id
+        from_pretrained=lambda model_id, **_kw: (
+            rec.record("AutoModelForSeq2SeqLM.from_pretrained", model_id)
+            or FakeCausalLM(rec, name=f"seq2seq:{model_id}")
         )
-        or FakeCausalLM(rec, name=f"seq2seq:{model_id}")
     )
     fake_seq_cls = SimpleNamespace(
-        from_pretrained=lambda model_id, **_kw: rec.record(
-            "AutoModelForSequenceClassification.from_pretrained", model_id
+        from_pretrained=lambda model_id, **_kw: (
+            rec.record("AutoModelForSequenceClassification.from_pretrained", model_id)
+            or FakeQuestionClassifier(rec)
         )
-        or FakeQuestionClassifier(rec)
     )
     fake_spacy = SimpleNamespace(
         load=lambda model_id: rec.record("spacy.load", model_id) or FakeNLP(rec)
@@ -389,6 +391,7 @@ def load_botcortex_runtime(
     # Wire helper module reference to the extracted BotCortex namespace so
     # helpers calling BotCortex.<attr> see dynamic updates to local_only_mode, etc.
     helpers_ns["BotCortex"] = SimpleNamespace(**ns)
+
     # Keep live proxy onto ns dict for attributes mutated by load_all_models / classify_input
     class _LiveCortexProxy:
         def __getattr__(self, item: str) -> Any:

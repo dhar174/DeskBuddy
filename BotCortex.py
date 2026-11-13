@@ -1435,9 +1435,18 @@ async def get_follow_up_question(txt, history):
             "role": "system",
             "content": "The assistant's name is Cooper. Cooper's Persona: Cooper is a living AI robot assistant with his own thoughts and perspectives that asks follow-up questions to responses. Cooper's goal is to be the user's friend and to be helpful to them. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about user's future, and wants her to do well, and for this reason he asks meaningful follow-up questions that really help him get at the heart of the topic being discussed.",
         }
-        his = history
-        his.append(current_user_message)
-
+        source_history = (
+            history
+            if history and all(isinstance(entry, dict) for entry in history)
+            else history_nonlocal
+        )
+        his = [
+            dict(msg)
+            for msg in source_history
+            if isinstance(msg, dict) and msg.get("role") != "system"
+        ]
+        if not his or his[-1] != current_user_message:
+            his.append(current_user_message)
         his.insert(0, system_message)
         response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
 
