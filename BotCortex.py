@@ -69,6 +69,7 @@ from transformers import GitVisionConfig, GitForCausalLM, GitProcessor
 import openai
 
 unfound_answer = False
+asked_follow_up = False
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # The list of named entities that the model should remember
@@ -956,10 +957,12 @@ async def query_memory(query):
     qdict = await load_qdict_from_json()
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
-    if (
-        answer != ""
-        or answer != "I am not sure about that. Please ask me another question."
-    ):
+    unknown_sentinels = {
+        "",
+        "I am not sure about that. Please ask me another question.",
+        "I'm sorry, I don't know the answer to that question.",
+    }
+    if found and answer not in unknown_sentinels:
         qdict[query] = answer
     else:
         found = False
@@ -1485,7 +1488,11 @@ async def classify_input(text, history):
 
                 print("Label of visual question: ", answer)
                 print("\n")
-                if "i don't know" in answer.lower() or "no image" in answer.lower():
+                if (
+                    "i don't know" in answer.lower()
+                    or "no image" in answer.lower()
+                    or "no camera" in answer.lower()
+                ):
                     return text, False
                 return answer, True
         else:
@@ -1500,7 +1507,11 @@ async def classify_input(text, history):
 
                 print("Label of visual question: ", answer)
                 print("\n")
-                if "i don't know" in answer.lower() or "no image" in answer.lower():
+                if (
+                    "i don't know" in answer.lower()
+                    or "no image" in answer.lower()
+                    or "no camera" in answer.lower()
+                ):
                     return text, False
                 return answer, True
         if await helpers.is_personal(text):
@@ -1885,7 +1896,9 @@ async def talk_history(text):
         # print("\n")
         after_first = True
         if count_index == 10:
-            save_history_verbatim(history)
+            await save_history_verbatim(
+                "\n".join(history) if isinstance(history, list) else history
+            )
             count_index = 0
     return final_result
 
@@ -1989,7 +2002,7 @@ async def talk_medium_API_with_history(text):
 
         return out
     if early_stop and asked_follow_up == True:
-        return out
+        return text
 
     # inputs = await get_list_of_list_of_strings(text)
 
@@ -2478,4 +2491,4 @@ async def answer_visual_question(question):
 
 
 if __name__ == "__main__":
-    model = load_all_models("Large")
+    model = asyncio.run(load_all_models("Large", True))

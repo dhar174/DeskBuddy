@@ -110,6 +110,30 @@ def chose_large():
     return
 
 
+async def dispatch_reply(message, button_text, local_only, cortex=None):
+    cortex = cortex or BotCortex
+    if local_only:
+        print("local only")
+        if button_text == "Large":
+            return str(await cortex.talk_history(message))
+        elif button_text == "Small":
+            return str(await cortex.talk_small(message))
+        elif button_text == "Medium":
+            return str(await cortex.talk_medium_with_history(message))
+        else:
+            return str(await cortex.talk_fast(message))
+    else:
+        print("not local only")
+        if button_text == "Large":
+            return str(await cortex.talk_history(message))
+        elif button_text == "Small":
+            return str(await cortex.talk_small(message))
+        elif button_text == "Medium":
+            return str(await cortex.talk_medium_API_with_history(message))
+        else:
+            return str(await cortex.talk_fast(message))
+
+
 async def main():
     global user_response
     global message
@@ -168,26 +192,7 @@ async def main():
             lastMessage = message
 
             print("User: " + message)
-            if local_only:
-                print("local only")
-                if button_text == "Large":
-                    reply = str(await BotCortex.talk_history(message))
-                elif button_text == "Small":
-                    reply = str(await BotCortex.talk_small(message))
-                elif button_text == "Medium":
-                    reply = str(await BotCortex.talk_medium_with_history(message))
-                else:
-                    reply = str(await BotCortex.talk_fast(message))
-            else:
-                print("not local only")
-                if button_text == "Large":
-                    reply = str(await BotCortex.talk_history(message))
-                elif button_text == "Small":
-                    reply = str(await BotCortex.talk_small(message))
-                elif button_text == "Medium":
-                    reply = str(await BotCortex.talk_medium_API_with_history(message))
-                else:
-                    reply = str(await BotCortex.talk_fast(message))
+            reply = await dispatch_reply(message, button_text, local_only)
             reply = reply.replace(message, "")
             reply = reply.replace("\n", " ")
 
