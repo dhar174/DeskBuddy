@@ -93,7 +93,7 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-include = ["src/**/*.py", "tests/**/*.py", "transport/**/*.py"]
+include = ["src/**/*.py", "tests/**/*.py", "transport/**/*.py", "robot_client.py"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
@@ -102,7 +102,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 # Discover production packages, including PR #28's transport/ when it lands.
 # The repository root stays a non-package; flat legacy scripts migrate separately.
 files = ["."]
-exclude = ['^tests/', '^windows/', '^dist/', '^build/', '^[^/]+\.py$']
+exclude = ['^tests/', '^windows/', '^dist/', '^build/', '^(?!robot_client\.py$)[^/]+\.py$']
 python_version = "3.11"
 check_untyped_defs = true
 disallow_untyped_defs = true

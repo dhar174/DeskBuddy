@@ -41,9 +41,13 @@ HEAVY_MODULES = frozenset(
         "torchaudio",
         "torchvision",
         "transformers",
+        "sentence_transformers",
         "deepspeed",
         "accelerate",
         "spacy",
+        "PIL",
+        "aiohttp",
+        "psutil",
         "cv2",
         "whisper",
         "openai",
@@ -209,7 +213,6 @@ def load_botcortex_runtime(
 
     fake_openai = openai_sdk or FakeOpenAISDK(rec)
     emb_runtime = FakeEmbeddingRuntime(rec, scores=embedding_scores)
-    qgen_tok = FakeTokenizer(rec, name="qgen_tokenizer", decoded_prefix=qgen_output)
     qgen_mod = FakeCausalLM(rec, name="qgen_model")
 
     class _FakeQGenTokenizer(FakeTokenizer):
@@ -230,7 +233,7 @@ def load_botcortex_runtime(
             return "PROMPT_INPUT"
 
     chat_tok = _FakeChatTokenizer(rec, name="chat_tokenizer")
-    chat_mod = FakeCausalLM(rec, name="chat_model")
+    chat_mod = FakeCausalLM(rec, name="chat_model", output_tokens=[[10, 11, 12, 13, 99, 100]])
     sum_tok = FakeTokenizer(rec, name="sumtokenizer", decoded_prefix="SUMMARY")
     sum_mod = FakeCausalLM(rec, name="longsummarizer")
     topic_tok = FakeTokenizer(rec, name="topic_tokenizer", decoded_prefix="TOPIC")
@@ -388,11 +391,8 @@ def load_botcortex_runtime(
         "_fake_helpers": fake_helpers,
     }
     ns = extract_module_functions(BOT_CORTEX_PATH, cortex_names, globals_)
-    # Wire helper module reference to the extracted BotCortex namespace so
-    # helpers calling BotCortex.<attr> see dynamic updates to local_only_mode, etc.
-    helpers_ns["BotCortex"] = SimpleNamespace(**ns)
 
-    # Keep live proxy onto ns dict for attributes mutated by load_all_models / classify_input
+    # Keep a live proxy so helper calls observe routing state mutations.
     class _LiveCortexProxy:
         def __getattr__(self, item: str) -> Any:
             return ns[item]
@@ -431,6 +431,7 @@ def load_start_bot_main(
     robot_client: Any,
     *,
     local_only: bool,
+    button_text: str = "Medium",
 ) -> Callable[[], Any]:
     """Load the legacy desktop loop without importing its GUI or runtime."""
 
@@ -461,7 +462,7 @@ def load_start_bot_main(
             "rc": robot_client,
             "asyncio": SimpleNamespace(sleep=yield_without_delay),
             "local_only": local_only,
-            "button_text": "Medium",
+            "button_text": button_text,
             "user_response": "",
             "message": "",
             "lastMessage": "",

@@ -52,4 +52,4 @@ jobs:
       - name: Mypy
         run: uv run --no-sync mypy
       - name: Ruff format
-        run: uv run --no-sync ruff format --check src transport tests
+        run: uv run --no-sync ruff format --check src transport tests robot_client.py

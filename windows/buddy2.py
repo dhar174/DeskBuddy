@@ -239,7 +239,7 @@ class MyFunctions:
         global lastReplyMessage
         global priorReplyMessage
         print("Replying: " + text)
-        if text != lastReplyMessage and text != "" and text is not None:
+        if text is not None and text.strip():
             print(text)
             priorReplyMessage = lastReplyMessage
             lastReplyMessage = text

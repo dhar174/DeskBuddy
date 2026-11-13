@@ -115,23 +115,23 @@ async def dispatch_reply(message, button_text, local_only, cortex=None):
     if local_only:
         print("local only")
         if button_text == "Large":
-            return str(await cortex.talk_history(message))
+            return await cortex.talk_history(message)
         elif button_text == "Small":
-            return str(await cortex.talk_small(message))
+            return await cortex.talk_small(message)
         elif button_text == "Medium":
-            return str(await cortex.talk_medium_with_history(message))
+            return await cortex.talk_medium_with_history(message)
         else:
-            return str(await cortex.talk_fast(message))
+            return await cortex.talk_fast(message)
     else:
         print("not local only")
         if button_text == "Large":
-            return str(await cortex.talk_history(message))
+            return await cortex.talk_history(message)
         elif button_text == "Small":
-            return str(await cortex.talk_small(message))
+            return await cortex.talk_small(message)
         elif button_text == "Medium":
-            return str(await cortex.talk_medium_API_with_history(message))
+            return await cortex.talk_medium_API_with_history(message)
         else:
-            return str(await cortex.talk_fast(message))
+            return await cortex.talk_fast(message)
 
 
 async def main():
@@ -192,29 +192,32 @@ async def main():
             lastMessage = message
 
             print("User: " + message)
-            reply = await dispatch_reply(message, button_text, local_only)
-            reply = reply.replace(message, "")
-            reply = reply.replace("\n", " ")
-
-            print("Cooper: " + reply)
-            kwargs = {"function_name": "reply", "message": reply}
-            while True:
-                if message != "":
+            try:
+                reply = await dispatch_reply(message, button_text, local_only)
+            except Exception as exc:
+                print(f"Could not generate a reply ({type(exc).__name__}); continuing to poll.")
+            else:
+                if not isinstance(reply, str):
+                    print("Could not generate a text reply; continuing to poll.")
+                    continue
+                reply = reply.replace("\n", " ").strip()
+                if reply:
+                    print("Cooper: " + reply)
                     try:
-                        print("Sending kwargs:", kwargs)
-                        results = await rc.request_to_server(**kwargs)
-                        break
+                        await rc.send_reply(reply)
                     except rc.ExecutionOutcomeUnknown as exc:
                         print(
                             f"Ambiguous execution outcome for command '{exc.command}' "
                             f"(request_id={exc.request_id}): {exc}. "
                             "Will not automatically retry physical speech action."
                         )
-                        break
-                    except Exception:
-                        print("Error sending message to server. Trying again...")
-                        await asyncio.sleep(0.1)
-                        continue
+                    except rc.TransportError as exc:
+                        print(f"Could not confirm speech delivery ({exc.code}); continuing to poll.")
+                    except Exception as exc:
+                        print(
+                            f"Could not confirm speech delivery ({type(exc).__name__}); "
+                            "continuing to poll."
+                        )
         await asyncio.sleep(0.1)
 
 

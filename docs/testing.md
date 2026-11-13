@@ -11,7 +11,7 @@ uv lock --check --offline
 uv run --no-sync pytest
 uv run --no-sync ruff check .
 uv run --no-sync mypy
-uv run --no-sync ruff format --check src transport tests
+uv run --no-sync ruff format --check src transport tests robot_client.py
 ```
 
 To test the other interpreter, set `UV_PYTHON` to `3.11` or `3.12` for the
@@ -25,11 +25,11 @@ Ubuntu CPU runners. The install can fetch locked core and dev packages. Pytest
 runs offline with no repository secrets, GPU libraries, pretrained model weights,
 physical devices, or live services.
 
-Ruff lint and formatting cover Python files in `src/`, `transport/`, and `tests/`.
-Mypy discovers production packages from the repository root, currently `src/` and
-`transport/`. Its configuration excludes tests, build outputs, Windows vendor
-copies, and flat legacy scripts. Tests may still exercise the legacy entry points
-with fakes. Those tests provide behavioral evidence within their asserted scope.
+Ruff lint and formatting cover Python files in `src/`, `transport/`, `tests/`,
+and the desktop transport adapter `robot_client.py`. Mypy checks `src/`,
+`transport/`, and that adapter. Its configuration excludes tests, build outputs,
+Windows vendor copies, and other flat legacy scripts. Tests exercise legacy entry
+points with fakes and provide behavioral evidence within their asserted scope.
 
 ## Offline contract tests
 
@@ -86,11 +86,28 @@ $env:DESKBUDDY_TEST_ROBOT_AUTH_SECRET = '<local test service secret>'
 uv run --no-sync pytest --run-optional=external_service
 ```
 
+When `--run-optional` is supplied, pytest collects only from
+`tests/optional/`; the session rejects explicit paths outside that tree before
+collection, including mixed optional and ordinary test paths. Explicitly naming
+an optional test without `--run-optional` is also rejected; default root
+discovery still skips the optional directory. For the external service category,
+the temporary profile,
+credential scrubbing, runtime import block, offline flags, and loopback socket
+guard remain active. Only the three explicit `DESKBUDDY_TEST_ROBOT_*` variables
+are preserved for the external service category. The smoke test accepts
+`localhost` by mapping it directly to `127.0.0.1`, or accepts a loopback IP
+literal; it does not resolve arbitrary hostnames. A whitespace-only secret fails
+configuration validation, while a nonblank secret is passed unchanged.
+
+The `hardware` and `model_weights` categories preserve the operator's original
+environment and optional runtime imports so those tests can use provisioned
+devices, weights, settings, and credentials. Model weight tests still receive
+Hugging Face offline flags.
+
 The hardware and model-weight categories remain templates for future tests.
 Their tests must check prerequisites and skip before initializing a device,
 model, or service client. Model runs retain Hugging Face offline controls and
-must use already provisioned assets. Live service and hardware runs use the
-operator's explicitly configured environment.
+must use already provisioned assets.
 
 Qualify real classifier accuracy and GPU memory, event-loop and lookup latency
 under Gate 2. Qualify physical movement, real speech latency, dialogue safety,

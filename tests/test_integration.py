@@ -113,13 +113,23 @@ async def test_integration_legacy_request_to_server_compatibility(
 
 
 @pytest.mark.asyncio
-async def test_windows_buddy1_server_integration(ephemeral_server_config: TransportConfig):
+async def test_windows_buddy1_server_integration(
+    ephemeral_server_config: TransportConfig, monkeypatch: pytest.MonkeyPatch
+):
     from transport.client import RobotClient
     from transport.protocol import TransportError, TransportErrorCode
     from windows import buddy1 as win_buddy1
 
     win_buddy1.lastTranscription = "Transcription from Windows buddy1"
     win_buddy1.priorTranscription = ""
+    spoken = []
+
+    async def fake_say(text):
+        spoken.append(text)
+
+    monkeypatch.setattr(win_buddy1.MyFunctions, "picoh_say", fake_say)
+    monkeypatch.setattr(win_buddy1, "lastReplyMessage", "")
+    monkeypatch.setattr(win_buddy1, "priorReplyMessage", "")
 
     server = win_buddy1.create_robot_server(ephemeral_server_config)
     await server.start()
@@ -141,6 +151,8 @@ async def test_windows_buddy1_server_integration(ephemeral_server_config: Transp
 
             # 3. Speech reply
             await client.reply("Hello from Windows buddy1 test")
+            await client.reply("Hello from Windows buddy1 test")
+            assert spoken == ["Hello from Windows buddy1 test"] * 2
 
             # 4. LED color
             await client.base_col(1, 2, 3)
@@ -173,13 +185,23 @@ async def test_windows_buddy1_server_integration(ephemeral_server_config: Transp
 
 
 @pytest.mark.asyncio
-async def test_windows_buddy2_server_integration(ephemeral_server_config: TransportConfig):
+async def test_windows_buddy2_server_integration(
+    ephemeral_server_config: TransportConfig, monkeypatch: pytest.MonkeyPatch
+):
     from transport.client import RobotClient
     from transport.protocol import TransportError, TransportErrorCode
     from windows import buddy2 as win_buddy2
 
     win_buddy2.lastTranscription = "Transcription from Windows buddy2"
     win_buddy2.priorTranscription = ""
+    spoken = []
+
+    async def fake_say(text):
+        spoken.append(text)
+
+    monkeypatch.setattr(win_buddy2.MyFunctions, "picoh_say", fake_say)
+    monkeypatch.setattr(win_buddy2, "lastReplyMessage", "")
+    monkeypatch.setattr(win_buddy2, "priorReplyMessage", "")
 
     server = win_buddy2.create_robot_server(ephemeral_server_config)
     await server.start()
@@ -201,6 +223,8 @@ async def test_windows_buddy2_server_integration(ephemeral_server_config: Transp
 
             # 3. Speech reply
             await client.reply("Hello from Windows buddy2 test")
+            await client.reply("Hello from Windows buddy2 test")
+            assert spoken == ["Hello from Windows buddy2 test"] * 2
 
             # 4. LED color
             await client.base_col(4, 5, 6)
