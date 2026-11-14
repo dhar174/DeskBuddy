@@ -13,24 +13,10 @@ import pytest
 
 from deskbuddy import question_bank
 from deskbuddy.settings import Settings, SettingsError
+from tests.support.legacy_runtime import extract_module_functions
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BOT_CORTEX_PATH = REPOSITORY_ROOT / "BotCortex.py"
-
-
-def _extract_functions(path: Path, names: set[str], globals_: dict[str, Any]) -> dict[str, Any]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    functions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
-    }
-    assert functions.keys() == names, f"Missing expected functions: {names - functions.keys()}"
-    module = ast.Module(body=list(functions.values()), type_ignores=[])
-    ast.fix_missing_locations(module)
-    namespace = {"__builtins__": __builtins__, **globals_}
-    exec(compile(module, str(path), "exec"), namespace)
-    return {name: namespace[name] for name in names}
 
 
 def _settings_at(data_dir: Path, cache_dir: Path, offload_dir: Path | None = None) -> Settings:
@@ -42,7 +28,7 @@ def _question_bank_adapters(
     *,
     settings_loader: Any | None = None,
 ) -> dict[str, Any]:
-    return _extract_functions(
+    return extract_module_functions(
         BOT_CORTEX_PATH,
         {
             "load_qdict_from_json",
@@ -164,40 +150,105 @@ def test_question_bank_disk_adapters_yield_to_event_loop(
     asyncio.run(exercise())
 
 
-def test_question_bank_settings_error_still_propagates(tmp_path: Path) -> None:
+@pytest.mark.parametrize("adapter", ["load", "save"])
+def test_question_bank_settings_error_still_propagates(adapter: str, tmp_path: Path) -> None:
     settings = _settings_at(tmp_path / "data", tmp_path / "cache")
 
     def broken_settings_loader() -> Settings:
         raise SettingsError("invalid local settings")
 
-    load = _question_bank_adapters(settings, settings_loader=broken_settings_loader)[
-        "load_qdict_from_json"
+    function_name = "load_qdict_from_json" if adapter == "load" else "save_qdict_to_json"
+    operation = _question_bank_adapters(settings, settings_loader=broken_settings_loader)[
+        function_name
     ]
     with pytest.raises(SettingsError, match="invalid local settings"):
-        asyncio.run(load())
+        if adapter == "load":
+            asyncio.run(operation())
+        else:
+            asyncio.run(operation({"hello": "there"}))
 
 
-def test_question_bank_warning_latch_resets_after_successful_read(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_question_bank_warning_latch_recovers_after_successful_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = _settings_at(tmp_path / "data", tmp_path / "cache")
+    settings.data_dir.mkdir(parents=True)
     adapters = _question_bank_adapters(settings)
-    warn = adapters["_warn_question_bank_unavailable"]
+    load = adapters["load_qdict_from_json"]
     bank = settings.data_path("question_file.json")
+    private_detail = "private question-bank details"
+
+    def unavailable(_path: Path) -> dict[str, str]:
+        raise PermissionError(13, private_detail)
+
+    monkeypatch.setattr(question_bank, "load_question_bank", unavailable)
+    main_thread = threading.get_ident()
 
     with caplog.at_level(logging.WARNING, logger="BotCortex"):
-        warn(bank, "malformed-file")
-        warn(bank, "malformed-file")
-        warn(bank, "PermissionError")
-        assert asyncio.run(adapters["load_qdict_from_json"]()) == {}
-        warn(bank, "PermissionError")
+        assert asyncio.run(load(allow_unavailable=True)) is None
+        assert asyncio.run(load(allow_unavailable=True)) is None
+
+        monkeypatch.setattr(
+            question_bank,
+            "load_question_bank",
+            lambda _path: {"restored": "answer"},
+        )
+        assert asyncio.run(load(allow_unavailable=True)) == {"restored": "answer"}
+
+        monkeypatch.setattr(question_bank, "load_question_bank", unavailable)
+        assert asyncio.run(load(allow_unavailable=True)) is None
 
     warnings = [record for record in caplog.records if record.name == "BotCortex"]
-    assert [record.getMessage().split("(")[-1].split(")")[0] for record in warnings] == [
-        "malformed-file",
-        "PermissionError",
-        "PermissionError",
-    ]
+    assert len(warnings) == 2
+    assert all(record.levelname == "WARNING" for record in warnings)
+    assert all(record.thread != main_thread for record in warnings)
+    assert all(str(bank) in record.getMessage() for record in warnings)
+    assert all("PermissionError" in record.getMessage() for record in warnings)
+    assert private_detail not in caplog.text
+
+
+def test_successful_save_clears_question_bank_warning_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _settings_at(tmp_path / "data", tmp_path / "cache")
+    settings.data_dir.mkdir(parents=True)
+    adapters = _question_bank_adapters(settings)
+    load = adapters["load_qdict_from_json"]
+    save = adapters["save_qdict_to_json"]
+    bank = settings.data_path("question_file.json")
+
+    def unavailable(_path: Path) -> dict[str, str]:
+        raise PermissionError(13, "private diagnostic")
+
+    with caplog.at_level(logging.WARNING, logger="BotCortex"):
+        with monkeypatch.context() as scoped:
+            scoped.setattr(question_bank, "load_question_bank", unavailable)
+            assert asyncio.run(load(allow_unavailable=True)) is None
+
+        assert (
+            str(bank)
+            in adapters["_warn_question_bank_unavailable"].__globals__[
+                "_question_bank_warning_reasons"
+            ]
+        )
+        asyncio.run(save({"saved": "answer"}))
+        assert (
+            str(bank)
+            not in adapters["_warn_question_bank_unavailable"].__globals__[
+                "_question_bank_warning_reasons"
+            ]
+        )
+        with monkeypatch.context() as scoped:
+            scoped.setattr(question_bank, "load_question_bank", unavailable)
+            assert asyncio.run(load(allow_unavailable=True)) is None
+
+    warnings = [record for record in caplog.records if record.name == "BotCortex"]
+    assert len(warnings) == 2
+    assert all(str(bank) in record.getMessage() for record in warnings)
 
 
 @pytest.mark.parametrize("failure", ["malformed", "replace"])
@@ -215,25 +266,58 @@ def test_question_bank_save_adapter_preserves_existing_file_on_error(
     save = _question_bank_adapters(settings)["save_qdict_to_json"]
 
     if failure == "replace":
-        real_os = question_bank.os
 
         def failed_replace(*_args: Any) -> None:
             raise OSError("replacement failed")
 
-        monkeypatch.setattr(
-            question_bank,
-            "os",
-            SimpleNamespace(fsync=real_os.fsync, replace=failed_replace),
-        )
         expected_error = OSError
     else:
         expected_error = question_bank.QuestionBankDataError
 
-    with pytest.raises(expected_error):
-        asyncio.run(save({"new question": "new answer"}))
+    with monkeypatch.context() as scoped:
+        if failure == "replace":
+            scoped.setattr(question_bank.os, "replace", failed_replace)
+        with pytest.raises(expected_error):
+            asyncio.run(save({"new question": "new answer"}))
 
     assert bank.read_bytes() == original
     assert list(data_dir.glob(".question_file.json.*.tmp")) == []
+
+
+def test_question_bank_save_snapshots_mapping_before_offloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_at(tmp_path / "data", tmp_path / "cache")
+    adapters = _question_bank_adapters(settings)
+    save = adapters["save_qdict_to_json"]
+    submitted = threading.Event()
+    release = asyncio.Event()
+    saved_entries: list[dict[str, str]] = []
+
+    def record_save(_path: Path, entries: dict[str, str]) -> None:
+        saved_entries.append(dict(entries))
+
+    monkeypatch.setattr(question_bank, "save_question_bank", record_save)
+    original = {"question": "before save starts"}
+    real_asyncio = asyncio
+
+    async def gated_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        submitted.set()
+        await release.wait()
+        return await real_asyncio.to_thread(function, *args, **kwargs)
+
+    save.__globals__["asyncio"] = SimpleNamespace(to_thread=gated_to_thread)
+
+    async def exercise() -> None:
+        save_task = asyncio.create_task(save(original))
+        assert await asyncio.wait_for(asyncio.to_thread(submitted.wait, 2), timeout=2)
+        original["question"] = "mutated after scheduling"
+        release.set()
+        await asyncio.wait_for(save_task, timeout=2)
+
+    asyncio.run(exercise())
+
+    assert saved_entries == [{"question": "before save starts"}]
 
 
 @pytest.mark.parametrize(
@@ -259,7 +343,7 @@ def test_history_persistence_uses_user_data_not_cwd(
     data_dir.mkdir()
     (data_dir / filename).write_text(initial, encoding="utf-8")
     settings = _settings_at(data_dir, tmp_path / "user-cache")
-    save = _extract_functions(
+    save = extract_module_functions(
         BOT_CORTEX_PATH,
         {function_name},
         {"load_settings": lambda: settings},
@@ -277,7 +361,7 @@ def test_missing_camera_returns_message_without_touching_vision_dependencies() -
             pytest.fail(f"camera/vision runtime accessed without a source: {name}")
 
     forbidden = ForbiddenRuntime()
-    answer = _extract_functions(
+    answer = extract_module_functions(
         BOT_CORTEX_PATH,
         {"answer_visual_question"},
         {
@@ -339,7 +423,7 @@ def _memory_test_function(
         def virtual_memory() -> SimpleNamespace:
             return SimpleNamespace(available=available)
 
-    functions = _extract_functions(
+    functions = extract_module_functions(
         BOT_CORTEX_PATH,
         {"_max_memory_with_settings", "_memory_limit_bytes"},
         {
@@ -463,7 +547,7 @@ def test_explicit_cpu_budget_does_not_touch_cuda_or_accelerate(tmp_path: Path) -
         def virtual_memory() -> SimpleNamespace:
             return SimpleNamespace(available=40 * 1024**3)
 
-    budget = _extract_functions(
+    budget = extract_module_functions(
         BOT_CORTEX_PATH,
         {"_max_memory_with_settings", "_memory_limit_bytes"},
         {

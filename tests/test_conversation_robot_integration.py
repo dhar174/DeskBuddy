@@ -7,6 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from io import StringIO
 from logging.handlers import RotatingFileHandler
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +18,7 @@ import pytest_asyncio
 import buddy1
 import robot_client
 from deskbuddy import question_bank
-from deskbuddy.settings import Settings
+from deskbuddy.settings import Settings, SettingsError
 from tests.support.fakes import CallRecorder, FakeNLIClassifier, FakeOpenAISDK, nli_routes
 from tests.support.legacy_runtime import (
     START_BOT_PATH,
@@ -524,41 +525,103 @@ async def test_question_bank_oserror_falls_through_without_logging_error_details
     assert private_detail not in caplog.text
 
 
-def test_botcortex_logging_uses_rotating_file_without_stderr(tmp_path):
-    logger = logging.getLogger("BotCortex")
-    original_handlers = list(logger.handlers)
-    original_level = logger.level
-    original_propagate = logger.propagate
-    for handler in original_handlers:
-        logger.removeHandler(handler)
-
+@pytest.mark.parametrize(
+    "mode", ["stderr", "file", "unwritable", "invalid-settings", "closed-before-idle", "closed"]
+)
+def test_botcortex_logging_configuration(tmp_path, mode):
+    logger = logging.Logger("BotCortex")
     settings = Settings(data_dir=tmp_path / "data", cache_dir=tmp_path / "cache")
+    stderr = StringIO() if mode == "stderr" else None
+    dialogs = []
+    idle_callbacks = []
+
+    class TclError(Exception):
+        pass
+
+    def get_settings():
+        if mode == "invalid-settings":
+            raise SettingsError("invalid settings")
+        return settings
+
+    def after_idle(callback):
+        if mode == "closed":
+            raise TclError("window closed")
+        idle_callbacks.append(callback)
+
+    def showwarning(*args, parent):
+        assert parent is root
+        if mode == "closed-before-idle":
+            raise TclError("window closed")
+        dialogs.append(args)
+
+    root = SimpleNamespace(after_idle=after_idle)
+    if mode in {"unwritable", "closed-before-idle", "closed"}:
+        settings.cache_dir.write_text("not a directory", encoding="utf-8")
+
     configure = extract_module_functions(
         START_BOT_PATH,
         {"configure_botcortex_logging"},
         {
-            "logging": logging,
-            "sys": SimpleNamespace(stderr=None),
-            "load_settings": lambda: settings,
+            "logging": SimpleNamespace(
+                getLogger=lambda _name: logger,
+                WARNING=logging.WARNING,
+                Formatter=logging.Formatter,
+                StreamHandler=logging.StreamHandler,
+                NullHandler=logging.NullHandler,
+            ),
+            "sys": SimpleNamespace(stderr=stderr),
+            "load_settings": get_settings,
             "RotatingFileHandler": RotatingFileHandler,
+            "SettingsError": SettingsError,
+            "tk": SimpleNamespace(TclError=TclError),
+            "messagebox": SimpleNamespace(showwarning=showwarning),
+            "root": root,
         },
     )["configure_botcortex_logging"]
 
     try:
         configure()
+        (handler,) = logger.handlers
+        configure()
+        assert logger.handlers == [handler]
+        assert logger.level == logging.WARNING
+        assert logger.propagate is False
+        assert dialogs == []
         logger.warning("question bank diagnostic test")
-        log_file = settings.cache_dir / "botcortex.log"
-        assert log_file.is_file()
-        assert "question bank diagnostic test" in log_file.read_text(encoding="utf-8")
-        assert isinstance(logger.handlers[0], RotatingFileHandler)
+        expected = "WARNING BotCortex: question bank diagnostic test"
+        if mode == "stderr":
+            assert stderr.getvalue().strip() == expected
+            assert type(handler) is logging.StreamHandler
+        elif mode == "file":
+            assert (settings.cache_dir / "botcortex.log").read_text(
+                encoding="utf-8"
+            ).strip() == expected
+            assert isinstance(handler, RotatingFileHandler)
+            assert handler.maxBytes == 256 * 1024
+            assert handler.backupCount == 1
+        else:
+            assert isinstance(handler, logging.NullHandler)
+        assert len(idle_callbacks) == (
+            mode in {"unwritable", "invalid-settings", "closed-before-idle"}
+        )
+        for callback in idle_callbacks:
+            callback()
+        if mode == "unwritable":
+            assert dialogs == [
+                (
+                    "DeskBuddy diagnostics",
+                    "Cannot write BotCortex diagnostics to the configured cache directory.",
+                )
+            ]
+        elif mode == "invalid-settings":
+            assert dialogs == [
+                ("DeskBuddy diagnostics", "Cannot load the settings for BotCortex diagnostics.")
+            ]
+        else:
+            assert dialogs == []
     finally:
-        for handler in list(logger.handlers):
-            logger.removeHandler(handler)
+        for handler in logger.handlers:
             handler.close()
-        for handler in original_handlers:
-            logger.addHandler(handler)
-        logger.setLevel(original_level)
-        logger.propagate = original_propagate
 
 
 async def test_lost_speech_acknowledgement_is_reported_without_retry(conversation, capsys):

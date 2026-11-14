@@ -5,7 +5,7 @@ if "--headless" in sys.argv[1:]:
 
     raise SystemExit(headless_main())
 
-from deskbuddy.settings import load_settings
+from deskbuddy.settings import SettingsError, load_settings
 
 local_only = load_settings().model_provider != "openai"
 
@@ -226,6 +226,8 @@ async def main():
 
 def configure_botcortex_logging():
     logger = logging.getLogger("BotCortex")
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
     if logger.handlers:
         return
     if sys.stderr is None:
@@ -238,19 +240,33 @@ def configure_botcortex_logging():
                 backupCount=1,
                 encoding="utf-8",
             )
-        except OSError:
-            messagebox.showwarning(
-                "DeskBuddy diagnostics",
-                "Cannot write BotCortex diagnostics to the configured cache directory.",
-                parent=root,
+        except (OSError, SettingsError) as error:
+            handler = logging.NullHandler()
+            warning = (
+                "Cannot load the settings for BotCortex diagnostics."
+                if isinstance(error, SettingsError)
+                else "Cannot write BotCortex diagnostics to the configured cache directory."
             )
-            return
+
+            def show_logging_warning():
+                try:
+                    messagebox.showwarning(
+                        "DeskBuddy diagnostics",
+                        warning,
+                        parent=root,
+                    )
+                except tk.TclError:
+                    pass
+
+            # Wait until the model chooser is running before showing a dialog.
+            try:
+                root.after_idle(show_logging_warning)
+            except tk.TclError:
+                pass
     else:
         handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     logger.addHandler(handler)
-    logger.setLevel(logging.WARNING)
-    logger.propagate = False
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ def _reject_json_constant(constant: str) -> NoReturn:
     raise ValueError(f"Invalid JSON constant: {constant}")
 
 
-def _snapshot_question_bank(entries: object) -> dict[str, str]:
+def snapshot_question_bank(entries: object) -> dict[str, str]:
     """Copy caller data before validating or serializing it."""
     if not isinstance(entries, Mapping):
         raise ValueError("Question bank entries must map question strings to answer strings")
@@ -75,7 +75,7 @@ def load_question_bank(path: Path) -> dict[str, str]:
 
 def save_question_bank(path: Path, entries: dict[str, str]) -> None:
     """Replace the whole bank atomically within one process."""
-    snapshot = _snapshot_question_bank(entries)
+    snapshot = snapshot_question_bank(entries)
     with _bank_lock:
         # Validate the existing file before replacing it. The same lock covers
         # validation and publication so concurrent calls cannot race this check.

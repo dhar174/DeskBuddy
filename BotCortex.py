@@ -957,15 +957,8 @@ async def search_question_in_bank(qdict, question):
 
 
 async def query_memory(query):
-    # Load the question bank
-    try:
-        qdict = await load_qdict_from_json()
-    except question_bank.QuestionBankDataError as exc:
-        _warn_question_bank_unavailable(exc.path, exc.reason)
-        return query, False
-    except OSError as exc:
-        path = getattr(exc, "filename", None) or "question_file.json"
-        _warn_question_bank_unavailable(path, type(exc).__name__)
+    qdict = await load_qdict_from_json(allow_unavailable=True)
+    if qdict is None:
         return query, False
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
@@ -986,17 +979,30 @@ async def query_memory(query):
 
 
 async def save_qdict_to_json(my_dict):
+    snapshot = question_bank.snapshot_question_bank(my_dict)
+
     def save_question_bank():
         path = load_settings().data_path("question_file.json")
-        question_bank.save_question_bank(path, my_dict)
+        question_bank.save_question_bank(path, snapshot)
+        _clear_question_bank_warning(path)
 
     await asyncio.to_thread(save_question_bank)
 
 
-async def load_qdict_from_json():
+async def load_qdict_from_json(*, allow_unavailable=False):
     def load_question_bank():
         path = load_settings().data_path("question_file.json")
-        qdict = question_bank.load_question_bank(path)
+        try:
+            qdict = question_bank.load_question_bank(path)
+        except (question_bank.QuestionBankDataError, OSError) as exc:
+            if not allow_unavailable:
+                raise
+            reason = (
+                exc.reason if isinstance(exc, question_bank.QuestionBankDataError)
+                else type(exc).__name__
+            )
+            _warn_question_bank_unavailable(path, reason)
+            return None
         _clear_question_bank_warning(path)
         return qdict
 
@@ -1008,7 +1014,10 @@ def _warn_question_bank_unavailable(path, reason):
     with _question_bank_warning_lock:
         if _question_bank_warning_reasons.get(key) == reason:
             return
+        _question_bank_warning_reasons.pop(key, None)
         _question_bank_warning_reasons[key] = reason
+        if len(_question_bank_warning_reasons) > 32:
+            del _question_bank_warning_reasons[next(iter(_question_bank_warning_reasons))]
     logging.getLogger(__name__).warning(
         "Question bank unavailable at %s (%s); continuing without saved answers",
         path,

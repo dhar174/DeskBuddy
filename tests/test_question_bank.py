@@ -41,6 +41,24 @@ def test_load_rejects_malformed_or_wrong_shaped_data(
     assert caught.value.reason == reason
 
 
+def test_load_classifies_recursion_error_as_malformed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "question_file.json"
+    path.write_text("{}", encoding="utf-8")
+
+    def recurse(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RecursionError("injected JSON nesting failure")
+
+    monkeypatch.setattr(question_bank.json, "load", recurse)
+
+    with pytest.raises(question_bank.QuestionBankDataError) as caught:
+        question_bank.load_question_bank(path)
+
+    assert caught.value.reason == "malformed-file"
+
+
 def test_missing_bank_is_empty_without_creating_its_directory(tmp_path: Path) -> None:
     path = tmp_path / "not-created" / "question_file.json"
 
@@ -64,12 +82,37 @@ def test_save_round_trips_utf8_and_replaces_the_complete_mapping(tmp_path: Path)
 
     assert question_bank.load_question_bank(path) == replacement
 
+    question_bank.save_question_bank(path, {})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+    assert question_bank.load_question_bank(path) == {}
+
 
 @pytest.mark.parametrize(
     "contents",
     [b"{broken", b"\xfe\xff", b'{"question": null}'],
 )
 def test_save_refuses_to_replace_corrupt_bank_and_preserves_its_bytes(
+    tmp_path: Path, contents: bytes
+) -> None:
+    path = tmp_path / "question_file.json"
+    path.write_bytes(contents)
+
+    with pytest.raises(question_bank.QuestionBankDataError):
+        question_bank.save_question_bank(path, {"replacement": "answer"})
+
+    assert path.read_bytes() == contents
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        bytes((0xEF, 0xBB, 0xBF)) + b'{"question": "answer"}',
+        b'{"question": NaN}',
+    ],
+)
+def test_save_refuses_to_replace_bom_or_nonstandard_number_and_preserves_bytes(
     tmp_path: Path, contents: bytes
 ) -> None:
     path = tmp_path / "question_file.json"
@@ -122,15 +165,28 @@ def test_save_uses_a_snapshot_taken_before_validation(
     assert json.loads(path.read_text(encoding="utf-8")) == {"question": "answer"}
 
 
+def test_empty_answer_is_rejected_without_replacing_valid_bank(tmp_path: Path) -> None:
+    path = tmp_path / "question_file.json"
+    original = b'{"question": "answer"}'
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="nonblank answer"):
+        question_bank.save_question_bank(path, {"question": ""})
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_save_backslash_escapes_lone_surrogates_and_round_trips_them(tmp_path: Path) -> None:
     path = tmp_path / "question_file.json"
-    entries = {"question\ud800": "answer\udfff"}
+    entries = {"question café\ud800": "answer 你好\udfff🌍"}
 
     question_bank.save_question_bank(path, entries)
 
     contents = path.read_bytes()
     assert b"\\ud800" in contents
     assert b"\\udfff" in contents
+    assert "你好".encode("utf-8") in contents
     assert question_bank.load_question_bank(path) == entries
 
 
@@ -218,9 +274,11 @@ def test_reader_overlaps_publication_and_observes_a_complete_snapshot(
             if current_thread().name == "question-bank-reader":
                 if not real_lock.acquire(blocking=False):
                     reader_blocked_on_writer.set()
-                    real_lock.acquire()
+                    if not real_lock.acquire(timeout=30):
+                        raise TimeoutError("reader did not acquire the released bank lock")
                 return self
-            real_lock.acquire()
+            if not real_lock.acquire(timeout=30):
+                raise TimeoutError("writer did not acquire the bank lock")
             return self
 
         def __exit__(self, *args: Any) -> None:
@@ -229,7 +287,8 @@ def test_reader_overlaps_publication_and_observes_a_complete_snapshot(
 
     def gated_replace(source: Path, destination: Path) -> None:
         replace_entered.set()
-        allow_replace.wait()
+        if not allow_replace.wait(timeout=30):
+            raise TimeoutError("controller did not release the staged replacement")
         real_replace(source, destination)
 
     def write_new_snapshot() -> None:
@@ -290,7 +349,8 @@ def test_failed_save_cannot_invalidate_a_concurrent_successful_replacement(
             if not real_lock.acquire(blocking=False):
                 if current_thread().name == "question-bank-second-writer":
                     second_writer_contended.set()
-                real_lock.acquire()
+                if not real_lock.acquire(timeout=30):
+                    raise TimeoutError("writer did not acquire the released bank lock")
             return self
 
         def __exit__(self, *args: Any) -> None:
@@ -300,7 +360,8 @@ def test_failed_save_cannot_invalidate_a_concurrent_successful_replacement(
     def coordinated_dump(value: object, stream: Any, *args: Any, **kwargs: Any) -> None:
         if current_thread().name == "question-bank-first-writer":
             first_dump_entered.set()
-            allow_first_writer.wait()
+            if not allow_first_writer.wait(timeout=30):
+                raise TimeoutError("controller did not release the first writer")
             if value == broken:
                 raise OSError("injected concurrent write failure")
         elif value == broken:

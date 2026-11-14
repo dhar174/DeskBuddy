@@ -120,10 +120,13 @@ on disk and saves refuse to overwrite it.
 
 If a bank cannot be decoded, validated, or read, conversation lookup skips
 saved answers and warns with the path and reason. The same failure warns once
-until the bank can be read again or the failure reason changes. Filesystem
-failures are reported by exception type. The desktop writes warnings to stderr.
+until the bank can be read or saved successfully or the failure reason
+changes. The process remembers up to 32 paths. Filesystem failures are reported
+by exception type. The desktop writes warnings to stderr.
 When started without stderr (such as with `pythonw.exe`), it writes them to
-`botcortex.log` in the configured cache directory.
+`botcortex.log` in the configured cache directory. It checks that the file can
+be opened at startup. If opening fails, the model chooser shows a diagnostics
+warning when its event loop starts.
 
 To recover, stop DeskBuddy and make a copy of the damaged file. Restore a
 valid backup to `question_file.json` or move the damaged file aside to start
@@ -138,6 +141,10 @@ before replacement leaves the prior file intact. The last successful full
 replacement wins. This contract covers normal local filesystem operation.
 Power-loss durability of directory metadata depends on the filesystem.
 Run separate writing processes with separate data directories.
+
+The legacy format still accepts blank question strings. Escaped adjacent UTF-16
+surrogates follow JSON decoder behavior and may be read back as one Unicode
+character. Existing-bank validation reads the file before each replacement.
 
 `device=auto` keeps CUDA-if-available/CPU fallback when the legacy runtime asks
 for a device; `cpu`, `cuda`, `mps` are explicit preferences. Unsupported hardware

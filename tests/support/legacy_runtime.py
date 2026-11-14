@@ -243,7 +243,8 @@ def load_botcortex_runtime(
 
     memory_store = dict(qdict_data) if qdict_data is not None else {}
 
-    async def fake_load_qdict() -> dict[str, str]:
+    async def fake_load_qdict(*, allow_unavailable: bool = False) -> dict[str, str]:
+        _ = allow_unavailable
         rec.record("load_qdict_from_json")
         return dict(memory_store)
 
@@ -406,9 +407,9 @@ def load_botcortex_runtime(
         real_load_qdict = ns["load_qdict_from_json"]
         real_save_qdict = ns["save_qdict_to_json"]
 
-        async def recorded_load_qdict() -> dict[str, str]:
+        async def recorded_load_qdict(*, allow_unavailable: bool = False) -> dict[str, str] | None:
             rec.record("load_qdict_from_json")
-            return await real_load_qdict()
+            return await real_load_qdict(allow_unavailable=allow_unavailable)
 
         async def recorded_save_qdict(entries: dict[str, str]) -> None:
             rec.record("save_qdict_to_json", dict(entries))
