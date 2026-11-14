@@ -2,9 +2,10 @@
 # from optimum.onnxruntime import OrtModelForCausalLM
 # from soft_embedding import SoftEmbedding
 import asyncio
-import json
+import logging
 import threading
 import psutil
+from deskbuddy import question_bank
 from deskbuddy.settings import SettingsError, load_settings
 from PIL import Image
 import cv2 as cv
@@ -67,6 +68,9 @@ import numpy as np
 import sklearn
 from transformers import GitVisionConfig, GitForCausalLM, GitProcessor
 import openai
+
+_question_bank_warning_lock = threading.Lock()
+_question_bank_warning_reasons = {}
 
 unfound_answer = False
 asked_follow_up = False
@@ -953,8 +957,9 @@ async def search_question_in_bank(qdict, question):
 
 
 async def query_memory(query):
-    # Load the question bank
-    qdict = await load_qdict_from_json()
+    qdict = await load_qdict_from_json(allow_unavailable=True)
+    if qdict is None:
+        return query, False
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
     unknown_sentinels = {
@@ -974,25 +979,55 @@ async def query_memory(query):
 
 
 async def save_qdict_to_json(my_dict):
-    settings = load_settings()
-    settings.prepare_directories()
-    with settings.data_path("question_file.json").open("w", encoding="utf-8") as f:
-        # Save the key-value pairs to the file using JSON encoding
-        json.dump(my_dict, f)
+    snapshot = question_bank.snapshot_question_bank(my_dict)
+
+    def save_question_bank():
+        path = load_settings().data_path("question_file.json")
+        question_bank.save_question_bank(path, snapshot)
+        _clear_question_bank_warning(path)
+
+    await asyncio.to_thread(save_question_bank)
 
 
-# Open the file for reading
+async def load_qdict_from_json(*, allow_unavailable=False):
+    def load_question_bank():
+        path = load_settings().data_path("question_file.json")
+        try:
+            qdict = question_bank.load_question_bank(path)
+        except (question_bank.QuestionBankDataError, OSError) as exc:
+            if not allow_unavailable:
+                raise
+            reason = (
+                exc.reason if isinstance(exc, question_bank.QuestionBankDataError)
+                else type(exc).__name__
+            )
+            _warn_question_bank_unavailable(path, reason)
+            return None
+        _clear_question_bank_warning(path)
+        return qdict
+
+    return await asyncio.to_thread(load_question_bank)
 
 
-async def load_qdict_from_json():
-    question_file = load_settings().data_path("question_file.json")
-    if not question_file.exists():
-        return {}
-    with question_file.open("r", encoding="utf-8") as f:
-        # Load the key-value pairs from the file using JSON decoding
-        my_dict = json.load(f)
-        print("type:", type(my_dict))
-        return my_dict
+def _warn_question_bank_unavailable(path, reason):
+    key = str(path)
+    with _question_bank_warning_lock:
+        if _question_bank_warning_reasons.get(key) == reason:
+            return
+        _question_bank_warning_reasons.pop(key, None)
+        _question_bank_warning_reasons[key] = reason
+        if len(_question_bank_warning_reasons) > 32:
+            del _question_bank_warning_reasons[next(iter(_question_bank_warning_reasons))]
+    logging.getLogger(__name__).warning(
+        "Question bank unavailable at %s (%s); continuing without saved answers",
+        path,
+        reason,
+    )
+
+
+def _clear_question_bank_warning(path):
+    with _question_bank_warning_lock:
+        _question_bank_warning_reasons.pop(str(path), None)
 
 
 async def init():
