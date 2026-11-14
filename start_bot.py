@@ -146,27 +146,49 @@ async def main():
     local_only_checkbox.pack()
 
     # Start the main event loop
-    root.mainloop()
-    local_only = local_only_tk.get()
-    await BotCortex.load_all_models(button_text, local_only)
-    await helpers.load_models()
+    try:
+        root.mainloop()
+        if not button_text:
+            return
+        local_only = local_only_tk.get()
+        await BotCortex.load_all_models(button_text, local_only)
+        await helpers.load_models()
 
-    poller = rc.TranscriptPoller()
-    while True:
-        await asyncio.sleep(0.1)
-        try:
-            message = await poller.next_transcript()
-        except rc.ExecutionOutcomeUnknown as exc:
-            print(f"Transcript delivery outcome is unknown ({exc.code}); continuing to poll.")
-            continue
-        except rc.TransportError as exc:
-            print(f"Transcript request failed ({exc.code}); continuing to poll.")
-            continue
-        except (OSError, asyncio.TimeoutError) as exc:
-            print(f"Transcript connection failed ({type(exc).__name__}); continuing to poll.")
-            continue
+        poller = rc.TranscriptPoller()
+        backoff = 0.1
+        last_poll_error = None
+        while True:
+            try:
+                message = await poller.next_transcript()
+            except Exception as exc:
+                reason = type(exc).__name__
+                if isinstance(exc, rc.TransportError):
+                    reason = getattr(exc.code, "value", exc.code)
+                unknown_command = (
+                    exc.command if isinstance(exc, rc.ExecutionOutcomeUnknown) else None
+                )
+                error_key = (type(exc), reason, unknown_command)
+                if error_key != last_poll_error:
+                    uncertain = (
+                        " Transcript acknowledgement outcome is unknown."
+                        if unknown_command == "ack_transcript"
+                        else ""
+                    )
+                    print(
+                        f"Transcript polling failed ({reason}).{uncertain} "
+                        "Backing off before polling again."
+                    )
+                last_poll_error = error_key
+                await asyncio.sleep(backoff)
+                backoff = min(5.0, backoff * 2)
+                continue
 
-        if message is not None:
+            backoff = 0.1
+            last_poll_error = None
+            if message is None:
+                await asyncio.sleep(0.1)
+                continue
+
             print("User: " + message)
             try:
                 reply = await dispatch_reply(message, button_text, local_only)
@@ -194,6 +216,8 @@ async def main():
                             f"Could not confirm speech delivery ({type(exc).__name__}); "
                             "continuing to poll."
                         )
+    finally:
+        await rc.close_client()
 
 
 if __name__ == "__main__":

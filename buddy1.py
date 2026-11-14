@@ -1,6 +1,7 @@
 
 import asyncio
 import concurrent.futures
+import logging
 import os
 import socket
 import tkinter as tk
@@ -92,7 +93,9 @@ from transport import (
     validate_move_arguments,
     validate_wait_arguments,
 )
-from transport.transcripts import TranscriptQueue
+from transport.transcripts import TranscriptQueue, is_valid_transcript_text
+
+_logger = logging.getLogger(__name__)
 
 # State tracking globals
 lastReplyMessage = ""
@@ -116,8 +119,6 @@ class MyFunctions:
         print("Checking for response")
 
         if lastTranscription != "" and lastTranscription != priorTranscription:
-            print(priorTranscription)
-            print(lastTranscription)
             return lastTranscription
         else:
 
@@ -220,6 +221,9 @@ class MyFunctions:
         global lastReplyMessage
         global priorReplyMessage
         print("in send_response")
+        if not is_valid_transcript_text(text):
+            transcript_queue.enqueue(text)
+            return
         recorded = False
         recording = False
         priorTranscription = lastTranscription
@@ -417,7 +421,12 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
 
     # Register allowed DeskBuddy operations with strict validators
     async def _handle_check_for_response(args: dict) -> Any:
-        return await MyFunctions.check_for_response()
+        transcript_queue.select_polling_mode("legacy")
+        text = await MyFunctions.check_for_response()
+        if is_valid_transcript_text(text) and not transcript_queue.fits_legacy_response(text):
+            _logger.warning("Legacy transcript exceeds the configured response frame limit.")
+            return "No transcription"
+        return text
 
     registry.register(
         "check_for_response",

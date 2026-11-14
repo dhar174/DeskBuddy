@@ -126,10 +126,13 @@ async def request_to_server(**kwargs: Any) -> Any:
 def _transcript_result(response: RobotResponse) -> Any:
     if not response.ok:
         error = response.error or {}
-        raise TransportError(
-            error.get("code", TransportErrorCode.INTERNAL_ERROR),
-            "Robot transcript request failed",
-        )
+        code = error.get("code")
+        if not isinstance(code, str) or not isinstance(error.get("message"), str):
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST,
+                "Invalid transcript error response",
+            )
+        raise TransportError(code, "Robot transcript request failed")
     if response.error is not None:
         raise ProtocolViolationError(
             TransportErrorCode.MALFORMED_REQUEST,
@@ -150,19 +153,21 @@ class TranscriptPoller:
         client = await get_robot_client()
         connection = (client, client.connection_generation)
         if self._legacy_connection == connection and client.is_connected:
-            return await self._poll_legacy(client)
+            return await self._poll_legacy(client, connection[1])
 
         response = await client.request(POLL_TRANSCRIPT_COMMAND)
+        generation = client.connection_generation
+        error = response.error or {}
         if (
             not response.ok
             and response.result is None
-            and response.error
-            and response.error["code"] == TransportErrorCode.UNSUPPORTED_COMMAND
-            and isinstance(response.error["message"], str)
+            and error.get("code") == TransportErrorCode.UNSUPPORTED_COMMAND
+            and isinstance(error.get("message"), str)
         ):
-            self._legacy_connection = (client, client.connection_generation)
+            self._legacy_connection = (client, generation)
+            self._last_legacy_text = None
             logger.warning("Robot server lacks utterance IDs; using legacy text polling")
-            return await self._poll_legacy(client)
+            return await self._poll_legacy(client, generation)
 
         self._legacy_connection = None
         self._last_legacy_text = None
@@ -182,7 +187,12 @@ class TranscriptPoller:
             raise ProtocolViolationError(
                 TransportErrorCode.MALFORMED_REQUEST, "Invalid transcript identity or text"
             )
-        ack = await client.request(ACK_TRANSCRIPT_COMMAND, {"id": transcript_id})
+        ack = await client.request(
+            ACK_TRANSCRIPT_COMMAND,
+            {"id": transcript_id},
+            timeout=client.config.request_timeout,
+            expected_connection_generation=generation,
+        )
         accepted = _transcript_result(ack)
         if not isinstance(accepted, bool):
             raise ProtocolViolationError(
@@ -190,11 +200,11 @@ class TranscriptPoller:
             )
         return transcript if accepted else None
 
-    async def _poll_legacy(self, client: RobotClient) -> str | None:
+    async def _poll_legacy(self, client: RobotClient, generation: int) -> str | None:
         # A new socket must explicitly report lack of support before text
         # polling can consume a turn from it.
         response = await client.request(
-            "check_for_response", expected_connection_generation=client.connection_generation
+            "check_for_response", expected_connection_generation=generation
         )
         transcript = _transcript_result(response)
         if transcript in ("No transcription", "", None, self._last_legacy_text):

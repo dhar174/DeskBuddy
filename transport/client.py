@@ -45,12 +45,13 @@ KNOWN_PHYSICAL_COMMANDS: frozenset[str] = frozenset(
         "picoh_wait",
     }
 )
+NON_RETRYABLE_COMMANDS = KNOWN_PHYSICAL_COMMANDS | {"ack_transcript"}
 
 
 def is_side_effecting_command(command: str) -> bool:
     """Determine whether a command has potential side effects on physical hardware/state."""
     cmd_lower = command.lower()
-    if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+    if cmd_lower in NON_RETRYABLE_COMMANDS:
         return True
     return cmd_lower not in SAFE_IDEMPOTENT_COMMANDS
 
@@ -105,11 +106,19 @@ class RobotClient(RobotTransport):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connection_generation = 0
+        self._transcript_ack_at: float | None = None
         self._lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
+        reader, writer = self._reader, self._writer
+        return (
+            reader is not None
+            and reader.exception() is None
+            and not reader.at_eof()
+            and writer is not None
+            and not writer.is_closing()
+        )
 
     @property
     def connection_generation(self) -> int:
@@ -117,8 +126,9 @@ class RobotClient(RobotTransport):
         return self._connection_generation
 
     async def _ensure_connected(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        if self._reader is not None and self._writer is not None and not self._writer.is_closing():
-            return self._reader, self._writer
+        reader, writer = self._reader, self._writer
+        if reader is not None and writer is not None and self.is_connected:
+            return reader, writer
 
         await self._disconnect()
 
@@ -130,11 +140,11 @@ class RobotClient(RobotTransport):
             attempt += 1
             try:
                 connect_coro = asyncio.open_connection(self.config.host, self.config.port)
-                reader, writer = await asyncio.wait_for(
+                new_reader, new_writer = await asyncio.wait_for(
                     connect_coro, timeout=self.config.connect_timeout
                 )
-                self._reader = reader
-                self._writer = writer
+                self._reader = new_reader
+                self._writer = new_writer
                 self._connection_generation += 1
                 logger.debug(
                     "Connected to robot server at %s:%d (attempt %d/%d)",
@@ -143,7 +153,7 @@ class RobotClient(RobotTransport):
                     attempt,
                     max_attempts,
                 )
-                return reader, writer
+                return new_reader, new_writer
             except (OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 logger.debug(
@@ -170,6 +180,7 @@ class RobotClient(RobotTransport):
         writer = self._writer
         self._reader = None
         self._writer = None
+        self._transcript_ack_at = None
         if writer is not None:
             try:
                 writer.close()
@@ -201,11 +212,9 @@ class RobotClient(RobotTransport):
             timeout = validate_timeout_override(timeout)
 
         # Conservative side-effect classification:
-        # Known physical commands are unconditionally side-effecting.
-        # Explicit side_effects=True can upgrade an otherwise safe command,
-        # but side_effects=False can NEVER weaken protections on known physical commands.
+        # Physical commands and transcript claims may never be retried after transmission.
         cmd_lower = command.lower()
-        if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+        if cmd_lower in NON_RETRYABLE_COMMANDS:
             is_side_effecting = True
         elif side_effects is not None:
             is_side_effecting = side_effects
@@ -250,7 +259,29 @@ class RobotClient(RobotTransport):
             # Phase 2: Ensure connection (pre-transmission)
             # Dedicated bounded budget so slow connection establishment does not
             # consume the server execution plus response-grace deadline.
-            if timeout is not None:
+            # Model generation can block delivery of the socket EOF notification.
+            # Retire an aged reply connection before sending any speech bytes.
+            if (
+                expected_connection_generation is None
+                and cmd_lower == "reply"
+                and self._transcript_ack_at is not None
+                and loop.time() - self._transcript_ack_at >= self.config.read_timeout
+            ):
+                await self._disconnect()
+            if expected_connection_generation is not None:
+                pinned_reader, pinned_writer = self._reader, self._writer
+                if (
+                    self.connection_generation != expected_connection_generation
+                    or pinned_reader is None
+                    or pinned_writer is None
+                    or not self.is_connected
+                ):
+                    raise TransportError(
+                        TransportErrorCode.INTERNAL_ERROR,
+                        "Robot connection changed before the request was sent",
+                    )
+                reader, writer = pinned_reader, pinned_writer
+            elif timeout is not None:
                 elapsed = loop.time() - start_time
                 remaining_for_connect = timeout - elapsed
                 if remaining_for_connect <= 0:
@@ -269,15 +300,6 @@ class RobotClient(RobotTransport):
                     ) from exc
             else:
                 reader, writer = await self._ensure_connected()
-
-            if (
-                expected_connection_generation is not None
-                and self.connection_generation != expected_connection_generation
-            ):
-                raise TransportError(
-                    TransportErrorCode.INTERNAL_ERROR,
-                    "Robot connection changed before the request was sent",
-                )
 
             # Phase 3: Transmission and response deadline (starts after connection succeeds)
             if timeout is not None:
@@ -492,6 +514,12 @@ class RobotClient(RobotTransport):
                             code=err_code or TransportErrorCode.UNAUTHORIZED,
                         ) from underlying
                     raise underlying
+
+                self._transcript_ack_at = (
+                    loop.time()
+                    if cmd_lower == "ack_transcript" and response.ok and response.result is True
+                    else None
+                )
 
                 # Check for explicit replayed_request or execution_outcome_unknown error codes
                 if not response.ok and response.error:

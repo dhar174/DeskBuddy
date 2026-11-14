@@ -432,13 +432,22 @@ def load_start_bot_main(
     *,
     local_only: bool,
     button_text: str = "Medium",
+    sleep_calls: list[float] | None = None,
+    startup_calls: list[tuple[str, tuple[Any, ...]]] | None = None,
 ) -> Callable[[], Any]:
     """Load the legacy desktop loop without importing its GUI or runtime."""
 
-    async def skip_startup(*args: Any) -> None:
-        pass
+    async def skip_cortex_startup(*args: Any) -> None:
+        if startup_calls is not None:
+            startup_calls.append(("cortex", args))
 
-    async def yield_without_delay(_delay: float) -> None:
+    async def skip_helper_startup(*args: Any) -> None:
+        if startup_calls is not None:
+            startup_calls.append(("helpers", args))
+
+    async def yield_without_delay(delay: float) -> None:
+        if sleep_calls is not None:
+            sleep_calls.append(delay)
         await asyncio.sleep(0)
 
     class LocalOnlyOption:
@@ -457,8 +466,8 @@ def load_start_bot_main(
         {
             "tk": SimpleNamespace(Button=widget, Checkbutton=widget, BooleanVar=LocalOnlyOption),
             "root": SimpleNamespace(mainloop=lambda: None),
-            "BotCortex": SimpleNamespace(**{**cortex, "load_all_models": skip_startup}),
-            "helpers": SimpleNamespace(load_models=skip_startup),
+            "BotCortex": SimpleNamespace(**{**cortex, "load_all_models": skip_cortex_startup}),
+            "helpers": SimpleNamespace(load_models=skip_helper_startup),
             "rc": robot_client,
             "asyncio": SimpleNamespace(
                 sleep=yield_without_delay, TimeoutError=asyncio.TimeoutError

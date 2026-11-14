@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +15,9 @@ import pytest
 
 import buddy1
 from transport import RobotClient, RobotServer, TransportConfig
+from transport.auth import sign_response
+from transport.protocol import RobotResponse
+from transport.transcripts import MAX_PENDING_TRANSCRIPTS, TranscriptQueue, is_transcript_id
 from windows import buddy1 as windows_buddy1
 from windows import buddy2 as windows_buddy2
 
@@ -64,7 +69,7 @@ async def _ack(client: RobotClient, transcript_id: str) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_transcript_queue_round_trip_and_legacy_client(
+async def test_authenticated_transcript_queue_round_trip(
     adapter_module: ModuleType,
     ephemeral_server_config: TransportConfig,
 ) -> None:
@@ -72,11 +77,6 @@ async def test_authenticated_transcript_queue_round_trip_and_legacy_client(
 
     async with _running_client(adapter_module, ephemeral_server_config) as client:
         await adapter_module.MyFunctions.send_response(text)
-
-        legacy_response = await client.request("check_for_response", {})
-        assert legacy_response.ok, legacy_response.error
-        assert legacy_response.result == text
-
         item = await _poll(client)
         assert item is not None
         assert set(item) == {"id", "text"}
@@ -86,6 +86,317 @@ async def test_authenticated_transcript_queue_round_trip_and_legacy_client(
 
         assert await _ack(client, transcript_id) is True
         assert await _poll(client) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_polling_keeps_latest_text_after_shadow_queue_overflow(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    async with _running_client(adapter_module, ephemeral_server_config) as client:
+        for index in range(MAX_PENDING_TRANSCRIPTS + 8):
+            await adapter_module.MyFunctions.send_response(f"legacy turn {index}")
+
+        response = await client.request("check_for_response", {})
+
+        assert response.ok, response.error
+        assert response.result == f"legacy turn {MAX_PENDING_TRANSCRIPTS + 7}"
+        assert adapter_module.transcript_queue.polling_mode == "legacy"
+        assert adapter_module.transcript_queue.poll() is None
+
+        for index in range(MAX_PENDING_TRANSCRIPTS + 8):
+            await adapter_module.MyFunctions.send_response(f"later legacy turn {index}")
+        later = await client.request("check_for_response", {})
+        assert later.ok, later.error
+        assert later.result == f"later legacy turn {MAX_PENDING_TRANSCRIPTS + 7}"
+        assert adapter_module.transcript_queue.poll() is None
+
+
+@pytest.mark.asyncio
+async def test_id_poll_after_legacy_mode_returns_restart_hint(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    async with _running_client(adapter_module, ephemeral_server_config) as client:
+        legacy = await client.request("check_for_response", {})
+        assert legacy.ok, legacy.error
+
+        response = await client.request("poll_transcript", {})
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.get("code") == "invalid_arguments"
+        assert "restart the robot server" in response.error.get("message", "")
+
+
+@pytest.mark.asyncio
+async def test_invalid_ack_request_id_does_not_select_mode_or_remove_pending_text(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    async with _running_client(adapter_module, ephemeral_server_config) as client:
+        await adapter_module.MyFunctions.send_response("pending legacy text")
+        queue = adapter_module.transcript_queue
+        pending = queue.poll()
+        assert pending is not None
+        assert queue.polling_mode is None
+
+        response = await client.request(
+            "ack_transcript",
+            {"id": pending["id"]},
+            request_id="noncanonical-request-id",
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.get("code") == "invalid_arguments"
+        assert queue.polling_mode is None
+        assert queue.poll() == pending
+
+        malformed_ack = await client.request("ack_transcript", {"id": "not-a-uuid"})
+        assert malformed_ack.ok is False
+        assert malformed_ack.error is not None
+        assert malformed_ack.error.get("code") == "invalid_arguments"
+        assert queue.poll() == pending
+
+        legacy = await client.request("check_for_response", {})
+        assert legacy.ok, legacy.error
+        assert legacy.result == "pending legacy text"
+        assert queue.polling_mode == "legacy"
+        assert queue.poll() is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_text_fitting_only_legacy_frame_is_still_delivered(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    max_payload_size = 1024
+    config = ephemeral_server_config.with_overrides(max_payload_size=max_payload_size)
+    probe = TranscriptQueue(max_payload_size=max_payload_size, secret=config.secret)
+    transcript_id = str(uuid.UUID(int=1))
+    text = next(
+        "x" * length
+        for length in range(max_payload_size)
+        if probe._legacy_response_size("x" * length, config.secret) <= max_payload_size
+        and probe._poll_response_size(transcript_id, "x" * length, config.secret) > max_payload_size
+    )
+
+    async with _running_client(adapter_module, config) as client:
+        await adapter_module.MyFunctions.send_response(text)
+        assert adapter_module.transcript_queue.poll() is None
+
+        response = await client.request("check_for_response", {})
+
+        assert response.ok, response.error
+        assert response.result == text
+
+
+@pytest.mark.asyncio
+async def test_oversized_legacy_text_is_skipped_without_printing_or_logging_content(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_marker = "PRIVATE_OVERSIZED_LEGACY_SENTINEL"
+    text = private_marker + ("x" * 2048)
+    config = ephemeral_server_config.with_overrides(max_payload_size=1024)
+    caplog.set_level(logging.WARNING, logger="transport.transcripts")
+
+    async with _running_client(adapter_module, config) as client:
+        await adapter_module.MyFunctions.send_response(text)
+        response = await client.request("check_for_response", {})
+
+        assert response.ok, response.error
+        assert response.result == "No transcription"
+
+    assert private_marker not in caplog.text
+    assert private_marker not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_invalid_text_is_rejected_without_poisoning_prestart_legacy_state(
+    adapter_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue = TranscriptQueue()
+    monkeypatch.setattr(adapter_module, "transcript_queue", queue)
+    monkeypatch.setattr(adapter_module, "lastTranscription", "previous valid")
+    monkeypatch.setattr(adapter_module, "priorTranscription", "older")
+    caplog.set_level(logging.WARNING, logger="transport.transcripts")
+
+    await adapter_module.MyFunctions.send_response(" \t")
+    await adapter_module.MyFunctions.send_response(None)
+    assert adapter_module.lastTranscription == "previous valid"
+    assert adapter_module.priorTranscription == "older"
+
+    await adapter_module.MyFunctions.send_response("valid before startup")
+
+    assert adapter_module.lastTranscription == "valid before startup"
+    assert adapter_module.priorTranscription == "previous valid"
+    assert queue.poll() is None
+    assert queue.polling_mode is None
+    assert "valid before startup" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["transcript-boundary-test-secret", ""],
+    ids=["signed", "unsigned"],
+)
+def test_queue_accepts_exact_signed_or_unsigned_response_limit(secret: str) -> None:
+    transcript_id = str(uuid.UUID(int=1))
+    text = 'A café transcript with "JSON" and 😀.'
+    expected_response = RobotResponse.success(
+        request_id="00000000-0000-0000-0000-000000000000",
+        result={"id": transcript_id, "text": text},
+        timestamp=-sys.float_info.max,
+    )
+    if secret:
+        sign_response(secret, expected_response)
+    exact_size = len(expected_response.to_json().encode("utf-8"))
+
+    exact = TranscriptQueue(max_payload_size=exact_size, secret=secret)
+    assert exact.enqueue(text)
+    assert exact.poll() is not None
+
+    one_byte_short = TranscriptQueue(max_payload_size=exact_size - 1, secret=secret)
+    assert one_byte_short.enqueue(text) is False
+    assert one_byte_short.poll() is None
+
+
+def test_queue_fast_rejects_text_longer_than_frame_before_json_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = TranscriptQueue(max_payload_size=64, secret="fast-reject-secret")
+
+    def sizing_must_not_run(*args: object, **kwargs: object) -> int:
+        pytest.fail("oversized text reached response serialization")
+
+    monkeypatch.setattr(TranscriptQueue, "_poll_response_size", sizing_must_not_run)
+
+    assert queue.enqueue("x" * 65) is False
+
+
+@pytest.mark.parametrize(
+    ("max_payload_size", "error_type"),
+    [
+        (True, TypeError),
+        (0, ValueError),
+        (-1, ValueError),
+        (1.5, TypeError),
+    ],
+)
+def test_queue_constructor_rejects_invalid_frame_limits(
+    max_payload_size: object,
+    error_type: type[Exception],
+) -> None:
+    with pytest.raises(error_type):
+        TranscriptQueue(max_payload_size=max_payload_size)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("max_payload_size", [True, 0, -1, 1.5])
+def test_invalid_reset_frame_limit_preserves_pending_head(max_payload_size: object) -> None:
+    queue = TranscriptQueue(max_payload_size=65536, secret="reset-validation-secret")
+    assert queue.enqueue("preserve me")
+    pending = queue.poll()
+    assert pending is not None
+
+    expected_error = TypeError if isinstance(max_payload_size, (bool, float)) else ValueError
+    with pytest.raises(expected_error):
+        queue.reset(max_payload_size=max_payload_size, secret="replacement-secret")  # type: ignore[arg-type]
+
+    assert queue.poll() == pending
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (str(uuid.UUID(int=1)), True),
+        (str(uuid.UUID("abcdefab-cdef-abcd-efab-cdefabcdefab")).upper(), False),
+        ("not-a-uuid", False),
+        ("0" * 36, False),
+        ("0" * 37, False),
+        (None, False),
+        (123, False),
+    ],
+)
+def test_transcript_id_validation_is_canonical_and_bounded(value: object, expected: bool) -> None:
+    assert is_transcript_id(value) is expected
+
+
+def test_invalid_signing_configuration_preserves_pending_head() -> None:
+    with pytest.raises(TypeError, match="secret must be a string"):
+        TranscriptQueue(secret=None)  # type: ignore[arg-type]
+
+    queue = TranscriptQueue(max_payload_size=65536, secret="valid-secret")
+    assert queue.enqueue("pending")
+    pending = queue.poll()
+    assert pending is not None
+    with pytest.raises(TypeError, match="secret must be a string"):
+        queue.reset(max_payload_size=65536, secret=None)  # type: ignore[arg-type]
+
+    assert queue.poll() == pending
+
+
+def test_concurrent_enqueue_respects_queue_capacity() -> None:
+    queue = TranscriptQueue(max_payload_size=65536, secret="queue-concurrency-secret")
+    worker_count = MAX_PENDING_TRANSCRIPTS * 2
+    start = threading.Barrier(worker_count + 1)
+    accepted: list[str] = []
+    accepted_lock = threading.Lock()
+
+    def enqueue(index: int) -> None:
+        text = f"concurrent transcript {index}"
+        start.wait(timeout=5)
+        if queue.enqueue(text):
+            with accepted_lock:
+                accepted.append(text)
+
+    workers = [threading.Thread(target=enqueue, args=(i,)) for i in range(worker_count)]
+    for worker in workers:
+        worker.start()
+    start.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    assert len(accepted) == MAX_PENDING_TRANSCRIPTS
+    queued: list[str] = []
+    while (item := queue.poll()) is not None:
+        queued.append(item["text"])
+        assert queue.ack(item["id"])
+    assert len(queued) == MAX_PENDING_TRANSCRIPTS
+    assert set(queued) == set(accepted)
+
+
+def test_reset_during_size_preflight_rejects_stale_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = TranscriptQueue(max_payload_size=65536, secret="old-secret")
+    preflight_started = threading.Event()
+    resume_preflight = threading.Event()
+    original_preflight = queue._fits_poll_response
+    result: list[bool] = []
+
+    def pause_preflight(*args: object, **kwargs: object) -> bool:
+        preflight_started.set()
+        assert resume_preflight.wait(timeout=5)
+        return original_preflight(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(queue, "_fits_poll_response", pause_preflight)
+    worker = threading.Thread(target=lambda: result.append(queue.enqueue("during reset")))
+    worker.start()
+    assert preflight_started.wait(timeout=5)
+    queue.reset(max_payload_size=65536, secret="new-secret")
+    resume_preflight.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert queue.poll() is None
 
 
 @pytest.mark.asyncio
@@ -155,6 +466,8 @@ async def test_transcript_commands_reject_noncanonical_request_id(
         response = await client.request("poll_transcript", {}, request_id="ordinary-invalid-id")
 
         assert response.ok is False
+        assert response.error is not None
+        assert response.error.get("code") == "invalid_arguments"
         assert await _poll(client) is None
 
 

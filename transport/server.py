@@ -298,8 +298,17 @@ class RobotServer:
         if request.command in (POLL_TRANSCRIPT_COMMAND, ACK_TRANSCRIPT_COMMAND) and not (
             is_transcript_id(req_id)
         ):
+            # Keep short invalid IDs correlatable without reflecting unbounded input.
+            error_id = (
+                req_id
+                if req_id is not None
+                and len(req_id) <= 36
+                and req_id.isascii()
+                and req_id.isprintable()
+                else None
+            )
             return RobotResponse.fail(
-                request_id=req_id,
+                request_id=error_id,
                 code=TransportErrorCode.INVALID_ARGUMENTS,
                 message="Transcript commands require a canonical UUID request ID",
             )

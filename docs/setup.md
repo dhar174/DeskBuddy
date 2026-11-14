@@ -212,26 +212,46 @@ production packages belong under `src/` or in the temporary `transport/` boundar
 
 ### Transcript delivery
 
-Run one desktop conversation client per robot. Updated robot adapters queue up to
-32 finalized nonblank transcripts in memory, in capture order. Each utterance
-gets its own ID, so separate utterances with identical text can both reach the
-desktop. A full queue rejects new arrivals. Transcripts too large for a signed
-poll response are rejected. Those warnings omit transcript text.
+Run one desktop conversation client per robot and one robot server per adapter
+process. Server instances in the same legacy adapter process share capture
+state, so starting another instance can clear the first instance's queue.
+Updated robot adapters queue up to 32 finalized nonblank transcripts in memory,
+in capture order. Each utterance gets its own ID, so separate utterances with
+identical text can both reach the desktop. A full queue rejects new arrivals.
+Transcripts too large for a signed poll response are rejected. Those warnings
+omit transcript text.
 
 The desktop begins a turn after an authenticated acknowledgement confirms that
-the robot removed the queued transcript. A lost poll response leaves it pending.
+the robot removed the queued transcript. Polling and acknowledging use two
+authenticated requests on the same connection. A lost poll response leaves it
+pending.
 A lost acknowledgement can lose that turn if removal already happened. A
 desktop crash after acknowledgement can also lose that turn. A reconnect can
 deliver pending entries, while a robot restart clears the in-memory queue.
 Uncertain speech delivery still uses `ExecutionOutcomeUnknown` and does not
-resend the speech action.
+resend the speech action. If the client observes a closed socket, it connects
+before sending speech. ID-based turns also replace the idle connection before
+sending if generation takes at least the configured read timeout. The desktop
+polls again immediately after a completed turn. Empty polls wait 100 ms.
+Polling failures back off from 100 ms to 5 seconds and reset the delay after a
+successful poll.
 
 An older desktop can still use an updated robot via `check_for_response`. An
 updated desktop warns and falls back to legacy text polling for a connection
 when the authenticated robot explicitly reports that `poll_transcript` is
-unsupported. Legacy polling retains its text deduplication and stale-transcript
-limits. Restart the robot server when switching between legacy and ID-based
-polling to discard pending queue entries.
+unsupported. Legacy text deduplication is scoped to one connection. A legacy
+server can still return stale text after a reconnect because it sends no
+utterance identity. The first transcript poll selects the robot server's mode.
+Legacy polling discards any pending ID entries and keeps only the adapter's
+latest-text behavior. Text that exceeds the signed legacy response limit is
+skipped. Restart the robot server to switch between legacy and ID-based polling.
+The server rejects a request for the other mode until then.
+
+Listening during playback can capture the robot's own speech as a new utterance.
+Capture and transcription can also delay transport handling on the robot event
+loop. See [#35](https://github.com/dhar174/DeskBuddy/issues/35),
+[#36](https://github.com/dhar174/DeskBuddy/issues/36), and
+[#37](https://github.com/dhar174/DeskBuddy/issues/37) for the related follow-ups.
 
 ## Larynx Docker limitation
 
