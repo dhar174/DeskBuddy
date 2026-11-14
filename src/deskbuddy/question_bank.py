@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
-from typing import Literal, TypeGuard
+from typing import Literal, NoReturn, TypeGuard
 
 _bank_lock = Lock()
 
@@ -24,8 +25,31 @@ class QuestionBankDataError(ValueError):
 
 def _is_question_bank(value: object) -> TypeGuard[dict[str, str]]:
     return isinstance(value, dict) and all(
-        isinstance(question, str) and isinstance(answer, str) for question, answer in value.items()
+        isinstance(question, str) and isinstance(answer, str) and bool(answer.strip())
+        for question, answer in value.items()
     )
+
+
+def _reject_json_constant(constant: str) -> NoReturn:
+    """Reject JavaScript constants that Python's JSON parser otherwise accepts."""
+    raise ValueError(f"Invalid JSON constant: {constant}")
+
+
+def _snapshot_question_bank(entries: object) -> dict[str, str]:
+    """Copy caller data before validating or serializing it."""
+    if not isinstance(entries, Mapping):
+        raise ValueError("Question bank entries must map question strings to answer strings")
+    try:
+        snapshot = dict(entries)
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Question bank entries must map question strings to answer strings"
+        ) from error
+    if not _is_question_bank(snapshot):
+        raise ValueError(
+            "Question bank entries must map question strings to nonblank answer strings"
+        )
+    return snapshot
 
 
 def _read_bank(path: Path) -> dict[str, str]:
@@ -35,7 +59,7 @@ def _read_bank(path: Path) -> dict[str, str]:
         return {}
     with source:
         try:
-            entries = json.load(source)
+            entries = json.load(source, parse_constant=_reject_json_constant)
         except (UnicodeDecodeError, ValueError, RecursionError):
             raise QuestionBankDataError(path, "malformed-file") from None
     if not _is_question_bank(entries):
@@ -51,8 +75,7 @@ def load_question_bank(path: Path) -> dict[str, str]:
 
 def save_question_bank(path: Path, entries: dict[str, str]) -> None:
     """Replace the whole bank atomically within one process."""
-    if not _is_question_bank(entries):
-        raise ValueError("Question bank entries must map question strings to answer strings")
+    snapshot = _snapshot_question_bank(entries)
     with _bank_lock:
         # Validate the existing file before replacing it. The same lock covers
         # validation and publication so concurrent calls cannot race this check.
@@ -63,13 +86,16 @@ def save_question_bank(path: Path, entries: dict[str, str]) -> None:
             with NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
+                errors="backslashreplace",
                 dir=path.parent,
                 prefix=f".{path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
                 temporary_path = Path(temporary.name)
-                json.dump(entries, temporary)
+                # Keep ordinary Unicode readable while escaping isolated
+                # surrogates as JSON-compatible backslash sequences.
+                json.dump(snapshot, temporary, ensure_ascii=False)
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_path, path)

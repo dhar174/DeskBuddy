@@ -69,6 +69,9 @@ import sklearn
 from transformers import GitVisionConfig, GitForCausalLM, GitProcessor
 import openai
 
+_question_bank_warning_lock = threading.Lock()
+_question_bank_warning_reasons = {}
+
 unfound_answer = False
 asked_follow_up = False
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -958,11 +961,11 @@ async def query_memory(query):
     try:
         qdict = await load_qdict_from_json()
     except question_bank.QuestionBankDataError as exc:
-        logging.getLogger(__name__).warning(
-            "Question bank unavailable at %s (%s); continuing without saved answers",
-            exc.path,
-            exc.reason,
-        )
+        _warn_question_bank_unavailable(exc.path, exc.reason)
+        return query, False
+    except OSError as exc:
+        path = getattr(exc, "filename", None) or "question_file.json"
+        _warn_question_bank_unavailable(path, type(exc).__name__)
         return query, False
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
@@ -983,13 +986,39 @@ async def query_memory(query):
 
 
 async def save_qdict_to_json(my_dict):
-    path = load_settings().data_path("question_file.json")
-    question_bank.save_question_bank(path, my_dict)
+    def save_question_bank():
+        path = load_settings().data_path("question_file.json")
+        question_bank.save_question_bank(path, my_dict)
+
+    await asyncio.to_thread(save_question_bank)
 
 
 async def load_qdict_from_json():
-    path = load_settings().data_path("question_file.json")
-    return question_bank.load_question_bank(path)
+    def load_question_bank():
+        path = load_settings().data_path("question_file.json")
+        qdict = question_bank.load_question_bank(path)
+        _clear_question_bank_warning(path)
+        return qdict
+
+    return await asyncio.to_thread(load_question_bank)
+
+
+def _warn_question_bank_unavailable(path, reason):
+    key = str(path)
+    with _question_bank_warning_lock:
+        if _question_bank_warning_reasons.get(key) == reason:
+            return
+        _question_bank_warning_reasons[key] = reason
+    logging.getLogger(__name__).warning(
+        "Question bank unavailable at %s (%s); continuing without saved answers",
+        path,
+        reason,
+    )
+
+
+def _clear_question_bank_warning(path):
+    with _question_bank_warning_lock:
+        _question_bank_warning_reasons.pop(str(path), None)
 
 
 async def init():

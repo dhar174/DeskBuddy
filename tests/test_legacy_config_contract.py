@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,8 +33,33 @@ def _extract_functions(path: Path, names: set[str], globals_: dict[str, Any]) ->
     return {name: namespace[name] for name in names}
 
 
-def _settings_at(data_dir: Path, cache_dir: Path) -> Settings:
-    return Settings(data_dir=data_dir, cache_dir=cache_dir)
+def _settings_at(data_dir: Path, cache_dir: Path, offload_dir: Path | None = None) -> Settings:
+    return Settings(data_dir=data_dir, cache_dir=cache_dir, offload_dir=offload_dir)
+
+
+def _question_bank_adapters(
+    settings: Settings,
+    *,
+    settings_loader: Any | None = None,
+) -> dict[str, Any]:
+    return _extract_functions(
+        BOT_CORTEX_PATH,
+        {
+            "load_qdict_from_json",
+            "save_qdict_to_json",
+            "_clear_question_bank_warning",
+            "_warn_question_bank_unavailable",
+        },
+        {
+            "asyncio": asyncio,
+            "logging": logging,
+            "__name__": "BotCortex",
+            "question_bank": question_bank,
+            "load_settings": settings_loader or (lambda: settings),
+            "_question_bank_warning_lock": threading.Lock(),
+            "_question_bank_warning_reasons": {},
+        },
+    )
 
 
 def test_question_bank_missing_file_is_empty_and_has_no_cwd_side_effect(
@@ -43,15 +70,12 @@ def test_question_bank_missing_file_is_empty_and_has_no_cwd_side_effect(
     monkeypatch.chdir(checkout)
     data_dir = tmp_path / "user-data"
     settings = _settings_at(data_dir, tmp_path / "user-cache")
-    load = _extract_functions(
-        BOT_CORTEX_PATH,
-        {"load_qdict_from_json"},
-        {"question_bank": question_bank, "load_settings": lambda: settings},
-    )["load_qdict_from_json"]
+    load = _question_bank_adapters(settings)["load_qdict_from_json"]
 
     assert asyncio.run(load()) == {}
     assert not data_dir.exists()
     assert not (checkout / "question_file.json").exists()
+    assert not settings.cache_dir.exists()
 
 
 def test_question_bank_existing_file_is_read_from_user_data(
@@ -65,11 +89,7 @@ def test_question_bank_existing_file_is_read_from_user_data(
     expected = {"hello": "Hi there"}
     (data_dir / "question_file.json").write_text(json.dumps(expected), encoding="utf-8")
     settings = _settings_at(data_dir, tmp_path / "user-cache")
-    load = _extract_functions(
-        BOT_CORTEX_PATH,
-        {"load_qdict_from_json"},
-        {"question_bank": question_bank, "load_settings": lambda: settings},
-    )["load_qdict_from_json"]
+    load = _question_bank_adapters(settings)["load_qdict_from_json"]
 
     assert asyncio.run(load()) == expected
     assert not (checkout / "question_file.json").exists()
@@ -85,17 +105,135 @@ def test_question_bank_save_targets_user_data_not_cwd(
     sentinel.write_text("production data sentinel", encoding="utf-8")
     data_dir = tmp_path / "user-data"
     settings = _settings_at(data_dir, tmp_path / "user-cache")
-    save = _extract_functions(
-        BOT_CORTEX_PATH,
-        {"save_qdict_to_json"},
-        {"question_bank": question_bank, "load_settings": lambda: settings},
-    )["save_qdict_to_json"]
+    save = _question_bank_adapters(settings)["save_qdict_to_json"]
     qdict = {"where are you?": "right here"}
 
     asyncio.run(save(qdict))
 
     assert json.loads((data_dir / "question_file.json").read_text(encoding="utf-8")) == qdict
     assert sentinel.read_text(encoding="utf-8") == "production data sentinel"
+    assert not settings.cache_dir.exists()
+    assert settings.offload_dir is not None
+    assert not settings.offload_dir.exists()
+
+
+@pytest.mark.parametrize("adapter", ["load", "save"])
+def test_question_bank_disk_adapters_yield_to_event_loop(
+    adapter: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_at(
+        tmp_path / "user-data", tmp_path / "user-cache", tmp_path / "model-offload"
+    )
+    adapters = _question_bank_adapters(settings)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_bank_operation(*_args: Any) -> dict[str, str] | None:
+        entered.set()
+        if not release.wait(timeout=1.5):
+            raise AssertionError("question-bank I/O blocked the event loop")
+        return {} if adapter == "load" else None
+
+    if adapter == "load":
+        monkeypatch.setattr(question_bank, "load_question_bank", blocking_bank_operation)
+    else:
+        monkeypatch.setattr(question_bank, "save_question_bank", blocking_bank_operation)
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+
+        def release_from_another_thread() -> None:
+            if entered.wait(timeout=2):
+                loop.call_soon_threadsafe(release.set)
+
+        release_thread = threading.Thread(target=release_from_another_thread, daemon=True)
+        release_thread.start()
+        try:
+            if adapter == "load":
+                result = await asyncio.wait_for(adapters["load_qdict_from_json"](), timeout=2)
+                assert result == {}
+            else:
+                await asyncio.wait_for(
+                    adapters["save_qdict_to_json"]({"hello": "there"}), timeout=2
+                )
+        finally:
+            release.set()
+            release_thread.join(timeout=1)
+        assert entered.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_question_bank_settings_error_still_propagates(tmp_path: Path) -> None:
+    settings = _settings_at(tmp_path / "data", tmp_path / "cache")
+
+    def broken_settings_loader() -> Settings:
+        raise SettingsError("invalid local settings")
+
+    load = _question_bank_adapters(settings, settings_loader=broken_settings_loader)[
+        "load_qdict_from_json"
+    ]
+    with pytest.raises(SettingsError, match="invalid local settings"):
+        asyncio.run(load())
+
+
+def test_question_bank_warning_latch_resets_after_successful_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings_at(tmp_path / "data", tmp_path / "cache")
+    adapters = _question_bank_adapters(settings)
+    warn = adapters["_warn_question_bank_unavailable"]
+    bank = settings.data_path("question_file.json")
+
+    with caplog.at_level(logging.WARNING, logger="BotCortex"):
+        warn(bank, "malformed-file")
+        warn(bank, "malformed-file")
+        warn(bank, "PermissionError")
+        assert asyncio.run(adapters["load_qdict_from_json"]()) == {}
+        warn(bank, "PermissionError")
+
+    warnings = [record for record in caplog.records if record.name == "BotCortex"]
+    assert [record.getMessage().split("(")[-1].split(")")[0] for record in warnings] == [
+        "malformed-file",
+        "PermissionError",
+        "PermissionError",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["malformed", "replace"])
+def test_question_bank_save_adapter_preserves_existing_file_on_error(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "user-data"
+    data_dir.mkdir()
+    bank = data_dir / "question_file.json"
+    original = b'{"existing question":"existing answer"}'
+    if failure == "malformed":
+        original = b'{"damaged question":'
+    bank.write_bytes(original)
+    settings = _settings_at(data_dir, tmp_path / "user-cache")
+    save = _question_bank_adapters(settings)["save_qdict_to_json"]
+
+    if failure == "replace":
+        real_os = question_bank.os
+
+        def failed_replace(*_args: Any) -> None:
+            raise OSError("replacement failed")
+
+        monkeypatch.setattr(
+            question_bank,
+            "os",
+            SimpleNamespace(fsync=real_os.fsync, replace=failed_replace),
+        )
+        expected_error = OSError
+    else:
+        expected_error = question_bank.QuestionBankDataError
+
+    with pytest.raises(expected_error):
+        asyncio.run(save({"new question": "new answer"}))
+
+    assert bank.read_bytes() == original
+    assert list(data_dir.glob(".question_file.json.*.tmp")) == []
 
 
 @pytest.mark.parametrize(

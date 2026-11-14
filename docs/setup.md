@@ -111,25 +111,33 @@ An empty or one-entry question bank skips semantic search and returns the existi
 language-model fallback signal; it never tries to embed an empty collection or
 compare two missing candidates.
 
-The question bank remains a UTF-8 JSON object whose keys are question strings
-and whose values are answer strings. A missing bank is treated as empty.
-If the file contains malformed JSON or invalid UTF-8, DeskBuddy reports
-`malformed-file`. A JSON value with the wrong structure reports `invalid-shape`.
-In either case the warning identifies the file and reason, the conversation
-can continue without saved answers, and saves refuse to overwrite the file.
-Filesystem errors such as insufficient permissions are reported separately.
+The question bank is a UTF-8 JSON object with string questions and nonblank
+string answers. A missing bank is treated as empty. DeskBuddy reports
+`malformed-file` for invalid UTF-8, a byte order mark, or invalid JSON,
+including nonstandard numeric constants. A JSON value with the wrong
+structure reports `invalid-shape`. A malformed or wrong-shaped bank stays
+on disk and saves refuse to overwrite it.
+
+If a bank cannot be decoded, validated, or read, conversation lookup skips
+saved answers and warns with the path and reason. The same failure warns once
+until the bank can be read again or the failure reason changes. Filesystem
+failures are reported by exception type. The desktop writes warnings to stderr.
+When started without stderr (such as with `pythonw.exe`), it writes them to
+`botcortex.log` in the configured cache directory.
 
 To recover, stop DeskBuddy and make a copy of the damaged file. Restore a
 valid backup to `question_file.json` or move the damaged file aside to start
 with an empty bank. Keep the copy for inspection or eventual migration.
 Conversation lookups do not automatically save changes to the bank.
 
-Within one DeskBuddy process, reads and saves are serialized. Each save
-publishes a complete replacement on the local filesystem. A failure before
-replacement leaves the prior file intact. The last successful full replacement
-wins. These guarantees cover normal local filesystem operation through the
-question bank helpers. Run separate writing processes with separate data
-directories.
+Within one DeskBuddy process, reads and saves are serialized. A question-bank
+save creates its data directory as needed. Model cache and offload directories
+are created separately by runtime setup. Each save syncs the temporary file
+before publishing a complete replacement on the local filesystem. A failure
+before replacement leaves the prior file intact. The last successful full
+replacement wins. This contract covers normal local filesystem operation.
+Power-loss durability of directory metadata depends on the filesystem.
+Run separate writing processes with separate data directories.
 
 `device=auto` keeps CUDA-if-available/CPU fallback when the legacy runtime asks
 for a device; `cpu`, `cuda`, `mps` are explicit preferences. Unsupported hardware

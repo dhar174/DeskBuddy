@@ -269,6 +269,8 @@ def load_botcortex_runtime(
 
     cortex_names = {
         "_openai_model_name",
+        "_clear_question_bank_warning",
+        "_warn_question_bank_unavailable",
         "search_question_in_bank",
         "query_memory",
         "find_names",
@@ -327,6 +329,8 @@ def load_botcortex_runtime(
         "__name__": "BotCortex",
         "logging": logging,
         "question_bank": question_bank,
+        "_question_bank_warning_lock": threading.Lock(),
+        "_question_bank_warning_reasons": {},
         "threading": threading,
         "time": SimpleNamespace(time=time.monotonic, sleep=lambda _s: None),
         "load_settings": lambda overrides=None: effective_settings,
@@ -397,6 +401,21 @@ def load_botcortex_runtime(
         "_fake_helpers": fake_helpers,
     }
     ns = extract_module_functions(BOT_CORTEX_PATH, cortex_names, globals_)
+
+    if use_disk_question_bank:
+        real_load_qdict = ns["load_qdict_from_json"]
+        real_save_qdict = ns["save_qdict_to_json"]
+
+        async def recorded_load_qdict() -> dict[str, str]:
+            rec.record("load_qdict_from_json")
+            return await real_load_qdict()
+
+        async def recorded_save_qdict(entries: dict[str, str]) -> None:
+            rec.record("save_qdict_to_json", dict(entries))
+            await real_save_qdict(entries)
+
+        ns["load_qdict_from_json"] = recorded_load_qdict
+        ns["save_qdict_to_json"] = recorded_save_qdict
 
     # Keep a live proxy so helper calls observe routing state mutations.
     class _LiveCortexProxy:

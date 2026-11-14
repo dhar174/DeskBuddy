@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from logging.handlers import RotatingFileHandler
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,9 +16,15 @@ import pytest_asyncio
 
 import buddy1
 import robot_client
+from deskbuddy import question_bank
 from deskbuddy.settings import Settings
 from tests.support.fakes import CallRecorder, FakeNLIClassifier, FakeOpenAISDK, nli_routes
-from tests.support.legacy_runtime import load_botcortex_runtime, load_start_bot_main
+from tests.support.legacy_runtime import (
+    START_BOT_PATH,
+    extract_module_functions,
+    load_botcortex_runtime,
+    load_start_bot_main,
+)
 from transport import ExecutionOutcomeUnknown, TransportConfig, TransportError, TransportErrorCode
 from transport.hardware import reset_default_hardware_executor
 
@@ -449,9 +457,18 @@ async def test_non_text_model_result_is_not_spoken(conversation, monkeypatch, ca
     assert "Could not generate a text reply" in capsys.readouterr().out
 
 
-async def test_corrupt_question_bank_falls_through_to_generation(conversation, tmp_path, caplog):
+@pytest.mark.parametrize(
+    ("damaged", "reason"),
+    [
+        (b'{"private-memory-fragment":', "malformed-file"),
+        (b'{"unexpected": []}', "invalid-shape"),
+    ],
+    ids=["malformed-json", "invalid-shape"],
+)
+async def test_corrupt_question_bank_falls_through_to_generation(
+    conversation, tmp_path, caplog, damaged, reason
+):
     bank = tmp_path / "question_file.json"
-    damaged = b'{"private-memory-fragment":'
     bank.write_bytes(damaged)
     rec = conversation.recorder
 
@@ -465,12 +482,83 @@ async def test_corrupt_question_bank_falls_through_to_generation(conversation, t
     assert conversation.received_replies == conversation.spoken == ["LOCAL_MODEL_REPLY"]
     assert rec.count("chat_model.generate") == 1
     assert rec.count("get_embeddings") == 0
+    assert rec.count("load_qdict_from_json") == 1
     assert bank.read_bytes() == damaged
     warnings = [record.getMessage() for record in caplog.records if record.name == "BotCortex"]
     (warning,) = warnings
     assert str(bank) in warning
-    assert "malformed-file" in warning
+    assert reason in warning
+    assert (
+        next(record.levelname for record in caplog.records if record.name == "BotCortex")
+        == "WARNING"
+    )
     assert "private-memory-fragment" not in caplog.text
+
+
+async def test_question_bank_oserror_falls_through_without_logging_error_details(
+    conversation, tmp_path, monkeypatch, caplog
+):
+    bank = tmp_path / "question_file.json"
+    private_detail = "permission denied: private question-bank content"
+
+    def unavailable(path):
+        raise PermissionError(13, private_detail, str(path))
+
+    monkeypatch.setattr(question_bank, "load_question_bank", unavailable)
+    rec = conversation.recorder
+
+    await conversation.run(
+        ["What is the capital of France?"],
+        settings=Settings(data_dir=tmp_path, cache_dir=tmp_path / "cache"),
+        use_disk_question_bank=True,
+        nli_classifier=FakeNLIClassifier(rec, routes=nli_routes()),
+    )
+
+    assert conversation.received_replies == conversation.spoken == ["LOCAL_MODEL_REPLY"]
+    assert rec.count("load_qdict_from_json") == 1
+    warnings = [record for record in caplog.records if record.name == "BotCortex"]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    assert str(bank) in warnings[0].getMessage()
+    assert "PermissionError" in warnings[0].getMessage()
+    assert private_detail not in caplog.text
+
+
+def test_botcortex_logging_uses_rotating_file_without_stderr(tmp_path):
+    logger = logging.getLogger("BotCortex")
+    original_handlers = list(logger.handlers)
+    original_level = logger.level
+    original_propagate = logger.propagate
+    for handler in original_handlers:
+        logger.removeHandler(handler)
+
+    settings = Settings(data_dir=tmp_path / "data", cache_dir=tmp_path / "cache")
+    configure = extract_module_functions(
+        START_BOT_PATH,
+        {"configure_botcortex_logging"},
+        {
+            "logging": logging,
+            "sys": SimpleNamespace(stderr=None),
+            "load_settings": lambda: settings,
+            "RotatingFileHandler": RotatingFileHandler,
+        },
+    )["configure_botcortex_logging"]
+
+    try:
+        configure()
+        logger.warning("question bank diagnostic test")
+        log_file = settings.cache_dir / "botcortex.log"
+        assert log_file.is_file()
+        assert "question bank diagnostic test" in log_file.read_text(encoding="utf-8")
+        assert isinstance(logger.handlers[0], RotatingFileHandler)
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        for handler in original_handlers:
+            logger.addHandler(handler)
+        logger.setLevel(original_level)
+        logger.propagate = original_propagate
 
 
 async def test_lost_speech_acknowledgement_is_reported_without_retry(conversation, capsys):

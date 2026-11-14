@@ -13,10 +13,19 @@ from deskbuddy import question_bank
 @pytest.mark.parametrize(
     ("contents", "reason"),
     [
+        (b"", "malformed-file"),
         (b'{"unfinished":', "malformed-file"),
         (b"\xff", "malformed-file"),
+        (b'\xef\xbb\xbf{"question": "answer"}', "malformed-file"),
+        (b'{"question": NaN}', "malformed-file"),
+        (b'{"question": Infinity}', "malformed-file"),
+        (b'{"question": -Infinity}', "malformed-file"),
+        (b"null", "invalid-shape"),
+        (b"123", "invalid-shape"),
         (b"[]", "invalid-shape"),
         (b'{"question": 42}', "invalid-shape"),
+        (b'{"question": ""}', "invalid-shape"),
+        (b'{"question": "  \\t\\n"}', "invalid-shape"),
     ],
 )
 def test_load_rejects_malformed_or_wrong_shaped_data(
@@ -48,6 +57,7 @@ def test_save_round_trips_utf8_and_replaces_the_complete_mapping(tmp_path: Path)
     question_bank.save_question_bank(path, first)
 
     assert json.loads(path.read_text(encoding="utf-8")) == first
+    assert "你好，世界 🌍".encode("utf-8") in path.read_bytes()
     assert question_bank.load_question_bank(path) == first
 
     question_bank.save_question_bank(path, replacement)
@@ -77,6 +87,7 @@ def test_save_refuses_to_replace_corrupt_bank_and_preserves_its_bytes(
     [
         {"question": 42},
         {3: "answer"},
+        {"question": " \t\n"},
         None,
     ],
 )
@@ -90,6 +101,37 @@ def test_invalid_proposed_mapping_is_rejected_before_disk_access(
 
     assert not isinstance(caught.value, question_bank.QuestionBankDataError)
     assert not path.parent.exists()
+
+
+def test_save_uses_a_snapshot_taken_before_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "question_file.json"
+    entries = {"question": "answer"}
+    validate = question_bank._is_question_bank
+
+    def mutate_caller_after_validation(candidate: object) -> bool:
+        valid = validate(candidate)
+        entries["question"] = "   "
+        return valid
+
+    monkeypatch.setattr(question_bank, "_is_question_bank", mutate_caller_after_validation)
+
+    question_bank.save_question_bank(path, entries)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"question": "answer"}
+
+
+def test_save_backslash_escapes_lone_surrogates_and_round_trips_them(tmp_path: Path) -> None:
+    path = tmp_path / "question_file.json"
+    entries = {"question\ud800": "answer\udfff"}
+
+    question_bank.save_question_bank(path, entries)
+
+    contents = path.read_bytes()
+    assert b"\\ud800" in contents
+    assert b"\\udfff" in contents
+    assert question_bank.load_question_bank(path) == entries
 
 
 def test_filesystem_errors_remain_distinct_from_question_bank_data_errors(tmp_path: Path) -> None:
@@ -109,12 +151,17 @@ def test_filesystem_errors_remain_distinct_from_question_bank_data_errors(tmp_pa
 
 
 @pytest.mark.parametrize("failure_point", ["write", "sync", "replace"])
+@pytest.mark.parametrize("existing", [True, False])
 def test_prepublication_failure_preserves_old_bytes_and_cleans_temporary_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    existing: bool,
 ) -> None:
     path = tmp_path / "question_file.json"
     old_bytes = b'{ "old": "snapshot" }\n'
-    path.write_bytes(old_bytes)
+    if existing:
+        path.write_bytes(old_bytes)
 
     def fail(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -136,8 +183,12 @@ def test_prepublication_failure_preserves_old_bytes_and_cleans_temporary_file(
     with pytest.raises(OSError, match=f"injected {failure_point} failure"):
         question_bank.save_question_bank(path, {"new": "snapshot"})
 
-    assert path.read_bytes() == old_bytes
-    assert {item.name for item in tmp_path.iterdir()} == {path.name}
+    if existing:
+        assert path.read_bytes() == old_bytes
+        assert {item.name for item in tmp_path.iterdir()} == {path.name}
+    else:
+        assert not path.exists()
+        assert not list(tmp_path.iterdir())
 
 
 def _join_worker(thread: Thread) -> None:
@@ -178,8 +229,7 @@ def test_reader_overlaps_publication_and_observes_a_complete_snapshot(
 
     def gated_replace(source: Path, destination: Path) -> None:
         replace_entered.set()
-        if not allow_replace.wait(timeout=5):
-            raise TimeoutError("test did not release the staged replacement")
+        allow_replace.wait()
         real_replace(source, destination)
 
     def write_new_snapshot() -> None:
@@ -217,8 +267,9 @@ def test_reader_overlaps_publication_and_observes_a_complete_snapshot(
     assert question_bank.load_question_bank(path) == new
 
 
+@pytest.mark.parametrize("first_writer", ["failing", "successful"])
 def test_failed_save_cannot_invalidate_a_concurrent_successful_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_writer: str
 ) -> None:
     path = tmp_path / "question_file.json"
     old = {"version": "old"}
@@ -227,17 +278,32 @@ def test_failed_save_cannot_invalidate_a_concurrent_successful_replacement(
     question_bank.save_question_bank(path, old)
 
     real_dump = question_bank.json.dump
-    failing_dump_entered = Event()
-    allow_failure = Event()
-    successful_call_started = Event()
+    real_lock = question_bank._bank_lock
+    first_dump_entered = Event()
+    allow_first_writer = Event()
     failure_errors: list[Exception] = []
     success_errors: list[Exception] = []
+    second_writer_contended = Event()
+
+    class ObservedBankLock:
+        def __enter__(self) -> ObservedBankLock:
+            if not real_lock.acquire(blocking=False):
+                if current_thread().name == "question-bank-second-writer":
+                    second_writer_contended.set()
+                real_lock.acquire()
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            del args
+            real_lock.release()
 
     def coordinated_dump(value: object, stream: Any, *args: Any, **kwargs: Any) -> None:
-        if value == broken:
-            failing_dump_entered.set()
-            if not allow_failure.wait(timeout=5):
-                raise TimeoutError("test did not release the failing writer")
+        if current_thread().name == "question-bank-first-writer":
+            first_dump_entered.set()
+            allow_first_writer.wait()
+            if value == broken:
+                raise OSError("injected concurrent write failure")
+        elif value == broken:
             raise OSError("injected concurrent write failure")
         real_dump(value, stream, *args, **kwargs)
 
@@ -247,23 +313,40 @@ def test_failed_save_cannot_invalidate_a_concurrent_successful_replacement(
         except Exception as error:
             errors.append(error)
 
-    def save_successful() -> None:
-        successful_call_started.set()
-        save(successful, success_errors)
-
     monkeypatch.setattr(question_bank.json, "dump", coordinated_dump)
-    failing_writer = Thread(target=save, args=(broken, failure_errors), daemon=True)
-    successful_writer = Thread(target=save_successful, daemon=True)
-    failing_writer.start()
+    monkeypatch.setattr(question_bank, "_bank_lock", ObservedBankLock())
+    first_entries, second_entries = (
+        (broken, successful) if first_writer == "failing" else (successful, broken)
+    )
+    first_errors, second_errors = (
+        (failure_errors, success_errors)
+        if first_writer == "failing"
+        else (success_errors, failure_errors)
+    )
+    first_thread = Thread(
+        target=save,
+        args=(first_entries, first_errors),
+        name="question-bank-first-writer",
+        daemon=True,
+    )
+    second_thread = Thread(
+        target=save,
+        args=(second_entries, second_errors),
+        name="question-bank-second-writer",
+        daemon=True,
+    )
+    first_thread.start()
     try:
-        assert failing_dump_entered.wait(timeout=5), "failing writer did not reach serialization"
-        successful_writer.start()
-        assert successful_call_started.wait(timeout=5), "successful save did not overlap failure"
+        assert first_dump_entered.wait(timeout=5), "first writer did not reach serialization"
+        second_thread.start()
+        assert second_writer_contended.wait(timeout=5), (
+            "second writer did not contend on the bank lock"
+        )
     finally:
-        allow_failure.set()
-        _join_worker(failing_writer)
-        if successful_writer.ident is not None:
-            _join_worker(successful_writer)
+        allow_first_writer.set()
+        _join_worker(first_thread)
+        if second_thread.ident is not None:
+            _join_worker(second_thread)
 
     assert len(failure_errors) == 1 and isinstance(failure_errors[0], OSError)
     assert not success_errors
