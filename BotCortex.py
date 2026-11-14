@@ -1413,11 +1413,14 @@ async def get_follow_up_question(txt, history):
         print("Follow up in local-only mode")
 
         his = "    ".join(history)
-        context = qgen_tokenizer.encode(
-            "Ask a followup question about the following text: " + " " + txt,
-            return_tensors="pt",
-        )
-        if qgen_model is not None and context is not None:
+        if qgen_model is not None and qgen_tokenizer is not None:
+            context = qgen_tokenizer.encode(
+                "Ask a followup question about the following text: " + " " + txt,
+                return_tensors="pt",
+            )
+        else:
+            context = None
+        if context is not None:
             question = qgen_model.generate(context, early_stopping=True)
             question = qgen_tokenizer.decode(question[0])
     else:
@@ -2193,11 +2196,11 @@ async def talk_small(text):
         no_repeat_ngram_size=2,
         early_stopping=False,
     )
-    # print(out)
-    print(tokenizer.decode(out[0], skip_special_tokens=True))
-    # print(out)
-    print(tokenizer.decode(out[0]), skip_special_tokens=True)
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+    prompt_length = prompt["input_ids"].shape[-1]
+    generated = out[:, prompt_length:][0]
+    reply = tokenizer.decode(generated, skip_special_tokens=True)
+    print(reply)
+    return reply
 
 
 async def init_fast():
@@ -2375,14 +2378,14 @@ async def is_requesting_SD(txt):
         print("ex: " + ex + "\n")
         print("examples[ex]: " + examples[ex] + "\n")
 
-        txt.append(
+        result.append(
             {
                 "role": "user",
                 "content": "Determine if the following question is asking for a drawing, image, or picture to be created, and then reply with True or False only:  "
                 + ex,
             }
         )
-        txt.append({"role": "assistant", "content": " Response: " + examples[ex]})
+        result.append({"role": "assistant", "content": " Response: " + examples[ex]})
 
     print("txt: ", txt)
 

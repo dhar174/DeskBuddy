@@ -8,16 +8,19 @@ from typing import Any
 
 import pytest
 
+from deskbuddy.settings import Settings
 from tests.support.fakes import (
     CallRecorder,
     FakeCommandModel,
     FakeNLIClassifier,
+    FakeOpenAISDK,
     FakeQuestionClassifier,
     FakeTokenizer,
 )
 from tests.support.legacy_runtime import (
     assert_no_new_heavy_imports,
     install_heavy_import_guard,
+    load_botcortex_runtime,
     load_helpers_runtime,
 )
 
@@ -225,6 +228,44 @@ def test_is_requesting_image_delegates_to_is_requesting_sd_when_not_local_only(
     assert result is True
     assert recorder.count("BotCortex.is_requesting_SD") == 1
     assert recorder.count("nli_classifier") == 0
+    assert_no_new_heavy_imports(loaded_before)
+
+
+@pytest.mark.parametrize(
+    ("model_reply", "expected"),
+    [("Response: True", True), ("Response: False", False)],
+)
+def test_real_is_requesting_sd_builds_valid_messages_and_classifies(
+    model_reply: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_before = install_heavy_import_guard(monkeypatch)
+    recorder = CallRecorder()
+    sdk = FakeOpenAISDK(recorder, chat_reply=model_reply)
+    cortex, _ = load_botcortex_runtime(
+        recorder=recorder,
+        local_only_mode=False,
+        openai_sdk=sdk,
+        settings=Settings(sd_classifier_model_id="integration-sd-model"),
+    )
+
+    result = asyncio.run(cortex["is_requesting_SD"]("Draw a spaceship"))
+
+    assert result is expected
+    (call,) = recorder.for_target("openai.ChatCompletion.create")
+    assert call.kwargs["model"] == "integration-sd-model"
+    messages = call.kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert all(isinstance(message, dict) for message in messages)
+    assert messages[-1] == {
+        "role": "user",
+        "content": (
+            "Determine if the following question is asking for a drawing, image, "
+            "or picture to be created, and then reply with True or False only: Draw a spaceship"
+        ),
+    }
+    assert len(messages) == 24
     assert_no_new_heavy_imports(loaded_before)
 
 

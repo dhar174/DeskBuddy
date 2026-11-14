@@ -12,7 +12,7 @@ from typing import Any
 
 from deskbuddy.settings import load_settings
 from transport.client import RobotClient, RobotTransport
-from transport.config import ClientConfig, TransportConfig, compute_command_timeout
+from transport.config import ClientConfig, TransportConfig
 from transport.protocol import (
     ExecutionOutcomeUnknown,
     TransportError,
@@ -53,7 +53,7 @@ async def get_robot_client() -> RobotClient:
 async def request_to_server(**kwargs: Any) -> Any:
     """Send a command to the robot server and return the result.
 
-    Maintains backward compatibility with legacy calls from start_bot.py:
+    Maintains backward compatibility with legacy callers:
         kwargs = {"function_name": "check_for_response"}
         kwargs = {"function_name": "reply", "message": "..."}
 
@@ -82,7 +82,9 @@ async def request_to_server(**kwargs: Any) -> Any:
         command = str(filtered_kwargs["command"])
         raw_args = filtered_kwargs.get("arguments", {})
         if isinstance(raw_args, dict):
-            arguments = {k: v for k, v in raw_args.items() if k not in ("timeout", "request_timeout")}
+            arguments = {
+                k: v for k, v in raw_args.items() if k not in ("timeout", "request_timeout")
+            }
         for k, v in filtered_kwargs.items():
             if k not in ("command", "arguments"):
                 arguments[k] = v
@@ -117,6 +119,12 @@ async def request_to_server(**kwargs: Any) -> Any:
         return None
 
 
+async def send_reply(message: str) -> None:
+    """Send speech, preserving typed failures for callers that need delivery status."""
+    client = await get_robot_client()
+    await client.reply(message)
+
+
 async def close_client() -> None:
     """Close the shared client connection."""
     global _shared_client, _shared_client_loop
@@ -135,7 +143,9 @@ __all__ = [
     "RobotClient",
     "RobotTransport",
     "TransportConfig",
+    "TransportError",
     "close_client",
     "get_robot_client",
     "request_to_server",
+    "send_reply",
 ]

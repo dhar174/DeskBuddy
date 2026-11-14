@@ -8,6 +8,34 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+FOLLOW_UP_1 = ("needs a follow-up question", "needs a statement response")
+FOLLOW_UP_2 = (
+    "there is enough info here to reply just fine",
+    "more info is needed here to reply appropriately",
+)
+FOLLOW_UP_3 = (
+    "I think I need to ask a question to understand",
+    "this sentence makes sense on its own",
+)
+VISUAL_Q = (
+    "question requiring vision to answer",
+    "question not requiring vision to answer",
+)
+PERSONAL_Q = ("personal question", "knowledge question")
+
+
+def nli_routes(
+    *, visual: bool = False, follow_up: bool = False, personal: bool = False
+) -> dict[tuple[str, ...], list[float]]:
+    """Scores that drive the legacy conversation's named classifier branches."""
+    return {
+        VISUAL_Q: [0.95, 0.05] if visual else [0.05, 0.95],
+        FOLLOW_UP_1: [0.9, 0.1] if follow_up else [0.1, 0.9],
+        FOLLOW_UP_2: [0.1, 0.9] if follow_up else [0.9, 0.1],
+        FOLLOW_UP_3: [0.9, 0.1] if follow_up else [0.1, 0.9],
+        PERSONAL_Q: [0.9, 0.1] if personal else [0.1, 0.9],
+    }
+
 
 @dataclass
 class CallRecord:

@@ -11,7 +11,7 @@ uv lock --check --offline
 uv run --no-sync pytest
 uv run --no-sync ruff check .
 uv run --no-sync mypy
-uv run --no-sync ruff format --check src transport tests
+uv run --no-sync ruff format --check src transport tests robot_client.py
 ```
 
 To test the other interpreter, set `UV_PYTHON` to `3.11` or `3.12` for the
@@ -25,11 +25,11 @@ Ubuntu CPU runners. The install can fetch locked core and dev packages. Pytest
 runs offline with no repository secrets, GPU libraries, pretrained model weights,
 physical devices, or live services.
 
-Ruff lint and formatting cover Python files in `src/`, `transport/`, and `tests/`.
-Mypy discovers production packages from the repository root, currently `src/` and
-`transport/`. Its configuration excludes tests, build outputs, Windows vendor
-copies, and flat legacy scripts. Tests may still exercise the legacy entry points
-with fakes. Those tests provide behavioral evidence within their asserted scope.
+Ruff lint and formatting cover Python files in `src/`, `transport/`, `tests/`,
+and the desktop transport adapter `robot_client.py`. Mypy checks `src/`,
+`transport/`, and that adapter. Its configuration excludes tests, build outputs,
+Windows vendor copies, and other flat legacy scripts. Tests exercise legacy entry
+points with fakes and provide behavioral evidence within their asserted scope.
 
 ## Offline contract tests
 
@@ -42,11 +42,18 @@ contract, including authenticated responses and safe timeout handling. These
 loopback tests run in the ordinary suite.
 
 Before test modules load, pytest isolates DeskBuddy's settings and known
-credential variables, sets Hugging Face offline controls, and masks the installed
-Picoh driver so legacy modules use their mock fallback. The Python socket guard
-permits loopback and blocks ordinary non-loopback socket calls and lookups in
-pytest. It applies to the pytest process. Use offline modes for subprocesses and
-fake native I/O boundaries in the tests that exercise them.
+credential variables, sets Hugging Face offline controls, and blocks imports of
+optional model, cloud, and device runtimes. The legacy robot adapter uses its
+mock Picoh fallback; tests that need an SDK or driver can supply an explicit fake.
+The Python socket guard permits loopback and blocks ordinary non-loopback
+socket calls and lookups in the pytest process. Plugin startup precedes these
+guards; use a clean core/dev install. Subprocesses and native I/O need their
+own offline or fake boundaries.
+
+`tests/test_pytest_isolation.py` checks the default process profile and proves a
+non-loopback lookup is stopped by the socket audit hook. `tmp_path` tests in
+`tests/test_legacy_config_contract.py` verify that memory files stay under an
+explicit temporary data directory and leave a checkout sentinel unchanged.
 
 The interactive root `test.py` was removed because it called async application
 functions without awaiting them. Use the pytest suite for automated verification.
@@ -61,17 +68,46 @@ directory and deselects any test with an optional marker elsewhere.
 | --- | --- | --- |
 | `hardware` | The actual robot, camera, microphone, or speakers needed by the test | `uv run --no-sync pytest --run-optional=hardware` |
 | `model_weights` | Locally provisioned weights and a compatible inference runtime | `uv run --no-sync pytest --run-optional=model_weights` |
-| `external_service` | A configured live endpoint and any credentials the test requires | `uv run --no-sync pytest --run-optional=external_service` |
+| `external_service` | A configured local robot service bound to loopback | `uv run --no-sync pytest --run-optional=external_service` |
 
 Install the relevant optional dependencies alongside `--group dev` in a separate
-environment. These commands select only the requested category. The repository
-currently has no tests in these categories, so selection reports no tests (exit
-code 5). A future test must check prerequisites in a fixture or in the test and
-call `pytest.skip()` with an explicit reason, or raise a configuration error,
-before initializing any device, model, or service client. Keep module imports safe
-for collection. Model runs retain Hugging Face offline controls and must use
-already provisioned assets. Live service and hardware runs use the operator's
-configured environment.
+environment. These commands select only the requested category. The external
+service template in `tests/optional/test_external_robot_service.py` requires
+explicit `DESKBUDDY_TEST_ROBOT_HOST`, `DESKBUDDY_TEST_ROBOT_PORT`, and
+`DESKBUDDY_TEST_ROBOT_AUTH_SECRET` values. It accepts only a loopback host and
+performs the read-only connectivity check (`simple_test`). Without configuration it skips before
+creating a client. Import and collection make no connection. Supply the settings
+only for an explicit run:
+
+```powershell
+$env:DESKBUDDY_TEST_ROBOT_HOST = '127.0.0.1'
+$env:DESKBUDDY_TEST_ROBOT_PORT = '8888'
+$env:DESKBUDDY_TEST_ROBOT_AUTH_SECRET = '<local test service secret>'
+uv run --no-sync pytest --run-optional=external_service
+```
+
+When `--run-optional` is supplied, pytest collects only from
+`tests/optional/`; the session rejects explicit paths outside that tree before
+collection, including mixed optional and ordinary test paths. Explicitly naming
+an optional test without `--run-optional` is also rejected; default root
+discovery still skips the optional directory. For the external service category,
+the temporary profile,
+credential scrubbing, runtime import block, offline flags, and loopback socket
+guard remain active. Only the three explicit `DESKBUDDY_TEST_ROBOT_*` variables
+are preserved for the external service category. The smoke test accepts
+`localhost` by mapping it directly to `127.0.0.1`, or accepts a loopback IP
+literal; it does not resolve arbitrary hostnames. A whitespace-only secret fails
+configuration validation, while a nonblank secret is passed unchanged.
+
+The `hardware` and `model_weights` categories preserve the operator's original
+environment and optional runtime imports so those tests can use provisioned
+devices, weights, settings, and credentials. Model weight tests still receive
+Hugging Face offline flags.
+
+The hardware and model-weight categories remain templates for future tests.
+Their tests must check prerequisites and skip before initializing a device,
+model, or service client. Model runs retain Hugging Face offline controls and
+must use already provisioned assets.
 
 Qualify real classifier accuracy and GPU memory, event-loop and lookup latency
 under Gate 2. Qualify physical movement, real speech latency, dialogue safety,

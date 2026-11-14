@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from deskbuddy.settings import Settings
-from tests.support.fakes import CallRecorder, FakeNLIClassifier, FakeOpenAISDK
+from tests.support.fakes import CallRecorder, FakeNLIClassifier, FakeOpenAISDK, nli_routes
 from tests.support.legacy_runtime import (
     assert_no_new_heavy_imports,
     install_heavy_import_guard,
@@ -17,60 +17,33 @@ from tests.support.legacy_runtime import (
     load_start_bot_dispatch,
 )
 
-FOLLOW_UP_1 = ("needs a follow-up question", "needs a statement response")
-FOLLOW_UP_2 = (
-    "there is enough info here to reply just fine",
-    "more info is needed here to reply appropriately",
-)
-FOLLOW_UP_3 = (
-    "I think I need to ask a question to understand",
-    "this sentence makes sense on its own",
-)
-VISUAL_Q = (
-    "question requiring vision to answer",
-    "question not requiring vision to answer",
-)
-PERSONAL_Q = ("personal question", "knowledge question")
-
-
-def _nli_routes(
-    *,
-    visual: bool = False,
-    follow_up: bool = False,
-    personal: bool = False,
-) -> dict[tuple[str, ...], list[float]]:
-    return {
-        VISUAL_Q: [0.95, 0.05] if visual else [0.05, 0.95],
-        FOLLOW_UP_1: [0.9, 0.1] if follow_up else [0.1, 0.9],
-        FOLLOW_UP_2: [0.1, 0.9] if follow_up else [0.9, 0.1],
-        FOLLOW_UP_3: [0.9, 0.1] if follow_up else [0.1, 0.9],
-        PERSONAL_Q: [0.9, 0.1] if personal else [0.1, 0.9],
-    }
-
-
 # ---------------------------------------------------------------------------
 # A. Normal conversation contracts
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("talk_fn", ["talk_history", "talk_medium_with_history", "talk_fast"])
+@pytest.mark.parametrize(
+    "talk_fn", ["talk_history", "talk_medium_with_history", "talk_fast", "talk_small"]
+)
 def test_normal_conversation_routes_to_selected_local_chat_model(
     talk_fn: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes())
+    nli = FakeNLIClassifier(recorder, routes=nli_routes())
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,
         nli_classifier=nli,
         is_question=False,
     )
-
     reply = asyncio.run(ns[talk_fn]("I played Zelda today"))
 
     assert reply == "LOCAL_MODEL_REPLY"
+    if talk_fn == "talk_small":
+        (decode_call,) = recorder.for_target("chat_tokenizer.decode")
+        assert decode_call.args[0].tolist() == [99, 100]
     assert recorder.count("chat_model.generate") == 1
     assert recorder.count("answer_visual_question") == 0
     assert recorder.count("load_qdict_from_json") == 0
@@ -89,7 +62,7 @@ def test_normal_conversation_routes_to_openai_chat_in_medium_api_mode(
         chat_reply="Cooper: That Zelda dungeon sounds awesome!",
         completion_reply="False",
     )
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes())
+    nli = FakeNLIClassifier(recorder, routes=nli_routes())
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=False,
@@ -124,7 +97,7 @@ def test_visual_question_with_useful_answer_returns_early_without_memory_or_loca
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(visual=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(visual=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,
@@ -153,7 +126,7 @@ def test_visual_question_in_medium_api_mode_rewords_vqa_answer_without_memory_or
         completion_reply="True",
         chat_reply="Response: Looks like you're holding a bright red mug!",
     )
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(visual=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(visual=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=False,
@@ -190,7 +163,7 @@ def test_visual_question_falls_back_to_generation_when_vqa_is_unavailable_or_unk
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(visual=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(visual=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,
@@ -218,7 +191,7 @@ def test_memory_hit_returns_early_without_invoking_local_generation(
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes())
+    nli = FakeNLIClassifier(recorder, routes=nli_routes())
     qdict = {
         "What is the capital of France?": "Paris is the capital of France",
         "Is the moon made of cheese?": "No, it is rock and dust.",
@@ -248,7 +221,7 @@ def test_memory_miss_falls_back_to_generation_and_sets_unfound_answer(
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes())
+    nli = FakeNLIClassifier(recorder, routes=nli_routes())
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,
@@ -349,7 +322,7 @@ def test_clarification_returns_follow_up_early_without_local_generation(
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(follow_up=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(follow_up=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,
@@ -385,7 +358,7 @@ def test_talk_medium_api_clarification_returns_followup_without_unbound_out_or_a
         raise AssertionError("No post-clarification ChatCompletion call should occur")
 
     openai_sdk = FakeOpenAISDK(recorder, chat_reply=chat_reply, completion_reply="False")
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(follow_up=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(follow_up=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=False,
@@ -413,7 +386,7 @@ def test_talk_history_nonlocal_clarification_does_not_corrupt_local_history_on_n
         chat_reply="Which app crashed?",
         completion_reply="False",
     )
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes(follow_up=True))
+    nli = FakeNLIClassifier(recorder, routes=nli_routes(follow_up=True))
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=False,
@@ -430,7 +403,7 @@ def test_talk_history_nonlocal_clarification_does_not_corrupt_local_history_on_n
     assert len(chat_calls) == 1
     assert all(isinstance(msg, dict) for msg in chat_calls[0].kwargs["messages"])
 
-    nli.routes = _nli_routes(follow_up=False)
+    nli.routes = nli_routes(follow_up=False)
     reply2 = asyncio.run(ns["talk_history"]("My browser crashed"))
     assert reply2 == "LOCAL_MODEL_REPLY"
     assert recorder.count("chat_model.generate") == 1
@@ -530,6 +503,7 @@ def test_get_follow_up_question_degrades_gracefully_when_qgen_model_missing(
     loaded_before = install_heavy_import_guard(monkeypatch)
     ns, _ = load_botcortex_runtime(local_only_mode=True)
     ns["qgen_model"] = None
+    ns["qgen_tokenizer"] = None
 
     question = asyncio.run(ns["get_follow_up_question"]("vague prompt", ["Human: hi"]))
 
@@ -545,7 +519,7 @@ def test_async_entrypoints_complete_without_unawaited_coroutine_warnings(
 ) -> None:
     loaded_before = install_heavy_import_guard(monkeypatch)
     recorder = CallRecorder()
-    nli = FakeNLIClassifier(recorder, routes=_nli_routes())
+    nli = FakeNLIClassifier(recorder, routes=nli_routes())
     ns, _ = load_botcortex_runtime(
         recorder=recorder,
         local_only_mode=True,

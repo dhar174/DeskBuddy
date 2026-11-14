@@ -11,11 +11,14 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
+from tests.support.legacy_runtime import HEAVY_MODULES
 from transport.config import TransportConfig
 
 TEST_SECRET = "test-deskbuddy-secret-32-chars-long-abc!"
 OPTIONAL_MARKERS = ("hardware", "model_weights", "external_service")
 OPTIONAL_TESTS = Path(__file__).resolve().parent / "optional"
+# The robot adapter imports tkinter but does not open a GUI for loopback tests.
+BLOCKED_RUNTIME_IMPORTS = HEAVY_MODULES - {"tkinter"}
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -27,10 +30,40 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    category = config.getoption("--run-optional")
+    # Optional runs select only their isolated templates. This also means a
+    # command that names the repository root cannot include ordinary contract
+    # modules without the Gate 1 boundary.
+    if category is not None:
+        path = Path(collection_path)
+        return not (path.is_relative_to(OPTIONAL_TESTS) or OPTIONAL_TESTS.is_relative_to(path))
     # Avoid importing opt-in modules (and their optional dependencies) in Gate 1.
-    if not config.getoption("--run-optional") and collection_path.is_relative_to(OPTIONAL_TESTS):
+    if collection_path.is_relative_to(OPTIONAL_TESTS):
         return True
     return None
+
+
+def _validate_explicit_collection_args(
+    args: list[str], invocation_dir: Path, category: str | None
+) -> None:
+    for argument in args:
+        # Pytest accepts file::test selectors; only the filesystem portion is
+        # relevant to the isolation boundary.
+        path_text = argument.split("::", maxsplit=1)[0]
+        if not path_text or path_text.startswith("-"):
+            continue
+        path = (invocation_dir / path_text).resolve()
+        is_optional = path.is_relative_to(OPTIONAL_TESTS)
+        if category is not None:
+            if not is_optional and not OPTIONAL_TESTS.is_relative_to(path):
+                raise pytest.UsageError(
+                    "--run-optional only accepts paths under tests/optional "
+                    "or their directory ancestors"
+                )
+        elif is_optional:
+            raise pytest.UsageError(
+                "tests/optional paths require an explicit --run-optional category"
+            )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -59,19 +92,28 @@ def _is_loopback(host: str | bytes) -> bool:
 
 def pytest_configure(config: pytest.Config) -> None:
     category = config.getoption("--run-optional")
+    _validate_explicit_collection_args(config.args, config.invocation_params.dir, category)
     env = pytest.MonkeyPatch()
     config.add_cleanup(env.undo)
     if category in (None, "model_weights"):
         env.setenv("HF_HUB_OFFLINE", "1")
         env.setenv("HF_DATASETS_OFFLINE", "1")
         env.setenv("TRANSFORMERS_OFFLINE", "1")
-    if category is not None:
+    if category in {"hardware", "model_weights"}:
+        # These categories deliberately exercise user-provisioned devices,
+        # weights, runtimes, credentials, and configuration in tests/optional.
         return
-
     test_profile = TemporaryDirectory(prefix="deskbuddy-tests-")
     config.add_cleanup(test_profile.cleanup)
     for name in tuple(os.environ):
-        if name.startswith(("DESKBUDDY_", "OPENAI_")) or name in {
+        explicit_optional_robot_config = category == "external_service" and name in {
+            "DESKBUDDY_TEST_ROBOT_HOST",
+            "DESKBUDDY_TEST_ROBOT_PORT",
+            "DESKBUDDY_TEST_ROBOT_AUTH_SECRET",
+        }
+        if (
+            name.startswith(("DESKBUDDY_", "OPENAI_")) and not explicit_optional_robot_config
+        ) or name in {
             "API_KEY",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
@@ -87,10 +129,24 @@ def pytest_configure(config: pytest.Config) -> None:
     ):
         env.setenv(name, test_profile.name)
     env.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    env.setenv("DESKBUDDY_MOCK_HARDWARE", "1")
+    if category is None:
+        env.setenv("DESKBUDDY_MOCK_HARDWARE", "1")
     env.setenv("UV_OFFLINE", "1")
-    # The legacy adapter tries the real driver before falling back to MockPicoh.
-    env.setitem(sys.modules, "picoh", None)
+    # Block optional runtimes in Gate 1 and the read-only external smoke test.
+    # Hardware/model tests are explicitly selected templates where the requested
+    # runtime is the subject of the test.
+    if category in (None, "external_service"):
+        preloaded = {
+            module.partition(".")[0]
+            for module, loaded in sys.modules.copy().items()
+            if loaded is not None and module.partition(".")[0] in BLOCKED_RUNTIME_IMPORTS
+        }
+        if preloaded:
+            raise pytest.UsageError(
+                f"Gate 1 runtime imported before isolation: {', '.join(sorted(preloaded))}"
+            )
+        for module in BLOCKED_RUNTIME_IMPORTS:
+            env.setitem(sys.modules, module, None)
 
     active = True
 
