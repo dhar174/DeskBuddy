@@ -5,11 +5,13 @@ if "--headless" in sys.argv[1:]:
 
     raise SystemExit(headless_main())
 
-from deskbuddy.settings import load_settings
+from deskbuddy.settings import SettingsError, load_settings
 
 local_only = load_settings().model_provider != "openai"
 
 import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
 import helpers
 import time
 from scipy.io.wavfile import write
@@ -28,6 +30,7 @@ import threading
 import BotCortex
 
 import tkinter as tk
+from tkinter import messagebox
 
 import robot_client as rc
 
@@ -221,5 +224,51 @@ async def main():
         await asyncio.sleep(0.1)
 
 
+def configure_botcortex_logging():
+    logger = logging.getLogger("BotCortex")
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    if logger.handlers:
+        return
+    if sys.stderr is None:
+        try:
+            cache_dir = load_settings().cache_dir
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                cache_dir / "botcortex.log",
+                maxBytes=256 * 1024,
+                backupCount=1,
+                encoding="utf-8",
+            )
+        except (OSError, SettingsError) as error:
+            handler = logging.NullHandler()
+            warning = (
+                "Cannot load the settings for BotCortex diagnostics."
+                if isinstance(error, SettingsError)
+                else "Cannot write BotCortex diagnostics to the configured cache directory."
+            )
+
+            def show_logging_warning():
+                try:
+                    messagebox.showwarning(
+                        "DeskBuddy diagnostics",
+                        warning,
+                        parent=root,
+                    )
+                except tk.TclError:
+                    pass
+
+            # Wait until the model chooser is running before showing a dialog.
+            try:
+                root.after_idle(show_logging_warning)
+            except tk.TclError:
+                pass
+    else:
+        handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+
+
 if __name__ == "__main__":
+    configure_botcortex_logging()
     asyncio.run(main())
