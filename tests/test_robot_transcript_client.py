@@ -79,6 +79,19 @@ async def test_success_response_cannot_contain_an_error_object(monkeypatch):
         await robot_client.TranscriptPoller().next_transcript()
 
 
+async def test_transcript_poll_masks_an_unrecognized_server_diagnostic(monkeypatch):
+    client = ScriptedRobotClient(
+        response(ok=False, error={"code": "internal_error", "message": "private server detail"})
+    )
+    await install_client(monkeypatch, client)
+
+    with pytest.raises(robot_client.TransportError) as failure:
+        await robot_client.TranscriptPoller().next_transcript()
+
+    assert failure.value.code == TransportErrorCode.INTERNAL_ERROR
+    assert failure.value.message == "Robot transcript request failed"
+
+
 async def test_unsupported_poll_with_result_does_not_enter_legacy_mode(monkeypatch):
     client = ScriptedRobotClient(
         response(

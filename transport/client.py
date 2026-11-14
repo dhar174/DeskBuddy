@@ -139,12 +139,14 @@ class RobotClient(RobotTransport):
         while attempt < max_attempts:
             attempt += 1
             try:
+                connection_started_at = asyncio.get_running_loop().time()
                 connect_coro = asyncio.open_connection(self.config.host, self.config.port)
                 new_reader, new_writer = await asyncio.wait_for(
                     connect_coro, timeout=self.config.connect_timeout
                 )
                 self._reader = new_reader
                 self._writer = new_writer
+                self._last_request_started_at = connection_started_at
                 self._connection_generation += 1
                 logger.debug(
                     "Connected to robot server at %s:%d (attempt %d/%d)",
@@ -260,13 +262,6 @@ class RobotClient(RobotTransport):
             transmission_attempted = False
             request: RobotRequest | None = None
 
-            connect_deadline = loop.time() + connect_budget if connect_budget is not None else None
-            if timeout is not None:
-                deadline = start_time + timeout
-                connect_deadline = (
-                    min(deadline, connect_deadline) if connect_deadline is not None else deadline
-                )
-
             async def connect(
                 *, refresh: bool = False
             ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -275,9 +270,14 @@ class RobotClient(RobotTransport):
                         await self._disconnect()
                     return await self._ensure_connected()
 
-                if connect_deadline is None:
+                remaining = connect_budget
+                if timeout is not None:
+                    until_deadline = start_time + timeout - loop.time()
+                    remaining = (
+                        min(until_deadline, remaining) if remaining is not None else until_deadline
+                    )
+                if remaining is None:
                     return await open_or_reuse()
-                remaining = connect_deadline - loop.time()
                 if remaining <= 0:
                     raise TransportError(
                         TransportErrorCode.TIMEOUT,

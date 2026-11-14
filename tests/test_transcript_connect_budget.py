@@ -8,7 +8,12 @@ import robot_client
 from transport import client as client_module
 from transport.client import RobotClient
 from transport.config import TransportConfig
-from transport.protocol import TransportError, TransportErrorCode
+from transport.protocol import (
+    PayloadTooLargeError,
+    RobotResponse,
+    TransportError,
+    TransportErrorCode,
+)
 from transport.registry import validate_reply_arguments
 from transport.server import RobotServer
 from transport.transcripts import TRANSCRIPT_MODE_MISMATCH_MESSAGE, TranscriptQueue
@@ -49,6 +54,67 @@ async def test_desktop_connection_budget_bounds_stalled_socket_setup(
     assert connect_entered.is_set()
     assert connect_cancelled.is_set()
     assert client.connection_generation == 0
+
+
+async def test_safe_poll_gets_a_fresh_connect_budget_after_response_loss(
+    ephemeral_server_config: TransportConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = TranscriptQueue()
+    server = RobotServer(ephemeral_server_config, transcript_queue=queue)
+    process = server._process_request_payload
+    send = server._send_response
+    first_response = RobotResponse.success(None)
+
+    async def drop_first_request_before_dispatch(payload):
+        if not dropped:
+            return first_response
+        return await process(payload)
+
+    dropped = False
+
+    async def send_after_initial_budget(writer, response):
+        nonlocal dropped
+        if response is first_response:
+            dropped = True
+            await asyncio.sleep(0.35)
+            writer.close()
+        else:
+            await send(writer, response)
+
+    monkeypatch.setattr(server, "_process_request_payload", drop_first_request_before_dispatch)
+    monkeypatch.setattr(server, "_send_response", send_after_initial_budget)
+    await server.start()
+    try:
+        config = ephemeral_server_config.with_overrides(port=server.port)
+        async with RobotClient(config) as client:
+            assert queue.enqueue("pending")
+            response = await client.request("poll_transcript", connect_budget=0.25)
+            assert response.ok
+            assert response.result["text"] == "pending"
+            assert client.connection_generation == 2
+    finally:
+        await server.stop()
+
+
+async def test_unsent_first_request_still_leaves_an_age_for_socket_refresh(
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    server = RobotServer(ephemeral_server_config)
+    server.register("say", lambda _args: None, validate_reply_arguments)
+    await server.start()
+    try:
+        config = ephemeral_server_config.with_overrides(port=server.port, max_payload_size=512)
+        async with RobotClient(config) as client:
+            with pytest.raises(PayloadTooLargeError):
+                await client.say("x" * 600)
+
+            assert client.connection_generation == 1
+            assert client._last_request_started_at is not None
+            client._last_request_started_at -= config.read_timeout
+            await client.say("Hello")
+            assert client.connection_generation == 2
+    finally:
+        await server.stop()
 
 
 async def test_aged_exchange_refreshes_socket_before_other_side_effecting_command(

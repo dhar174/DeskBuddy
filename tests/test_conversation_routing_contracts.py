@@ -273,7 +273,7 @@ def test_query_memory_regression_rejects_empty_and_unknown_sentinels_without_ins
     ns, _ = load_botcortex_runtime(recorder=recorder)
     observed_qdict: dict[str, str] = {"q1": "a1", "q2": "a2"}
 
-    async def fake_load() -> dict[str, str]:
+    async def fake_load(*, allow_unavailable: bool = False) -> dict[str, str]:
         recorder.record("load_qdict_from_json")
         return observed_qdict
 

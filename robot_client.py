@@ -263,6 +263,7 @@ __all__ = [
     "RobotClient",
     "RobotTransport",
     "SettingsError",
+    "TRANSCRIPT_MODE_MISMATCH_MESSAGE",
     "TransportConfig",
     "TransportError",
     "TranscriptPoller",

@@ -10,11 +10,12 @@ from transport.transcripts import TranscriptQueue
 
 
 @pytest.mark.parametrize("invalid_id", ["x" * 37, "café", "line\nbreak"])
+@pytest.mark.parametrize("command", ["poll_transcript", "ack_transcript"])
 async def test_invalid_transcript_request_omits_unsafe_correlation_id(
-    ephemeral_server_config: TransportConfig, invalid_id: str
+    ephemeral_server_config: TransportConfig, invalid_id: str, command: str
 ) -> None:
     server = RobotServer(ephemeral_server_config, transcript_queue=TranscriptQueue())
-    request = RobotRequest.create(command="poll_transcript", request_id=invalid_id)
+    request = RobotRequest.create(command=command, request_id=invalid_id)
     sign_request(ephemeral_server_config.secret, request)
 
     response = await server._process_request_payload(request.to_json().encode("utf-8"))
