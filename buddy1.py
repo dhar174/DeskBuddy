@@ -92,12 +92,14 @@ from transport import (
     validate_move_arguments,
     validate_wait_arguments,
 )
+from transport.transcripts import TranscriptQueue, is_valid_transcript_text
 
 # State tracking globals
 lastReplyMessage = ""
 priorReplyMessage = ""
 lastTranscription = ""
 priorTranscription = ""
+transcript_queue = TranscriptQueue()
 
 
 class MyFunctions:
@@ -114,8 +116,6 @@ class MyFunctions:
         print("Checking for response")
 
         if lastTranscription != "" and lastTranscription != priorTranscription:
-            print(priorTranscription)
-            print(lastTranscription)
             return lastTranscription
         else:
 
@@ -218,11 +218,20 @@ class MyFunctions:
         global lastReplyMessage
         global priorReplyMessage
         print("in send_response")
+        if not is_valid_transcript_text(text):
+            recorded = False
+            recording = False
+            result = None
+            transcript_queue.enqueue(text)
+            return
         recorded = False
         recording = False
         priorTranscription = lastTranscription
         lastTranscription = text
         result = None
+        transcript_queue.enqueue(text)
+        if transcript_queue.polling_mode == "legacy":
+            transcript_queue.fits_legacy_response(text)
         return
 
     async def reply(text):
@@ -383,10 +392,10 @@ class MyFunctions:
                     result = model.transcribe(
                         await MyFunctions.picoh_get_input_path())
                     await MyFunctions.picoh_wait(0.25)
-                    print(result["text"])
-                if (result != None and result["text"].replace(" ", "") != ""):
+                transcript_text = result.get("text") if isinstance(result, dict) else None
+                if is_valid_transcript_text(transcript_text):
                     resp = await MyFunctions.send_response(
-                        result["text"])
+                        transcript_text)
                 else:
                     recorded = False
                     recording = False
@@ -414,7 +423,13 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
 
     # Register allowed DeskBuddy operations with strict validators
     async def _handle_check_for_response(args: dict) -> Any:
-        return await MyFunctions.check_for_response()
+        transcript_queue.select_polling_mode("legacy")
+        text = await MyFunctions.check_for_response()
+        if text == "No transcription":
+            return text
+        if is_valid_transcript_text(text) and transcript_queue.fits_legacy_response(text) is not True:
+            return "No transcription"
+        return text
 
     registry.register(
         "check_for_response",
@@ -476,7 +491,12 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
     registry.register("wait", _handle_wait, validate_wait_arguments)
     registry.register("picoh_wait", _handle_wait, validate_wait_arguments)
 
-    return RobotServer(config=cfg, registry=registry, hardware_executor=get_default_hardware_executor())
+    return RobotServer(
+        config=cfg,
+        registry=registry,
+        hardware_executor=get_default_hardware_executor(),
+        transcript_queue=transcript_queue,
+    )
 
 
 async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:

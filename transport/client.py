@@ -29,7 +29,7 @@ from transport.protocol import (
 logger = logging.getLogger(__name__)
 
 SAFE_IDEMPOTENT_COMMANDS: frozenset[str] = frozenset(
-    {"ping", "simple_test", "check_for_response", "test_timing", "hang"}
+    {"ping", "simple_test", "check_for_response", "poll_transcript", "test_timing", "hang"}
 )
 
 KNOWN_PHYSICAL_COMMANDS: frozenset[str] = frozenset(
@@ -45,12 +45,13 @@ KNOWN_PHYSICAL_COMMANDS: frozenset[str] = frozenset(
         "picoh_wait",
     }
 )
+NON_RETRYABLE_COMMANDS = KNOWN_PHYSICAL_COMMANDS | {"ack_transcript"}
 
 
 def is_side_effecting_command(command: str) -> bool:
     """Determine whether a command has potential side effects on physical hardware/state."""
     cmd_lower = command.lower()
-    if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+    if cmd_lower in NON_RETRYABLE_COMMANDS:
         return True
     return cmd_lower not in SAFE_IDEMPOTENT_COMMANDS
 
@@ -104,15 +105,30 @@ class RobotClient(RobotTransport):
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._connection_generation = 0
+        self._last_request_started_at: float | None = None
         self._lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
+        reader, writer = self._reader, self._writer
+        return (
+            reader is not None
+            and reader.exception() is None
+            and not reader.at_eof()
+            and writer is not None
+            and not writer.is_closing()
+        )
+
+    @property
+    def connection_generation(self) -> int:
+        """Increment when a new socket connects, including after a failed request."""
+        return self._connection_generation
 
     async def _ensure_connected(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        if self._reader is not None and self._writer is not None and not self._writer.is_closing():
-            return self._reader, self._writer
+        reader, writer = self._reader, self._writer
+        if reader is not None and writer is not None and self.is_connected:
+            return reader, writer
 
         await self._disconnect()
 
@@ -124,11 +140,12 @@ class RobotClient(RobotTransport):
             attempt += 1
             try:
                 connect_coro = asyncio.open_connection(self.config.host, self.config.port)
-                reader, writer = await asyncio.wait_for(
+                new_reader, new_writer = await asyncio.wait_for(
                     connect_coro, timeout=self.config.connect_timeout
                 )
-                self._reader = reader
-                self._writer = writer
+                self._reader = new_reader
+                self._writer = new_writer
+                self._connection_generation += 1
                 logger.debug(
                     "Connected to robot server at %s:%d (attempt %d/%d)",
                     self.config.host,
@@ -136,7 +153,7 @@ class RobotClient(RobotTransport):
                     attempt,
                     max_attempts,
                 )
-                return reader, writer
+                return new_reader, new_writer
             except (OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 logger.debug(
@@ -163,6 +180,7 @@ class RobotClient(RobotTransport):
         writer = self._writer
         self._reader = None
         self._writer = None
+        self._last_request_started_at = None
         if writer is not None:
             try:
                 writer.close()
@@ -182,21 +200,25 @@ class RobotClient(RobotTransport):
         timeout: float | None = None,
         side_effects: bool | None = None,
         request_id: str | None = None,
+        expected_connection_generation: int | None = None,
+        connect_budget: float | None = None,
     ) -> RobotResponse:
         """Send an authenticated command and wait for a verified response.
 
         Never retries potentially executed physical commands.
         Retries only safe/idempotent commands or pre-transmission failures.
+        A request pinned to a connection cannot be sent after reconnecting.
+        A connect budget caps socket setup separately from the response deadline.
         """
         if timeout is not None:
             timeout = validate_timeout_override(timeout)
+        if connect_budget is not None:
+            connect_budget = validate_timeout_override(connect_budget)
 
         # Conservative side-effect classification:
-        # Known physical commands are unconditionally side-effecting.
-        # Explicit side_effects=True can upgrade an otherwise safe command,
-        # but side_effects=False can NEVER weaken protections on known physical commands.
+        # Physical commands and transcript claims may never be retried after transmission.
         cmd_lower = command.lower()
-        if cmd_lower in KNOWN_PHYSICAL_COMMANDS:
+        if cmd_lower in NON_RETRYABLE_COMMANDS:
             is_side_effecting = True
         elif side_effects is not None:
             is_side_effecting = side_effects
@@ -222,7 +244,7 @@ class RobotClient(RobotTransport):
         lock_timeout = (
             effective_timeout
             if timeout is not None
-            else self.config.connect_timeout + self.config.request_timeout
+            else (connect_budget or self.config.connect_timeout) + self.config.request_timeout
         )
         lock_acquired = False
         try:
@@ -238,28 +260,62 @@ class RobotClient(RobotTransport):
             transmission_attempted = False
             request: RobotRequest | None = None
 
-            # Phase 2: Ensure connection (pre-transmission)
-            # Dedicated bounded budget so slow connection establishment does not
-            # consume the server execution plus response-grace deadline.
+            connect_deadline = loop.time() + connect_budget if connect_budget is not None else None
             if timeout is not None:
-                elapsed = loop.time() - start_time
-                remaining_for_connect = timeout - elapsed
-                if remaining_for_connect <= 0:
+                deadline = start_time + timeout
+                connect_deadline = (
+                    min(deadline, connect_deadline) if connect_deadline is not None else deadline
+                )
+
+            async def connect(
+                *, refresh: bool = False
+            ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                async def open_or_reuse() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                    if refresh:
+                        await self._disconnect()
+                    return await self._ensure_connected()
+
+                if connect_deadline is None:
+                    return await open_or_reuse()
+                remaining = connect_deadline - loop.time()
+                if remaining <= 0:
                     raise TransportError(
                         TransportErrorCode.TIMEOUT,
-                        f"Request timed out after {elapsed:.2f}s before connection",
+                        "Connection budget exhausted before transmission",
                     )
                 try:
-                    reader, writer = await asyncio.wait_for(
-                        self._ensure_connected(), timeout=remaining_for_connect
-                    )
+                    return await asyncio.wait_for(open_or_reuse(), timeout=remaining)
                 except asyncio.TimeoutError as exc:
                     raise TransportError(
                         TransportErrorCode.TIMEOUT,
-                        f"Connection timed out after {remaining_for_connect:.2f}s before transmission",
+                        "Connection budget exhausted before transmission",
                     ) from exc
+
+            # Phase 2: Ensure connection before attempting transmission.
+            if expected_connection_generation is not None:
+                pinned_reader, pinned_writer = self._reader, self._writer
+                if (
+                    self.connection_generation != expected_connection_generation
+                    or pinned_reader is None
+                    or pinned_writer is None
+                    or not self.is_connected
+                ):
+                    raise TransportError(
+                        TransportErrorCode.INTERNAL_ERROR,
+                        "Robot connection changed before the request was sent",
+                    )
+                reader, writer = pinned_reader, pinned_writer
             else:
-                reader, writer = await self._ensure_connected()
+                # The server cannot start its idle timer before our preceding
+                # request starts. Allow additional room for scheduling and transit.
+                read_timeout = self.config.read_timeout
+                idle_limit = read_timeout - min(1.0, read_timeout * 0.2)
+                refresh = (
+                    is_side_effecting
+                    and self._last_request_started_at is not None
+                    and loop.time() - self._last_request_started_at >= idle_limit
+                )
+                reader, writer = await connect(refresh=refresh)
 
             # Phase 3: Transmission and response deadline (starts after connection succeeds)
             if timeout is not None:
@@ -297,6 +353,7 @@ class RobotClient(RobotTransport):
                 if is_side_effecting:
                     # Side-effecting command: single transmission attempt, no blind retransmission
                     transmission_attempted = True
+                    sent_at = loop.time()
                     try:
                         await write_frame(
                             writer,
@@ -365,7 +422,7 @@ class RobotClient(RobotTransport):
                     for send_attempt in range(2):
                         if send_attempt > 0:
                             try:
-                                reader, writer = await self._ensure_connected()
+                                reader, writer = await connect()
                             except Exception as exc:
                                 if transmission_attempted:
                                     raise ExecutionOutcomeUnknown(
@@ -379,6 +436,7 @@ class RobotClient(RobotTransport):
                                 raise
                         try:
                             transmission_attempted = True
+                            sent_at = loop.time()
                             await write_frame(
                                 writer,
                                 request_bytes,
@@ -396,7 +454,7 @@ class RobotClient(RobotTransport):
                                 "Connection dropped during attempt %d: %s", send_attempt, exc
                             )
                             await self._disconnect()
-                            if send_attempt == 1:
+                            if send_attempt == 1 or expected_connection_generation is not None:
                                 raise TransportError(
                                     TransportErrorCode.INTERNAL_ERROR,
                                     f"Connection interrupted during request: {exc}",
@@ -474,6 +532,8 @@ class RobotClient(RobotTransport):
                             code=err_code or TransportErrorCode.UNAUTHORIZED,
                         ) from underlying
                     raise underlying
+
+                self._last_request_started_at = sent_at
 
                 # Check for explicit replayed_request or execution_outcome_unknown error codes
                 if not response.ok and response.error:
@@ -558,10 +618,16 @@ class RobotClient(RobotTransport):
             )
         return response.result
 
-    async def reply(self, message: str, *, timeout: float | None = None) -> Any:
+    async def reply(
+        self, message: str, *, timeout: float | None = None, connect_budget: float | None = None
+    ) -> Any:
         """Send a reply text message for Picoh to speak."""
         response = await self.request(
-            "reply", {"message": message}, timeout=timeout, side_effects=True
+            "reply",
+            {"message": message},
+            timeout=timeout,
+            connect_budget=connect_budget,
+            side_effects=True,
         )
         if not response.ok:
             raise TransportError(

@@ -210,6 +210,56 @@ See the [testing guide](testing.md) for the locked CPU-only checks and loopback
 transport tests. Keep the repository root a non-package (no root `__init__.py`);
 production packages belong under `src/` or in the temporary `transport/` boundary.
 
+### Transcript delivery
+
+Run one desktop conversation client per robot and one robot server per adapter
+process. Server instances in the same legacy adapter process share capture
+state, so starting another instance can clear the first instance's queue.
+Updated robot adapters queue up to 32 finalized nonblank transcripts in memory,
+in capture order. Each utterance gets its own ID, so separate utterances with
+identical text can both reach the desktop. A full queue rejects new arrivals.
+Transcripts too large for a signed poll response are rejected. Those warnings
+omit transcript text.
+
+The desktop begins a turn after an authenticated acknowledgement confirms that
+the robot removed the queued transcript. Polling and acknowledging use two
+authenticated requests on the same connection. A lost poll response leaves it
+pending.
+A lost acknowledgement can lose that turn if removal already happened. A
+desktop crash after acknowledgement can also lose that turn. A reconnect can
+deliver pending entries, while a robot restart clears the in-memory queue.
+Uncertain speech delivery still uses `ExecutionOutcomeUnknown` and does not
+resend the speech action. Before an unpinned side-effecting request, the client
+opens a fresh socket once the previous exchange is older than the configured
+read timeout minus a safety margin, measured from when the client sent that
+request. The margin is 20% of the timeout, capped at one second. Observed
+socket closures also trigger pre-send
+reconnection. Desktop polling and speech each use the configured connect
+timeout as a separate socket setup budget. An acknowledgement stays on the
+poll connection and retains the standard response grace. Empty polls wait 100
+ms. Polling failures back off from 100 ms to 5 seconds and reset the delay
+after a successful poll.
+
+An older desktop can still use an updated robot via `check_for_response`. An
+updated desktop warns and falls back to legacy text polling for a connection
+when the authenticated robot explicitly reports that `poll_transcript` is
+unsupported. Legacy text deduplication carries across a socket replacement
+preceding speech so the client can suppress the same stale value on the next
+poll. It resets when polling reconnects, which can expose stale text because
+legacy servers send no utterance identity. The first transcript poll selects
+the robot server's mode.
+Legacy polling discards any pending ID entries and keeps only the adapter's
+latest-text behavior. Text that exceeds the signed legacy response limit is
+skipped. Restart the robot server to switch between legacy and ID-based polling.
+The server rejects a request for the other mode until then.
+
+Listening during playback can capture the robot's own speech as a new
+utterance. [#35](https://github.com/dhar174/DeskBuddy/issues/35) tracks capture
+and transcription. [#36](https://github.com/dhar174/DeskBuddy/issues/36)
+tracks playback and capture coordination.
+[#37](https://github.com/dhar174/DeskBuddy/issues/37) tracks measuring and
+bounding event-loop blocking, including synchronous capture and inference.
+
 ## Larynx Docker limitation
 
 `larynx.Dockerfile` is retained byte-for-byte. It builds a Debian `.deb` under

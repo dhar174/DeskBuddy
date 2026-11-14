@@ -10,13 +10,23 @@ import asyncio
 import logging
 from typing import Any
 
+from deskbuddy.settings import SettingsError as SettingsError
 from deskbuddy.settings import load_settings
 from transport.client import RobotClient, RobotTransport
 from transport.config import ClientConfig, TransportConfig
 from transport.protocol import (
     ExecutionOutcomeUnknown,
+    ProtocolViolationError,
+    RobotResponse,
     TransportError,
+    TransportErrorCode,
     validate_timeout_override,
+)
+from transport.transcripts import (
+    ACK_TRANSCRIPT_COMMAND,
+    POLL_TRANSCRIPT_COMMAND,
+    TRANSCRIPT_MODE_MISMATCH_MESSAGE,
+    is_transcript_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,10 +129,120 @@ async def request_to_server(**kwargs: Any) -> Any:
         return None
 
 
+def _transcript_result(response: RobotResponse) -> Any:
+    if not response.ok:
+        error = response.error or {}
+        code, message = error.get("code"), error.get("message")
+        if not isinstance(code, str) or not isinstance(message, str) or response.result is not None:
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST,
+                "Invalid transcript error response",
+            )
+        if (
+            code == TransportErrorCode.INVALID_ARGUMENTS
+            and message == TRANSCRIPT_MODE_MISMATCH_MESSAGE
+        ):
+            raise TransportError(code, message)
+        raise TransportError(code, "Robot transcript request failed")
+    if response.error is not None:
+        raise ProtocolViolationError(
+            TransportErrorCode.MALFORMED_REQUEST,
+            "Unexpected error on successful transcript response",
+        )
+    return response.result
+
+
+class TranscriptPoller:
+    """Deliver only positively acknowledged utterances to the conversation loop."""
+
+    def __init__(self) -> None:
+        self._legacy_connection: tuple[RobotClient, int] | None = None
+        self._last_legacy_text: str | None = None
+
+    async def next_transcript(self) -> str | None:
+        """Run one poll, with one acknowledgement if the new API delivers a record."""
+        client = await get_robot_client()
+        connection = (client, client.connection_generation)
+        if self._legacy_connection == connection and client.is_connected:
+            return await self._poll_legacy(client, connection[1])
+
+        # Speech can renew the socket on a slow turn. Preserve the text in
+        # that case so our own reconnect cannot replay the turn on a legacy robot.
+        carry_legacy_text = (
+            self._legacy_connection is not None
+            and self._legacy_connection[0] is client
+            and client.is_connected
+        )
+        response = await client.request(
+            POLL_TRANSCRIPT_COMMAND, connect_budget=client.config.connect_timeout
+        )
+        generation = client.connection_generation
+        error = response.error or {}
+        if (
+            not response.ok
+            and response.result is None
+            and error.get("code") == TransportErrorCode.UNSUPPORTED_COMMAND
+            and isinstance(error.get("message"), str)
+        ):
+            self._legacy_connection = (client, generation)
+            if not carry_legacy_text or generation != connection[1]:
+                self._last_legacy_text = None
+            logger.warning("Robot server lacks utterance IDs; using legacy text polling")
+            return await self._poll_legacy(client, generation)
+
+        self._legacy_connection = None
+        self._last_legacy_text = None
+        record = _transcript_result(response)
+        if record is None:
+            return None
+        if not isinstance(record, dict) or record.keys() != {"id", "text"}:
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST, "Invalid transcript record"
+            )
+        transcript_id, transcript = record["id"], record["text"]
+        if (
+            not is_transcript_id(transcript_id)
+            or not isinstance(transcript, str)
+            or not transcript.strip()
+        ):
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST, "Invalid transcript identity or text"
+            )
+        ack = await client.request(
+            ACK_TRANSCRIPT_COMMAND,
+            {"id": transcript_id},
+            expected_connection_generation=generation,
+        )
+        accepted = _transcript_result(ack)
+        if not isinstance(accepted, bool):
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST, "Invalid transcript acknowledgement"
+            )
+        return transcript if accepted else None
+
+    async def _poll_legacy(self, client: RobotClient, generation: int) -> str | None:
+        # A new socket must explicitly report lack of support before text
+        # polling can consume a turn from it.
+        response = await client.request(
+            "check_for_response", expected_connection_generation=generation
+        )
+        transcript = _transcript_result(response)
+        if transcript is None:
+            return None
+        if not isinstance(transcript, str):
+            raise ProtocolViolationError(
+                TransportErrorCode.MALFORMED_REQUEST, "Invalid legacy transcript"
+            )
+        if not transcript.strip() or transcript in ("No transcription", self._last_legacy_text):
+            return None
+        self._last_legacy_text = transcript
+        return transcript
+
+
 async def send_reply(message: str) -> None:
     """Send speech, preserving typed failures for callers that need delivery status."""
     client = await get_robot_client()
-    await client.reply(message)
+    await client.reply(message, connect_budget=client.config.connect_timeout)
 
 
 async def close_client() -> None:
@@ -142,8 +262,10 @@ __all__ = [
     "ExecutionOutcomeUnknown",
     "RobotClient",
     "RobotTransport",
+    "SettingsError",
     "TransportConfig",
     "TransportError",
+    "TranscriptPoller",
     "close_client",
     "get_robot_client",
     "request_to_server",

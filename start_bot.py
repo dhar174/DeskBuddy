@@ -65,15 +65,6 @@ blinking = False
 # Set a default eye shape.
 defaultEyeshape = "Eyeball"
 
-lastReply = ""
-priorReply = ""
-lastMessage = ""
-priorMessage = ""
-reply = ""
-user_response = ""
-message = ""
-
-
 def chose_fast():
     global button_text
     button_text = "Fast"
@@ -135,13 +126,6 @@ async def dispatch_reply(message, button_text, local_only, cortex=None):
 
 
 async def main():
-    global user_response
-    global message
-    global lastReply
-    global priorReply
-    global lastMessage
-    global priorMessage
-    global reply
     global local_only
     fast_button = tk.Button(root, text="Fast", command=lambda: chose_fast())
     small_button = tk.Button(root, text="Small", command=lambda: chose_small())
@@ -162,34 +146,53 @@ async def main():
     local_only_checkbox.pack()
 
     # Start the main event loop
-    root.mainloop()
-    local_only = local_only_tk.get()
-    await BotCortex.load_all_models(button_text, local_only)
-    await helpers.load_models()
+    try:
+        root.mainloop()
+        if not button_text:
+            return
+        local_only = local_only_tk.get()
+        await BotCortex.load_all_models(button_text, local_only)
+        await helpers.load_models()
 
-    while True:
-        kwargs = {"function_name": "check_for_response"}
-
+        poller = rc.TranscriptPoller()
+        backoff = 0.1
+        last_poll_error = None
         while True:
-            if user_response not in ["No transcription", "", None, message]:
-                message = user_response
-                break
-            await asyncio.sleep(0.1)
-
             try:
-                user_response = await rc.request_to_server(**kwargs)
-            except rc.ExecutionOutcomeUnknown as exc:
-                print(f"Ambiguous execution outcome while checking for response: {exc}")
-                user_response = None
-            # print("waiting for response... "+user_response)
+                message = await poller.next_transcript()
+            except Exception as exc:
+                reason = type(exc).__name__
+                detail = ""
+                if isinstance(exc, rc.TransportError):
+                    reason = getattr(exc.code, "value", exc.code)
+                    if exc.message == rc.TRANSCRIPT_MODE_MISMATCH_MESSAGE:
+                        detail = f" {exc.message}"
+                elif isinstance(exc, rc.SettingsError):
+                    detail = f" {exc}"
+                unknown_command = (
+                    exc.command if isinstance(exc, rc.ExecutionOutcomeUnknown) else None
+                )
+                error_key = (type(exc), reason, detail, unknown_command)
+                if error_key != last_poll_error:
+                    uncertain = (
+                        " Transcript acknowledgement outcome is unknown."
+                        if unknown_command == "ack_transcript"
+                        else ""
+                    )
+                    print(
+                        f"Transcript polling failed ({reason}).{detail}{uncertain} "
+                        "Backing off before polling again."
+                    )
+                last_poll_error = error_key
+                await asyncio.sleep(backoff)
+                backoff = min(5.0, backoff * 2)
+                continue
 
-        message = user_response
-        print("last message:" + lastMessage)
-        if message != lastMessage and message != "":
-            print("server response2: " + user_response)
-            user_response = ""
-            priorMessage = lastMessage
-            lastMessage = message
+            backoff = 0.1
+            last_poll_error = None
+            if message is None:
+                await asyncio.sleep(0.1)
+                continue
 
             print("User: " + message)
             try:
@@ -218,7 +221,8 @@ async def main():
                             f"Could not confirm speech delivery ({type(exc).__name__}); "
                             "continuing to poll."
                         )
-        await asyncio.sleep(0.1)
+    finally:
+        await rc.close_client()
 
 
 if __name__ == "__main__":
