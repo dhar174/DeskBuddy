@@ -106,7 +106,7 @@ class RobotClient(RobotTransport):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connection_generation = 0
-        self._transcript_ack_at: float | None = None
+        self._last_request_started_at: float | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -180,7 +180,7 @@ class RobotClient(RobotTransport):
         writer = self._writer
         self._reader = None
         self._writer = None
-        self._transcript_ack_at = None
+        self._last_request_started_at = None
         if writer is not None:
             try:
                 writer.close()
@@ -201,15 +201,19 @@ class RobotClient(RobotTransport):
         side_effects: bool | None = None,
         request_id: str | None = None,
         expected_connection_generation: int | None = None,
+        connect_budget: float | None = None,
     ) -> RobotResponse:
         """Send an authenticated command and wait for a verified response.
 
         Never retries potentially executed physical commands.
         Retries only safe/idempotent commands or pre-transmission failures.
         A request pinned to a connection cannot be sent after reconnecting.
+        A connect budget caps socket setup separately from the response deadline.
         """
         if timeout is not None:
             timeout = validate_timeout_override(timeout)
+        if connect_budget is not None:
+            connect_budget = validate_timeout_override(connect_budget)
 
         # Conservative side-effect classification:
         # Physical commands and transcript claims may never be retried after transmission.
@@ -240,7 +244,7 @@ class RobotClient(RobotTransport):
         lock_timeout = (
             effective_timeout
             if timeout is not None
-            else self.config.connect_timeout + self.config.request_timeout
+            else (connect_budget or self.config.connect_timeout) + self.config.request_timeout
         )
         lock_acquired = False
         try:
@@ -256,18 +260,38 @@ class RobotClient(RobotTransport):
             transmission_attempted = False
             request: RobotRequest | None = None
 
-            # Phase 2: Ensure connection (pre-transmission)
-            # Dedicated bounded budget so slow connection establishment does not
-            # consume the server execution plus response-grace deadline.
-            # Model generation can block delivery of the socket EOF notification.
-            # Retire an aged reply connection before sending any speech bytes.
-            if (
-                expected_connection_generation is None
-                and cmd_lower == "reply"
-                and self._transcript_ack_at is not None
-                and loop.time() - self._transcript_ack_at >= self.config.read_timeout
-            ):
-                await self._disconnect()
+            connect_deadline = loop.time() + connect_budget if connect_budget is not None else None
+            if timeout is not None:
+                deadline = start_time + timeout
+                connect_deadline = (
+                    min(deadline, connect_deadline) if connect_deadline is not None else deadline
+                )
+
+            async def connect(
+                *, refresh: bool = False
+            ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                async def open_or_reuse() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                    if refresh:
+                        await self._disconnect()
+                    return await self._ensure_connected()
+
+                if connect_deadline is None:
+                    return await open_or_reuse()
+                remaining = connect_deadline - loop.time()
+                if remaining <= 0:
+                    raise TransportError(
+                        TransportErrorCode.TIMEOUT,
+                        "Connection budget exhausted before transmission",
+                    )
+                try:
+                    return await asyncio.wait_for(open_or_reuse(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise TransportError(
+                        TransportErrorCode.TIMEOUT,
+                        "Connection budget exhausted before transmission",
+                    ) from exc
+
+            # Phase 2: Ensure connection before attempting transmission.
             if expected_connection_generation is not None:
                 pinned_reader, pinned_writer = self._reader, self._writer
                 if (
@@ -281,25 +305,17 @@ class RobotClient(RobotTransport):
                         "Robot connection changed before the request was sent",
                     )
                 reader, writer = pinned_reader, pinned_writer
-            elif timeout is not None:
-                elapsed = loop.time() - start_time
-                remaining_for_connect = timeout - elapsed
-                if remaining_for_connect <= 0:
-                    raise TransportError(
-                        TransportErrorCode.TIMEOUT,
-                        f"Request timed out after {elapsed:.2f}s before connection",
-                    )
-                try:
-                    reader, writer = await asyncio.wait_for(
-                        self._ensure_connected(), timeout=remaining_for_connect
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise TransportError(
-                        TransportErrorCode.TIMEOUT,
-                        f"Connection timed out after {remaining_for_connect:.2f}s before transmission",
-                    ) from exc
             else:
-                reader, writer = await self._ensure_connected()
+                # The server cannot start its idle timer before our preceding
+                # request starts. Allow additional room for scheduling and transit.
+                read_timeout = self.config.read_timeout
+                idle_limit = read_timeout - min(1.0, read_timeout * 0.2)
+                refresh = (
+                    is_side_effecting
+                    and self._last_request_started_at is not None
+                    and loop.time() - self._last_request_started_at >= idle_limit
+                )
+                reader, writer = await connect(refresh=refresh)
 
             # Phase 3: Transmission and response deadline (starts after connection succeeds)
             if timeout is not None:
@@ -337,6 +353,7 @@ class RobotClient(RobotTransport):
                 if is_side_effecting:
                     # Side-effecting command: single transmission attempt, no blind retransmission
                     transmission_attempted = True
+                    sent_at = loop.time()
                     try:
                         await write_frame(
                             writer,
@@ -405,7 +422,7 @@ class RobotClient(RobotTransport):
                     for send_attempt in range(2):
                         if send_attempt > 0:
                             try:
-                                reader, writer = await self._ensure_connected()
+                                reader, writer = await connect()
                             except Exception as exc:
                                 if transmission_attempted:
                                     raise ExecutionOutcomeUnknown(
@@ -419,6 +436,7 @@ class RobotClient(RobotTransport):
                                 raise
                         try:
                             transmission_attempted = True
+                            sent_at = loop.time()
                             await write_frame(
                                 writer,
                                 request_bytes,
@@ -515,11 +533,7 @@ class RobotClient(RobotTransport):
                         ) from underlying
                     raise underlying
 
-                self._transcript_ack_at = (
-                    loop.time()
-                    if cmd_lower == "ack_transcript" and response.ok and response.result is True
-                    else None
-                )
+                self._last_request_started_at = sent_at
 
                 # Check for explicit replayed_request or execution_outcome_unknown error codes
                 if not response.ok and response.error:
@@ -604,10 +618,16 @@ class RobotClient(RobotTransport):
             )
         return response.result
 
-    async def reply(self, message: str, *, timeout: float | None = None) -> Any:
+    async def reply(
+        self, message: str, *, timeout: float | None = None, connect_budget: float | None = None
+    ) -> Any:
         """Send a reply text message for Picoh to speak."""
         response = await self.request(
-            "reply", {"message": message}, timeout=timeout, side_effects=True
+            "reply",
+            {"message": message},
+            timeout=timeout,
+            connect_budget=connect_budget,
+            side_effects=True,
         )
         if not response.ok:
             raise TransportError(

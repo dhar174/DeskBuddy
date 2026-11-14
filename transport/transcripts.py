@@ -19,6 +19,9 @@ ACK_TRANSCRIPT_COMMAND = "ack_transcript"
 
 _logger = logging.getLogger(__name__)
 _SIZE_CHECK_REQUEST_ID = "00000000-0000-0000-0000-000000000000"
+TRANSCRIPT_MODE_MISMATCH_MESSAGE = (
+    "Transcript polling mode changed; restart the robot server before switching clients."
+)
 TranscriptPollingMode = Literal["id", "legacy"]
 
 
@@ -69,6 +72,7 @@ class TranscriptQueue:
         self._lock = threading.Lock()
         self._generation = 0
         self._polling_mode: TranscriptPollingMode | None = None
+        self._legacy_fit_cache: tuple[int, str, bool] | None = None
 
     def reset(self, *, max_payload_size: int, secret: str) -> None:
         """Clear pending work and publish the server's current wire configuration."""
@@ -84,6 +88,7 @@ class TranscriptQueue:
             self._secret = secret
             self._generation += 1
             self._polling_mode = None
+            self._legacy_fit_cache = None
 
     @property
     def polling_mode(self) -> TranscriptPollingMode | None:
@@ -104,7 +109,7 @@ class TranscriptQueue:
             elif self._polling_mode != mode:
                 raise TransportError(
                     TransportErrorCode.INVALID_ARGUMENTS,
-                    "Transcript polling mode changed; restart the robot server before switching clients.",
+                    TRANSCRIPT_MODE_MISMATCH_MESSAGE,
                 )
             selected_mode = self._polling_mode
         assert selected_mode is not None
@@ -173,26 +178,44 @@ class TranscriptQueue:
         if not is_transcript_id(transcript_id):
             return False
         with self._lock:
+            if self._polling_mode == "legacy":
+                raise TransportError(
+                    TransportErrorCode.INVALID_ARGUMENTS,
+                    TRANSCRIPT_MODE_MISMATCH_MESSAGE,
+                )
             if not self._pending or self._pending[0][0] != transcript_id:
                 return False
             self._pending.popleft()
             return True
 
-    def fits_legacy_response(self, text: object) -> bool:
+    def fits_legacy_response(self, text: object) -> bool | None:
         """Check whether legacy text polling can serialize this text safely."""
         if not is_valid_transcript_text(text):
             return False
         with self._lock:
             if self._max_payload_size == 0:
-                return False
+                return None
             max_payload_size = self._max_payload_size
             secret = self._secret
             generation = self._generation
+            cached = self._legacy_fit_cache
+            if cached is not None and cached[0] == generation and cached[1] is text:
+                return cached[2]
         if len(text) > max_payload_size:
-            return False
-        response_size = self._legacy_response_size(text, secret)
+            fits = False
+        else:
+            response_size = self._legacy_response_size(text, secret)
+            fits = response_size <= max_payload_size
         with self._lock:
-            return generation == self._generation and response_size <= max_payload_size
+            if generation != self._generation:
+                return None
+            cached = self._legacy_fit_cache
+            if cached is not None and cached[0] == generation and cached[1] is text:
+                return cached[2]
+            self._legacy_fit_cache = (generation, text, fits)
+        if not fits:
+            _logger.warning("Legacy transcript exceeds the configured response frame limit.")
+        return fits
 
     @staticmethod
     def _response_size(response: RobotResponse, secret: str) -> int:

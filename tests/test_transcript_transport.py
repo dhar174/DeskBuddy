@@ -17,7 +17,12 @@ import buddy1
 from transport import RobotClient, RobotServer, TransportConfig
 from transport.auth import sign_response
 from transport.protocol import RobotResponse
-from transport.transcripts import MAX_PENDING_TRANSCRIPTS, TranscriptQueue, is_transcript_id
+from transport.transcripts import (
+    MAX_PENDING_TRANSCRIPTS,
+    TRANSCRIPT_MODE_MISMATCH_MESSAGE,
+    TranscriptQueue,
+    is_transcript_id,
+)
 from windows import buddy1 as windows_buddy1
 from windows import buddy2 as windows_buddy2
 
@@ -130,6 +135,25 @@ async def test_id_poll_after_legacy_mode_returns_restart_hint(
 
 
 @pytest.mark.asyncio
+async def test_ack_after_legacy_mode_returns_mode_mismatch(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+) -> None:
+    async with _running_client(adapter_module, ephemeral_server_config) as client:
+        legacy = await client.request("check_for_response", {})
+        assert legacy.ok, legacy.error
+        assert adapter_module.transcript_queue.polling_mode == "legacy"
+
+        response = await client.request("ack_transcript", {"id": str(uuid.uuid4())})
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.get("code") == "invalid_arguments"
+        assert response.error.get("message") == TRANSCRIPT_MODE_MISMATCH_MESSAGE
+        assert adapter_module.transcript_queue.polling_mode == "legacy"
+
+
+@pytest.mark.asyncio
 async def test_invalid_ack_request_id_does_not_select_mode_or_remove_pending_text(
     adapter_module: ModuleType,
     ephemeral_server_config: TransportConfig,
@@ -140,6 +164,12 @@ async def test_invalid_ack_request_id_does_not_select_mode_or_remove_pending_tex
         pending = queue.poll()
         assert pending is not None
         assert queue.polling_mode is None
+
+        stray_ack = await client.request("ack_transcript", {"id": str(uuid.uuid4())})
+        assert stray_ack.ok
+        assert stray_ack.result is False
+        assert queue.polling_mode is None
+        assert queue.poll() == pending
 
         response = await client.request(
             "ack_transcript",
@@ -206,13 +236,46 @@ async def test_oversized_legacy_text_is_skipped_without_printing_or_logging_cont
 
     async with _running_client(adapter_module, config) as client:
         await adapter_module.MyFunctions.send_response(text)
-        response = await client.request("check_for_response", {})
-
-        assert response.ok, response.error
-        assert response.result == "No transcription"
+        for _ in range(3):
+            response = await client.request("check_for_response", {})
+            assert response.ok, response.error
+            assert response.result == "No transcription"
 
     assert private_marker not in caplog.text
     assert private_marker not in capsys.readouterr().out
+    legacy_warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Legacy transcript exceeds the configured response frame limit."
+    ]
+    assert len(legacy_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_legacy_sentinel_skips_response_sizing(
+    adapter_module: ModuleType,
+    ephemeral_server_config: TransportConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(adapter_module, "lastTranscription", "")
+    monkeypatch.setattr(adapter_module, "priorTranscription", "")
+
+    def unexpected_size_check(text: object) -> bool:
+        pytest.fail(f"idle sentinel should not be sized: {text!r}")
+
+    monkeypatch.setattr(
+        adapter_module.transcript_queue, "fits_legacy_response", unexpected_size_check
+    )
+    caplog.set_level(logging.WARNING, logger="transport.transcripts")
+
+    async with _running_client(adapter_module, ephemeral_server_config) as client:
+        for _ in range(3):
+            response = await client.request("check_for_response", {})
+            assert response.ok, response.error
+            assert response.result == "No transcription"
+
+    assert not any("Legacy transcript exceeds" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -225,10 +288,23 @@ async def test_invalid_text_is_rejected_without_poisoning_prestart_legacy_state(
     monkeypatch.setattr(adapter_module, "transcript_queue", queue)
     monkeypatch.setattr(adapter_module, "lastTranscription", "previous valid")
     monkeypatch.setattr(adapter_module, "priorTranscription", "older")
+    monkeypatch.setattr(adapter_module, "recorded", True, raising=False)
+    monkeypatch.setattr(adapter_module, "recording", True, raising=False)
+    monkeypatch.setattr(adapter_module, "result", {"text": "stale"}, raising=False)
     caplog.set_level(logging.WARNING, logger="transport.transcripts")
 
-    await adapter_module.MyFunctions.send_response(" \t")
+    await adapter_module.MyFunctions.send_response("\n")
+    assert adapter_module.recorded is False
+    assert adapter_module.recording is False
+    assert adapter_module.result is None
+
+    monkeypatch.setattr(adapter_module, "recorded", True)
+    monkeypatch.setattr(adapter_module, "recording", True)
+    monkeypatch.setattr(adapter_module, "result", {"text": "stale"})
     await adapter_module.MyFunctions.send_response(None)
+    assert adapter_module.recorded is False
+    assert adapter_module.recording is False
+    assert adapter_module.result is None
     assert adapter_module.lastTranscription == "previous valid"
     assert adapter_module.priorTranscription == "older"
 

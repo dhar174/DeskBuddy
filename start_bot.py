@@ -162,12 +162,17 @@ async def main():
                 message = await poller.next_transcript()
             except Exception as exc:
                 reason = type(exc).__name__
+                detail = ""
                 if isinstance(exc, rc.TransportError):
                     reason = getattr(exc.code, "value", exc.code)
+                    if exc.message == rc.TRANSCRIPT_MODE_MISMATCH_MESSAGE:
+                        detail = f" {exc.message}"
+                elif isinstance(exc, rc.SettingsError):
+                    detail = f" {exc}"
                 unknown_command = (
                     exc.command if isinstance(exc, rc.ExecutionOutcomeUnknown) else None
                 )
-                error_key = (type(exc), reason, unknown_command)
+                error_key = (type(exc), reason, detail, unknown_command)
                 if error_key != last_poll_error:
                     uncertain = (
                         " Transcript acknowledgement outcome is unknown."
@@ -175,7 +180,7 @@ async def main():
                         else ""
                     )
                     print(
-                        f"Transcript polling failed ({reason}).{uncertain} "
+                        f"Transcript polling failed ({reason}).{detail}{uncertain} "
                         "Backing off before polling again."
                     )
                 last_poll_error = error_key

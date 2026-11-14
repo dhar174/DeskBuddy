@@ -42,6 +42,7 @@ class DropTranscriptResponse(Enum):
     POLL = auto()
     ACK_BEFORE_REMOVAL = auto()
     ACK_AFTER_REMOVAL = auto()
+    LEGACY = auto()
 
 
 @dataclass
@@ -142,8 +143,10 @@ class LoopbackConversation:
                 TranscriptPoller=create_poller,
                 send_reply=send_reply,
                 close_client=close_client,
-                ExecutionOutcomeUnknown=ExecutionOutcomeUnknown,
-                TransportError=TransportError,
+                ExecutionOutcomeUnknown=robot_client.ExecutionOutcomeUnknown,
+                TransportError=robot_client.TransportError,
+                SettingsError=robot_client.SettingsError,
+                TRANSCRIPT_MODE_MISMATCH_MESSAGE=robot_client.TRANSCRIPT_MODE_MISMATCH_MESSAGE,
             ),
             local_only=local_only,
             button_text=button_text,
@@ -224,14 +227,27 @@ async def conversation_server(
         server.registry.unregister("ack_transcript")
     send_response = server._send_response
     process_payload = server._process_request_payload
-    pending_drop = False
+    pending_drop_request_ids: set[str] = set()
     dropped = False
+    transcript_queue = server._transcript_queue
+    assert transcript_queue is not None
+    original_ack = transcript_queue.ack
+
+    def ack_with_scripted_rejection(transcript_id: object) -> bool:
+        if flow.reject_transcript_ack:
+            flow.reject_transcript_ack = False
+            return False
+        return original_ack(transcript_id)
+
+    monkeypatch.setattr(transcript_queue, "ack", ack_with_scripted_rejection)
 
     async def maybe_drop_transcript(payload):
-        nonlocal pending_drop
         from transport.protocol import RobotRequest, RobotResponse
 
-        request = RobotRequest.from_json(payload)
+        try:
+            request = RobotRequest.from_json(payload)
+        except ProtocolViolationError:
+            return await process_payload(payload)
         flow.server_commands.append(request.command)
         if flow.malformed_poll_responses and request.command == "poll_transcript":
             flow.malformed_poll_responses -= 1
@@ -242,21 +258,19 @@ async def conversation_server(
         failure = flow.drop_transcript_response
         if request.command == "poll_transcript" and failure is DropTranscriptResponse.POLL:
             flow.drop_transcript_response = None
-            pending_drop = True
+            pending_drop_request_ids.add(request.request_id)
+        if request.command == "check_for_response" and failure is DropTranscriptResponse.LEGACY:
+            flow.drop_transcript_response = None
+            pending_drop_request_ids.add(request.request_id)
         if request.command == "ack_transcript":
             if failure is DropTranscriptResponse.ACK_BEFORE_REMOVAL:
                 flow.drop_transcript_response = None
-                pending_drop = True
+                pending_drop_request_ids.add(request.request_id)
                 # Model transport loss before the acknowledgement reaches dispatch.
                 return RobotResponse.success(request.request_id)
             if failure is DropTranscriptResponse.ACK_AFTER_REMOVAL:
                 flow.drop_transcript_response = None
-                pending_drop = True
-            if flow.reject_transcript_ack:
-                flow.reject_transcript_ack = False
-                response = RobotResponse.success(request.request_id)
-                response.result = False
-                return response
+                pending_drop_request_ids.add(request.request_id)
         response = await process_payload(payload)
         if request.command == "ack_transcript" and response.ok:
             if flow.malformed_transcript_ack:
@@ -265,11 +279,11 @@ async def conversation_server(
         return response
 
     async def maybe_drop_ack(writer, response):
-        nonlocal dropped, pending_drop
+        nonlocal dropped
         if not flow.server_writers or flow.server_writers[-1] is not writer:
             flow.server_writers.append(writer)
-        if pending_drop:
-            pending_drop = False
+        if response.request_id in pending_drop_request_ids:
+            pending_drop_request_ids.remove(response.request_id)
             writer.close()
             await writer.wait_closed()
         elif flow.drop_reply_ack and flow.spoken and not dropped:
@@ -336,6 +350,40 @@ async def test_transcription_reaches_selected_model_and_robot_speech(conversatio
     assert conversation.sleep_calls == []
 
 
+async def test_desktop_poll_and_speech_use_connect_budget_but_ack_keeps_default_timeout(
+    conversation, monkeypatch
+):
+    client = await robot_client.get_robot_client()
+    real_request = client.request
+    observed_requests: list[tuple[str, dict[str, object]]] = []
+
+    async def record_request(command, *args, **kwargs):
+        observed_requests.append((command, dict(kwargs)))
+        return await real_request(command, *args, **kwargs)
+
+    monkeypatch.setattr(client, "request", record_request)
+    await conversation.run(
+        ["Hello"],
+        is_question=False,
+        nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
+    )
+
+    assert [command for command, _ in observed_requests] == [
+        "poll_transcript",
+        "ack_transcript",
+        "reply",
+    ]
+    poll_options = observed_requests[0][1]
+    ack_options = observed_requests[1][1]
+    reply_options = observed_requests[2][1]
+    assert poll_options["connect_budget"] == client.config.connect_timeout
+    assert ack_options["expected_connection_generation"] == 1
+    assert "timeout" not in ack_options
+    assert reply_options["connect_budget"] == client.config.connect_timeout
+    assert reply_options["side_effects"] is True
+    assert conversation.reply_generations == [1]
+
+
 async def test_idle_poll_sleeps_only_after_an_empty_result(conversation):
     await conversation.run(
         [Poll.NO_NEW_UTTERANCE],
@@ -361,6 +409,7 @@ async def test_desktop_close_before_selection_skips_startup_and_polling(conversa
 async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation, monkeypatch):
     client = await robot_client.get_robot_client()
     real_loader = load_botcortex_runtime
+    acknowledged_request_starts: list[float] = []
 
     def load_with_slow_model(**options):
         cortex, recorder = real_loader(**options)
@@ -369,7 +418,10 @@ async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation
 
         def generate_after_slow_turn(*args, **kwargs):
             result = generate(*args, **kwargs)
-            client._transcript_ack_at = (
+            request_started_at = client._last_request_started_at
+            assert request_started_at is not None
+            acknowledged_request_starts.append(request_started_at)
+            client._last_request_started_at = (
                 asyncio.get_running_loop().time() - 2 * client.config.read_timeout
             )
             return result
@@ -384,11 +436,49 @@ async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation
         nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
     )
 
+    assert acknowledged_request_starts
     assert conversation.poll_generations == [1]
     assert conversation.reply_generations == [2]
     assert conversation.received_replies == conversation.spoken == ["LOCAL_MODEL_REPLY"]
     assert conversation.requests == ["poll", "reply"]
     assert conversation.recorder.count("chat_model.generate") == 1
+
+
+async def test_slow_model_turn_reuses_socket_below_refresh_threshold(conversation, monkeypatch):
+    client = await robot_client.get_robot_client()
+    real_loader = load_botcortex_runtime
+    acknowledged_request_starts: list[float] = []
+
+    def load_with_nearly_stale_model(**options):
+        cortex, recorder = real_loader(**options)
+        model = cortex["model"]
+        generate = model.generate
+
+        def generate_before_refresh_threshold(*args, **kwargs):
+            result = generate(*args, **kwargs)
+            request_started_at = client._last_request_started_at
+            assert request_started_at is not None
+            acknowledged_request_starts.append(request_started_at)
+            refresh_after = client.config.read_timeout - min(1.0, client.config.read_timeout * 0.2)
+            client._last_request_started_at = asyncio.get_running_loop().time() - (
+                refresh_after - 0.25
+            )
+            return result
+
+        model.generate = generate_before_refresh_threshold
+        return cortex, recorder
+
+    monkeypatch.setattr(f"{__name__}.load_botcortex_runtime", load_with_nearly_stale_model)
+    await conversation.run(
+        ["Hello"],
+        is_question=False,
+        nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
+    )
+
+    assert acknowledged_request_starts
+    assert conversation.poll_generations == [1]
+    assert conversation.reply_generations == [1]
+    assert conversation.received_replies == conversation.spoken == ["LOCAL_MODEL_REPLY"]
 
 
 @pytest.mark.parametrize(
@@ -638,7 +728,8 @@ async def test_repeated_poll_faults_back_off_once_per_reason_then_resume(convers
 
 async def test_startup_loop_handles_settings_error_caps_backoff_and_resets(capsys):
     outcomes: list[str | None | BaseException] = [
-        *[SettingsError("Injected settings fault") for _ in range(7)],
+        *[SettingsError("Injected settings fault") for _ in range(6)],
+        SettingsError("Different settings fault"),
         None,
         SettingsError("Injected settings fault after recovery"),
         PollScriptComplete(),
@@ -666,8 +757,10 @@ async def test_startup_loop_handles_settings_error_caps_backoff_and_resets(capsy
             TranscriptPoller=lambda: SimpleNamespace(next_transcript=next_transcript),
             close_client=close_client,
             send_reply=unused_reply,
-            ExecutionOutcomeUnknown=ExecutionOutcomeUnknown,
-            TransportError=TransportError,
+            ExecutionOutcomeUnknown=robot_client.ExecutionOutcomeUnknown,
+            TransportError=robot_client.TransportError,
+            SettingsError=robot_client.SettingsError,
+            TRANSCRIPT_MODE_MISMATCH_MESSAGE=robot_client.TRANSCRIPT_MODE_MISMATCH_MESSAGE,
         ),
         local_only=True,
         sleep_calls=sleep_calls,
@@ -680,7 +773,10 @@ async def test_startup_loop_handles_settings_error_caps_backoff_and_resets(capsy
     assert startup_calls == [("cortex", ("Medium", True)), ("helpers", ())]
     assert close_calls == 1
     output = capsys.readouterr().out.lower()
-    assert output.count("transcript polling failed (settingserror)") == 2
+    assert output.count("transcript polling failed (settingserror)") == 3
+    assert "different settings fault" in output
+    assert "injected settings fault" in output
+    assert "injected settings fault after recovery" in output
     assert "transcript acknowledgement outcome is unknown" not in output
 
 
@@ -756,6 +852,73 @@ async def test_legacy_connection_is_reprobed_after_disconnect(
         assert caplog.text.count("Robot server lacks utterance IDs") == 2
 
 
+async def test_legacy_fallback_does_not_reconnect_after_probe_disconnect(
+    monkeypatch, ephemeral_server_config
+):
+    async with conversation_server(
+        monkeypatch, ephemeral_server_config, legacy_server=True
+    ) as conversation:
+        conversation.poll = "Legacy turn"
+        client = await robot_client.get_robot_client()
+        poller = robot_client.TranscriptPoller()
+        real_request = client.request
+        disconnect_after_probe = True
+
+        async def disconnect_before_legacy_poll(command, *args, **kwargs):
+            nonlocal disconnect_after_probe
+            response = await real_request(command, *args, **kwargs)
+            if command == "poll_transcript" and disconnect_after_probe:
+                disconnect_after_probe = False
+                await client.close()
+            return response
+
+        monkeypatch.setattr(client, "request", disconnect_before_legacy_poll)
+        with pytest.raises(TransportError) as failure:
+            await poller.next_transcript()
+        assert failure.value.code == TransportErrorCode.INTERNAL_ERROR
+        assert client.connection_generation == 1
+        assert conversation.server_commands == ["poll_transcript"]
+
+        assert await poller.next_transcript() == "Legacy turn"
+        assert client.connection_generation == 2
+        assert conversation.server_commands == [
+            "poll_transcript",
+            "poll_transcript",
+            "check_for_response",
+        ]
+
+
+async def test_legacy_poll_disconnect_after_transmission_is_not_retried(
+    monkeypatch, ephemeral_server_config
+):
+    async with conversation_server(
+        monkeypatch, ephemeral_server_config, legacy_server=True
+    ) as conversation:
+        conversation.poll = "Legacy turn"
+        conversation.drop_transcript_response = DropTranscriptResponse.LEGACY
+        client = await robot_client.get_robot_client()
+        poller = robot_client.TranscriptPoller()
+
+        with pytest.raises(TransportError) as failure:
+            await poller.next_transcript()
+
+        assert failure.value.code == TransportErrorCode.INTERNAL_ERROR
+        assert client.connection_generation == 1
+        assert conversation.server_commands == ["poll_transcript", "check_for_response"]
+
+        buddy1.lastTranscription = ""
+        buddy1.priorTranscription = ""
+        conversation.poll = "Legacy turn"
+        assert await poller.next_transcript() == "Legacy turn"
+        assert client.connection_generation == 2
+        assert conversation.server_commands == [
+            "poll_transcript",
+            "check_for_response",
+            "poll_transcript",
+            "check_for_response",
+        ]
+
+
 async def test_legacy_disconnect_then_server_upgrade_uses_new_generation(
     monkeypatch, ephemeral_server_config, caplog
 ):
@@ -796,7 +959,9 @@ async def test_legacy_disconnect_then_server_upgrade_uses_new_generation(
         assert caplog.text.count("Robot server lacks utterance IDs") == 1
 
 
-async def test_ack_uses_the_poll_connection_generation(monkeypatch, ephemeral_server_config):
+async def test_ack_rejects_a_different_active_connection_generation(
+    monkeypatch, ephemeral_server_config
+):
     async with conversation_server(
         monkeypatch, ephemeral_server_config, legacy_server=False
     ) as conversation:
@@ -804,28 +969,28 @@ async def test_ack_uses_the_poll_connection_generation(monkeypatch, ephemeral_se
         client = await robot_client.get_robot_client()
         poller = robot_client.TranscriptPoller()
         real_request = client.request
-        close_after_poll = True
+        reconnect_before_ack = True
 
-        async def close_between_poll_and_ack(command, *args, **kwargs):
-            nonlocal close_after_poll
-            response = await real_request(command, *args, **kwargs)
-            if command == "poll_transcript" and close_after_poll:
-                close_after_poll = False
+        async def reconnect_before_pinned_ack(command, *args, **kwargs):
+            nonlocal reconnect_before_ack
+            if command == "ack_transcript" and reconnect_before_ack:
+                reconnect_before_ack = False
                 await client.close()
-            return response
+                await real_request("ping")
+            return await real_request(command, *args, **kwargs)
 
-        monkeypatch.setattr(client, "request", close_between_poll_and_ack)
+        monkeypatch.setattr(client, "request", reconnect_before_pinned_ack)
         with pytest.raises(TransportError) as failure:
             await poller.next_transcript()
         assert failure.value.code == TransportErrorCode.INTERNAL_ERROR
-        assert client.connection_generation == 1
-        assert conversation.server_commands == ["poll_transcript"]
+        assert client.connection_generation == 2
+        assert conversation.server_commands == ["poll_transcript", "ping"]
 
-        monkeypatch.setattr(client, "request", real_request)
         assert await poller.next_transcript() == "Still pending after stale ACK socket"
         assert client.connection_generation == 2
         assert conversation.server_commands == [
             "poll_transcript",
+            "ping",
             "poll_transcript",
             "ack_transcript",
         ]
