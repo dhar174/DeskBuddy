@@ -25,6 +25,13 @@ from transport.protocol import (
     TruncatedFrameError,
 )
 from transport.registry import CommandRegistry
+from transport.transcripts import (
+    ACK_TRANSCRIPT_COMMAND,
+    POLL_TRANSCRIPT_COMMAND,
+    TranscriptQueue,
+    is_transcript_id,
+    register_transcript_commands,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +48,7 @@ class RobotServer:
         host: str | None = None,
         port: int | None = None,
         secret: str | bytes | None = None,
+        transcript_queue: TranscriptQueue | None = None,
     ) -> None:
         base_config = TransportConfig.from_settings(role="server") if config is None else config
         # Overrides produce a re-validated copy; the caller's config is never mutated.
@@ -53,6 +61,9 @@ class RobotServer:
             )
 
         self.registry = registry or CommandRegistry()
+        self._transcript_queue = transcript_queue
+        if transcript_queue is not None:
+            register_transcript_commands(self.registry, transcript_queue)
         self.hardware_executor = hardware_executor or get_default_hardware_executor()
         self.authenticator = HMACAuthenticator(
             secret=self.config.secret,
@@ -91,6 +102,10 @@ class RobotServer:
         if self._is_running:
             return
 
+        if self._transcript_queue is not None:
+            self._transcript_queue.reset(
+                max_payload_size=self.config.max_payload_size, secret=self.config.secret
+            )
         self._server = await asyncio.start_server(
             self._handle_client_connection,
             host=self.config.host,
@@ -277,6 +292,16 @@ class RobotServer:
                 request_id=req_id,
                 code=TransportErrorCode.UNSUPPORTED_COMMAND,
                 message=f"Command '{request.command}' is not supported",
+            )
+
+        # Transcript admission bounds the signed response using a UUID request ID.
+        if request.command in (POLL_TRANSCRIPT_COMMAND, ACK_TRANSCRIPT_COMMAND) and not (
+            is_transcript_id(req_id)
+        ):
+            return RobotResponse.fail(
+                request_id=req_id,
+                code=TransportErrorCode.INVALID_ARGUMENTS,
+                message="Transcript commands require a canonical UUID request ID",
             )
 
         # 5. Validate arguments against schema

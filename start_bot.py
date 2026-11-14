@@ -65,15 +65,6 @@ blinking = False
 # Set a default eye shape.
 defaultEyeshape = "Eyeball"
 
-lastReply = ""
-priorReply = ""
-lastMessage = ""
-priorMessage = ""
-reply = ""
-user_response = ""
-message = ""
-
-
 def chose_fast():
     global button_text
     button_text = "Fast"
@@ -135,13 +126,6 @@ async def dispatch_reply(message, button_text, local_only, cortex=None):
 
 
 async def main():
-    global user_response
-    global message
-    global lastReply
-    global priorReply
-    global lastMessage
-    global priorMessage
-    global reply
     global local_only
     fast_button = tk.Button(root, text="Fast", command=lambda: chose_fast())
     small_button = tk.Button(root, text="Small", command=lambda: chose_small())
@@ -167,30 +151,22 @@ async def main():
     await BotCortex.load_all_models(button_text, local_only)
     await helpers.load_models()
 
+    poller = rc.TranscriptPoller()
     while True:
-        kwargs = {"function_name": "check_for_response"}
+        await asyncio.sleep(0.1)
+        try:
+            message = await poller.next_transcript()
+        except rc.ExecutionOutcomeUnknown as exc:
+            print(f"Transcript delivery outcome is unknown ({exc.code}); continuing to poll.")
+            continue
+        except rc.TransportError as exc:
+            print(f"Transcript request failed ({exc.code}); continuing to poll.")
+            continue
+        except (OSError, asyncio.TimeoutError) as exc:
+            print(f"Transcript connection failed ({type(exc).__name__}); continuing to poll.")
+            continue
 
-        while True:
-            if user_response not in ["No transcription", "", None, message]:
-                message = user_response
-                break
-            await asyncio.sleep(0.1)
-
-            try:
-                user_response = await rc.request_to_server(**kwargs)
-            except rc.ExecutionOutcomeUnknown as exc:
-                print(f"Ambiguous execution outcome while checking for response: {exc}")
-                user_response = None
-            # print("waiting for response... "+user_response)
-
-        message = user_response
-        print("last message:" + lastMessage)
-        if message != lastMessage and message != "":
-            print("server response2: " + user_response)
-            user_response = ""
-            priorMessage = lastMessage
-            lastMessage = message
-
+        if message is not None:
             print("User: " + message)
             try:
                 reply = await dispatch_reply(message, button_text, local_only)
@@ -218,7 +194,6 @@ async def main():
                             f"Could not confirm speech delivery ({type(exc).__name__}); "
                             "continuing to poll."
                         )
-        await asyncio.sleep(0.1)
 
 
 if __name__ == "__main__":

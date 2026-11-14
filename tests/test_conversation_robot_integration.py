@@ -31,6 +31,12 @@ class Poll(Enum):
     NULL_RPC_RESULT = auto()
 
 
+class DropTranscriptResponse(Enum):
+    POLL = auto()
+    ACK_BEFORE_REMOVAL = auto()
+    ACK_AFTER_REMOVAL = auto()
+
+
 @dataclass
 class LoopbackConversation:
     recorder: CallRecorder = field(default_factory=CallRecorder)
@@ -42,6 +48,10 @@ class LoopbackConversation:
     transcriptions: list[str | None] = field(default_factory=list)
     drop_reply_ack: bool = False
     fail_before_reply_transmission: bool = False
+    legacy_server: bool = False
+    drop_transcript_response: DropTranscriptResponse | None = None
+    malformed_poll_response: bool = False
+    malformed_transcript_ack: bool = False
     poll: str | Poll = Poll.NO_NEW_UTTERANCE
 
     async def run(
@@ -61,14 +71,17 @@ class LoopbackConversation:
             cortex["qgen_model"] = None
             cortex["qgen_tokenizer"] = None
 
-        async def request(**kwargs: Any) -> Any:
-            assert kwargs == {"function_name": "check_for_response"}
+        poller = robot_client.TranscriptPoller()
+
+        async def next_transcript() -> str | None:
             try:
                 self.poll = next(pending)
             except StopIteration:
                 raise PollScriptComplete from None
-            self.requests.append("check_for_response")
-            result = await robot_client.request_to_server(**kwargs)
+            if not self.legacy_server and isinstance(self.poll, str):
+                await buddy1.MyFunctions.send_response(self.poll)
+            self.requests.append("poll")
+            result = await poller.next_transcript()
             self.transcriptions.append(result)
             return result
 
@@ -86,7 +99,7 @@ class LoopbackConversation:
         main = load_start_bot_main(
             cortex,
             SimpleNamespace(
-                request_to_server=request,
+                TranscriptPoller=lambda: SimpleNamespace(next_transcript=next_transcript),
                 send_reply=send_reply,
                 ExecutionOutcomeUnknown=ExecutionOutcomeUnknown,
                 TransportError=TransportError,
@@ -102,10 +115,14 @@ class LoopbackConversation:
 
 
 @pytest_asyncio.fixture
-async def conversation(monkeypatch: pytest.MonkeyPatch, ephemeral_server_config: TransportConfig):
+async def conversation(
+    monkeypatch: pytest.MonkeyPatch, ephemeral_server_config: TransportConfig, request
+):
     reset_default_hardware_executor()
     try:
-        async with conversation_server(monkeypatch, ephemeral_server_config) as flow:
+        async with conversation_server(
+            monkeypatch, ephemeral_server_config, legacy_server=getattr(request, "param", False)
+        ) as flow:
             yield flow
     finally:
         reset_default_hardware_executor()
@@ -113,9 +130,12 @@ async def conversation(monkeypatch: pytest.MonkeyPatch, ephemeral_server_config:
 
 @asynccontextmanager
 async def conversation_server(
-    monkeypatch: pytest.MonkeyPatch, ephemeral_server_config: TransportConfig
+    monkeypatch: pytest.MonkeyPatch,
+    ephemeral_server_config: TransportConfig,
+    *,
+    legacy_server: bool,
 ):
-    flow = LoopbackConversation()
+    flow = LoopbackConversation(legacy_server=legacy_server)
     real_poll = buddy1.MyFunctions.check_for_response
     real_reply = buddy1.MyFunctions.reply
 
@@ -155,12 +175,49 @@ async def conversation_server(
     monkeypatch.setattr(buddy1.MyFunctions, "baseCol", no_device_call)
     monkeypatch.setattr(buddy1.MyFunctions, "picoh_wait", no_device_call)
     server = buddy1.create_robot_server(ephemeral_server_config)
+    if legacy_server:
+        server.registry.unregister("poll_transcript")
+        server.registry.unregister("ack_transcript")
     send_response = server._send_response
+    process_payload = server._process_request_payload
+    pending_drop = False
     dropped = False
 
+    async def maybe_drop_transcript(payload):
+        nonlocal pending_drop
+        from transport.protocol import RobotRequest, RobotResponse
+
+        request = RobotRequest.from_json(payload)
+        if flow.malformed_poll_response and request.command == "poll_transcript":
+            response = await process_payload(payload)
+            if response.ok:
+                response.result = {"id": "invalid", "text": "Unusable transcript"}
+            return response
+        failure = flow.drop_transcript_response
+        if request.command == "poll_transcript" and failure is DropTranscriptResponse.POLL:
+            flow.drop_transcript_response = None
+            pending_drop = True
+        if request.command == "ack_transcript":
+            if failure is DropTranscriptResponse.ACK_BEFORE_REMOVAL:
+                flow.drop_transcript_response = None
+                pending_drop = True
+                # Model transport loss before the acknowledgement reaches dispatch.
+                return RobotResponse.success(request.request_id)
+            if failure is DropTranscriptResponse.ACK_AFTER_REMOVAL:
+                flow.drop_transcript_response = None
+                pending_drop = True
+        response = await process_payload(payload)
+        if flow.malformed_transcript_ack and request.command == "ack_transcript" and response.ok:
+            response.result = 1  # A truthy integer is not a confirmed acknowledgement.
+        return response
+
     async def maybe_drop_ack(writer, response):
-        nonlocal dropped
-        if flow.drop_reply_ack and flow.spoken and not dropped:
+        nonlocal dropped, pending_drop
+        if pending_drop:
+            pending_drop = False
+            writer.close()
+            await writer.wait_closed()
+        elif flow.drop_reply_ack and flow.spoken and not dropped:
             dropped = True
             writer.close()
             await writer.wait_closed()
@@ -168,6 +225,7 @@ async def conversation_server(
             await send_response(writer, response)
 
     monkeypatch.setattr(server, "_send_response", maybe_drop_ack)
+    monkeypatch.setattr(server, "_process_request_payload", maybe_drop_transcript)
     await server.start()
     try:
         monkeypatch.setenv("DESKBUDDY_ROBOT_HOST", "127.0.0.1")
@@ -217,7 +275,7 @@ async def test_transcription_reaches_selected_model_and_robot_speech(conversatio
         assert call.kwargs["messages"][-1]["content"] == f"User:{transcript}"
         assert rec.count("chat_model.generate") == 0
         assert conversation.spoken == [f"Cloud reply continues: {transcript}"]
-    assert conversation.requests == ["check_for_response", "reply"]
+    assert conversation.requests == ["poll", "reply"]
 
 
 @pytest.mark.parametrize(
@@ -243,7 +301,7 @@ async def test_other_local_tiers_reach_speech(
     (generation,) = rec.for_target("chat_model.generate")
     assert generation.kwargs[length_parameter] == length
     assert rec.count("openai.ChatCompletion.create") == 0
-    assert conversation.requests == ["check_for_response", "reply"]
+    assert conversation.requests == ["poll", "reply"]
     assert conversation.spoken == ["LOCAL_MODEL_REPLY"]
 
 
@@ -284,7 +342,7 @@ async def test_route_outcomes_reach_robot_speech(conversation, route, expected, 
         vqa_handler=(lambda _: "No camera configured") if route == "no-vision" else None,
     )
 
-    assert conversation.requests == ["check_for_response", "reply"]
+    assert conversation.requests == ["poll", "reply"]
     assert conversation.spoken == [expected]
     assert rec.count("chat_model.generate") == generation_calls
     assert rec.count("answer_visual_question") == int(visual)
@@ -312,11 +370,12 @@ async def test_cloud_early_answer_only_rewords_before_speech(conversation, visua
     assert rec.count("answer_visual_question") == int(visual)
     assert rec.count("load_qdict_from_json") == int(not visual)
     assert rec.count("chat_model.generate") == 0
-    assert conversation.requests == ["check_for_response", "reply"]
+    assert conversation.requests == ["poll", "reply"]
     assert conversation.spoken == ["A desk lamp."]
 
 
-async def test_absent_and_repeated_transcriptions_do_not_generate_or_speak(conversation):
+@pytest.mark.parametrize("conversation", [True], indirect=True, ids=["legacy-server"])
+async def test_legacy_text_polling_retains_deduplication(conversation, caplog):
     rec = conversation.recorder
     await conversation.run(
         [
@@ -335,31 +394,124 @@ async def test_absent_and_repeated_transcriptions_do_not_generate_or_speak(conve
     )
 
     assert conversation.requests == [
-        "check_for_response",
-        "check_for_response",
-        "check_for_response",
-        "check_for_response",
+        "poll",
+        "poll",
+        "poll",
+        "poll",
         "reply",
-        "check_for_response",
-        "check_for_response",
-        "check_for_response",
+        "poll",
+        "poll",
+        "poll",
         "reply",
     ]
-    assert conversation.transcriptions == [
-        "No transcription",
-        "",
-        None,
-        "First",
-        "First",
-        "No transcription",
-        "Second",
-    ]
+    assert conversation.transcriptions == [None, None, None, "First", None, None, "Second"]
     calls = rec.for_target("openai.ChatCompletion.create")
     assert [call.kwargs["messages"][-1]["content"] for call in calls] == [
         "User:First",
         "User:Second",
     ]
     assert conversation.spoken == [f"Reply {len(call.kwargs['messages'])}" for call in calls]
+    assert caplog.text.count("Robot server lacks utterance IDs") == 1
+
+
+async def test_identical_utterances_already_queued_produce_two_turns(conversation):
+    await buddy1.MyFunctions.send_response("Yes")
+    await buddy1.MyFunctions.send_response("Yes")
+    await conversation.run(
+        [Poll.NO_NEW_UTTERANCE] * 3,
+        is_question=False,
+        nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
+    )
+    assert conversation.transcriptions == ["Yes", "Yes", None]
+    assert conversation.recorder.count("chat_model.generate") == 2
+    assert conversation.spoken == ["LOCAL_MODEL_REPLY"] * 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_texts"),
+    [
+        (DropTranscriptResponse.POLL, ["First", "Second"]),
+        (DropTranscriptResponse.ACK_BEFORE_REMOVAL, ["First", "Second"]),
+        (DropTranscriptResponse.ACK_AFTER_REMOVAL, ["Second"]),
+    ],
+)
+async def test_transcript_response_loss_and_reconnect(conversation, failure, expected_texts):
+    await buddy1.MyFunctions.send_response("First")
+    await buddy1.MyFunctions.send_response("Second")
+    conversation.drop_transcript_response = failure
+    await conversation.run(
+        [Poll.NO_NEW_UTTERANCE] * 4,
+        is_question=False,
+        nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
+    )
+    assert [text for text in conversation.transcriptions if text is not None] == expected_texts
+    assert conversation.spoken == ["LOCAL_MODEL_REPLY"] * len(expected_texts)
+    assert conversation.recorder.count("chat_model.generate") == len(expected_texts)
+
+
+async def test_desktop_restart_does_not_replay_accepted_transcript(conversation):
+    await buddy1.MyFunctions.send_response("Accepted just before desktop exit")
+    await buddy1.MyFunctions.send_response("Still pending")
+    assert (
+        await robot_client.TranscriptPoller().next_transcript()
+        == "Accepted just before desktop exit"
+    )
+    await robot_client.close_client()
+
+    await conversation.run(
+        [Poll.NO_NEW_UTTERANCE] * 2,
+        is_question=False,
+        nli_classifier=FakeNLIClassifier(conversation.recorder, routes=nli_routes()),
+    )
+    assert conversation.transcriptions == ["Still pending", None]
+    assert conversation.spoken == ["LOCAL_MODEL_REPLY"]
+
+
+async def test_malformed_authenticated_poll_response_does_not_enable_legacy(
+    conversation, monkeypatch, caplog
+):
+    async def unexpected_legacy_poll():
+        pytest.fail("Legacy polling must not run after an invalid response")
+
+    monkeypatch.setattr(buddy1.MyFunctions, "check_for_response", unexpected_legacy_poll)
+    conversation.malformed_poll_response = True
+    await conversation.run(["First", Poll.NO_NEW_UTTERANCE])
+    assert conversation.requests == ["poll", "poll"]
+    assert not conversation.spoken
+    assert "using legacy text polling" not in caplog.text
+
+
+async def test_wrong_secret_does_not_enable_legacy(conversation, monkeypatch, caplog):
+    await robot_client.close_client()
+    monkeypatch.setenv("DESKBUDDY_ROBOT_AUTH_SECRET", "wrong-test-secret-not-used-by-server")
+    await conversation.run([Poll.NO_NEW_UTTERANCE])
+    assert conversation.requests == ["poll"]
+    assert not conversation.spoken
+    assert "using legacy text polling" not in caplog.text
+
+
+async def test_truthy_nonboolean_ack_cannot_start_a_turn(conversation):
+    conversation.malformed_transcript_ack = True
+    await conversation.run(["First", Poll.NO_NEW_UTTERANCE])
+    assert conversation.requests == ["poll", "poll"]
+    assert not conversation.spoken
+    assert conversation.recorder.count("chat_model.generate") == 0
+
+
+async def test_legacy_connection_is_reprobed_after_disconnect(
+    monkeypatch, ephemeral_server_config, caplog
+):
+    async with conversation_server(
+        monkeypatch, ephemeral_server_config, legacy_server=True
+    ) as conversation:
+        poller = robot_client.TranscriptPoller()
+        conversation.poll = "Legacy turn"
+        assert await poller.next_transcript() == "Legacy turn"
+        client = await robot_client.get_robot_client()
+        await client.close()
+        conversation.poll = "Another legacy turn"
+        assert await poller.next_transcript() == "Another legacy turn"
+        assert caplog.text.count("Robot server lacks utterance IDs") == 2
 
 
 @pytest.mark.parametrize("result", [None, "", "\n \t"], ids=["error", "empty", "whitespace"])
@@ -383,7 +535,7 @@ async def test_unusable_provider_result_skips_speech_and_next_turn_recovers(
         openai_sdk=FakeOpenAISDK(rec, chat_reply=chat_reply),
     )
 
-    assert conversation.requests == ["check_for_response", "check_for_response", "reply"]
+    assert conversation.requests == ["poll", "poll", "reply"]
     assert conversation.spoken == ["I can help now."]
     assert rec.count("openai.ChatCompletion.create") == 2
     if result is None:
@@ -416,7 +568,7 @@ async def test_speech_failure_is_reported_and_polling_continues(conversation, ca
     )
     assert error.code == expected_code
     assert conversation.unknown == []
-    assert conversation.requests == ["check_for_response", "reply", "check_for_response", "reply"]
+    assert conversation.requests == ["poll", "reply", "poll", "reply"]
     assert conversation.received_replies == conversation.spoken == ["Second reply"]
     assert f"Could not confirm speech delivery ({expected_code})" in capsys.readouterr().out
 
@@ -444,7 +596,7 @@ async def test_non_text_model_result_is_not_spoken(conversation, monkeypatch, ca
 
     monkeypatch.setattr(f"{__name__}.load_botcortex_runtime", load_with_non_text_result)
     await conversation.run(["Hello", Poll.NO_NEW_UTTERANCE])
-    assert conversation.requests == ["check_for_response"] * 2
+    assert conversation.requests == ["poll"] * 2
     assert conversation.received_replies == conversation.spoken == []
     assert "Could not generate a text reply" in capsys.readouterr().out
 
@@ -460,7 +612,7 @@ async def test_lost_speech_acknowledgement_is_reported_without_retry(conversatio
     (unknown,) = conversation.unknown
     assert unknown.command == "reply"
     assert unknown.request_id
-    assert conversation.requests == ["check_for_response", "reply", "check_for_response"]
+    assert conversation.requests == ["poll", "reply", "poll"]
     assert conversation.received_replies == ["LOCAL_MODEL_REPLY"]
     assert conversation.spoken == ["LOCAL_MODEL_REPLY"]
     assert "Will not automatically retry physical speech action" in capsys.readouterr().out

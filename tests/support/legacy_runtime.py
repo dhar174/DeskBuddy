@@ -460,16 +460,11 @@ def load_start_bot_main(
             "BotCortex": SimpleNamespace(**{**cortex, "load_all_models": skip_startup}),
             "helpers": SimpleNamespace(load_models=skip_startup),
             "rc": robot_client,
-            "asyncio": SimpleNamespace(sleep=yield_without_delay),
+            "asyncio": SimpleNamespace(
+                sleep=yield_without_delay, TimeoutError=asyncio.TimeoutError
+            ),
             "local_only": local_only,
             "button_text": button_text,
-            "user_response": "",
-            "message": "",
-            "lastMessage": "",
-            "lastReply": "",
-            "priorMessage": "",
-            "priorReply": "",
-            "reply": "",
         },
     )
     return ns["main"]

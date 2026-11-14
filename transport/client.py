@@ -29,7 +29,7 @@ from transport.protocol import (
 logger = logging.getLogger(__name__)
 
 SAFE_IDEMPOTENT_COMMANDS: frozenset[str] = frozenset(
-    {"ping", "simple_test", "check_for_response", "test_timing", "hang"}
+    {"ping", "simple_test", "check_for_response", "poll_transcript", "test_timing", "hang"}
 )
 
 KNOWN_PHYSICAL_COMMANDS: frozenset[str] = frozenset(
@@ -104,11 +104,17 @@ class RobotClient(RobotTransport):
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._connection_generation = 0
         self._lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
+
+    @property
+    def connection_generation(self) -> int:
+        """Increment when a new socket connects, including after a failed request."""
+        return self._connection_generation
 
     async def _ensure_connected(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         if self._reader is not None and self._writer is not None and not self._writer.is_closing():
@@ -129,6 +135,7 @@ class RobotClient(RobotTransport):
                 )
                 self._reader = reader
                 self._writer = writer
+                self._connection_generation += 1
                 logger.debug(
                     "Connected to robot server at %s:%d (attempt %d/%d)",
                     self.config.host,
@@ -182,11 +189,13 @@ class RobotClient(RobotTransport):
         timeout: float | None = None,
         side_effects: bool | None = None,
         request_id: str | None = None,
+        expected_connection_generation: int | None = None,
     ) -> RobotResponse:
         """Send an authenticated command and wait for a verified response.
 
         Never retries potentially executed physical commands.
         Retries only safe/idempotent commands or pre-transmission failures.
+        A request pinned to a connection cannot be sent after reconnecting.
         """
         if timeout is not None:
             timeout = validate_timeout_override(timeout)
@@ -260,6 +269,15 @@ class RobotClient(RobotTransport):
                     ) from exc
             else:
                 reader, writer = await self._ensure_connected()
+
+            if (
+                expected_connection_generation is not None
+                and self.connection_generation != expected_connection_generation
+            ):
+                raise TransportError(
+                    TransportErrorCode.INTERNAL_ERROR,
+                    "Robot connection changed before the request was sent",
+                )
 
             # Phase 3: Transmission and response deadline (starts after connection succeeds)
             if timeout is not None:
@@ -396,7 +414,7 @@ class RobotClient(RobotTransport):
                                 "Connection dropped during attempt %d: %s", send_attempt, exc
                             )
                             await self._disconnect()
-                            if send_attempt == 1:
+                            if send_attempt == 1 or expected_connection_generation is not None:
                                 raise TransportError(
                                     TransportErrorCode.INTERNAL_ERROR,
                                     f"Connection interrupted during request: {exc}",

@@ -210,6 +210,29 @@ See the [testing guide](testing.md) for the locked CPU-only checks and loopback
 transport tests. Keep the repository root a non-package (no root `__init__.py`);
 production packages belong under `src/` or in the temporary `transport/` boundary.
 
+### Transcript delivery
+
+Run one desktop conversation client per robot. Updated robot adapters queue up to
+32 finalized nonblank transcripts in memory, in capture order. Each utterance
+gets its own ID, so separate utterances with identical text can both reach the
+desktop. A full queue rejects new arrivals. Transcripts too large for a signed
+poll response are rejected. Those warnings omit transcript text.
+
+The desktop begins a turn after an authenticated acknowledgement confirms that
+the robot removed the queued transcript. A lost poll response leaves it pending.
+A lost acknowledgement can lose that turn if removal already happened. A
+desktop crash after acknowledgement can also lose that turn. A reconnect can
+deliver pending entries, while a robot restart clears the in-memory queue.
+Uncertain speech delivery still uses `ExecutionOutcomeUnknown` and does not
+resend the speech action.
+
+An older desktop can still use an updated robot via `check_for_response`. An
+updated desktop warns and falls back to legacy text polling for a connection
+when the authenticated robot explicitly reports that `poll_transcript` is
+unsupported. Legacy polling retains its text deduplication and stale-transcript
+limits. Restart the robot server when switching between legacy and ID-based
+polling to discard pending queue entries.
+
 ## Larynx Docker limitation
 
 `larynx.Dockerfile` is retained byte-for-byte. It builds a Debian `.deb` under

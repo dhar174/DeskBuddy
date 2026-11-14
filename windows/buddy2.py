@@ -54,6 +54,7 @@ from transport import (
     validate_say_arguments,
     validate_wait_arguments,
 )
+from transport.transcripts import TranscriptQueue
 
 _ALLOW_MOCK = (
     os.getenv("DESKBUDDY_MOCK_HARDWARE", "").lower() in ("1", "true", "yes")
@@ -105,6 +106,7 @@ lastReplyMessage = ""
 priorReplyMessage = ""
 lastTranscription = ""
 priorTranscription = ""
+transcript_queue = TranscriptQueue()
 listening = False
 
 
@@ -233,6 +235,7 @@ class MyFunctions:
         priorTranscription = lastTranscription
         lastTranscription = text
         result = None
+        transcript_queue.enqueue(text)
         return
 
     async def reply(text):
@@ -546,7 +549,12 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
     registry.register("wait", _handle_wait, validate_wait_arguments)
     registry.register("picoh_wait", _handle_wait, validate_wait_arguments)
 
-    return RobotServer(config=cfg, registry=registry, hardware_executor=get_default_hardware_executor())
+    return RobotServer(
+        config=cfg,
+        registry=registry,
+        hardware_executor=get_default_hardware_executor(),
+        transcript_queue=transcript_queue,
+    )
 
 
 async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:

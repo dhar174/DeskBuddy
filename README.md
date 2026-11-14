@@ -327,7 +327,9 @@ Unrestricted dynamic dispatch (`getattr(MyFunctions, ...)`) has been completely 
 
 | Command | Arguments | Validation Rules | Description |
 | :--- | :--- | :--- | :--- |
-| `check_for_response` | `{}` | No arguments accepted | Polls for latest Whisper STT transcription |
+| `check_for_response` | `{}` | No arguments accepted | Legacy text polling |
+| `poll_transcript` | `{}` | Canonical UUID request ID | Returns the oldest pending `{id, text}`, or `null` |
+| `ack_transcript` | `{"id": "<uuid>"}` | Canonical UUID request and transcript IDs | Removes the matching head and returns `true`. Other IDs return `false`. |
 | `reply` | `{"message": str}` | String, length $\le 10,000$ | Commands Picoh to speak assistant response |
 | `simple_test` / `ping` | `{}` | No arguments accepted | Health check / connectivity ping |
 | `base_col` / `baseCol` | `{"r": int, "g": int, "b": int}` | Integers in `[0, 10]` (rejected with `invalid_arguments` if out of bounds) | Sets base LED color |
