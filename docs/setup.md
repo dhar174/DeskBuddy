@@ -111,6 +111,26 @@ An empty or one-entry question bank skips semantic search and returns the existi
 language-model fallback signal; it never tries to embed an empty collection or
 compare two missing candidates.
 
+The question bank remains a UTF-8 JSON object whose keys are question strings
+and whose values are answer strings. A missing bank is treated as empty.
+If the file contains malformed JSON or invalid UTF-8, DeskBuddy reports
+`malformed-file`. A JSON value with the wrong structure reports `invalid-shape`.
+In either case the warning identifies the file and reason, the conversation
+can continue without saved answers, and saves refuse to overwrite the file.
+Filesystem errors such as insufficient permissions are reported separately.
+
+To recover, stop DeskBuddy and make a copy of the damaged file. Restore a
+valid backup to `question_file.json` or move the damaged file aside to start
+with an empty bank. Keep the copy for inspection or eventual migration.
+Conversation lookups do not automatically save changes to the bank.
+
+Within one DeskBuddy process, reads and saves are serialized. Each save
+publishes a complete replacement on the local filesystem. A failure before
+replacement leaves the prior file intact. The last successful full replacement
+wins. These guarantees cover normal local filesystem operation through the
+question bank helpers. Run separate writing processes with separate data
+directories.
+
 `device=auto` keeps CUDA-if-available/CPU fallback when the legacy runtime asks
 for a device; `cpu`, `cuda`, `mps` are explicit preferences. Unsupported hardware
 is rejected when the optional runtime resolves it, without importing Torch for

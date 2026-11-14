@@ -2,9 +2,10 @@
 # from optimum.onnxruntime import OrtModelForCausalLM
 # from soft_embedding import SoftEmbedding
 import asyncio
-import json
+import logging
 import threading
 import psutil
+from deskbuddy import question_bank
 from deskbuddy.settings import SettingsError, load_settings
 from PIL import Image
 import cv2 as cv
@@ -954,7 +955,15 @@ async def search_question_in_bank(qdict, question):
 
 async def query_memory(query):
     # Load the question bank
-    qdict = await load_qdict_from_json()
+    try:
+        qdict = await load_qdict_from_json()
+    except question_bank.QuestionBankDataError as exc:
+        logging.getLogger(__name__).warning(
+            "Question bank unavailable at %s (%s); continuing without saved answers",
+            exc.path,
+            exc.reason,
+        )
+        return query, False
     # Search the question bank
     answer, found = await search_question_in_bank(qdict, query)
     unknown_sentinels = {
@@ -974,25 +983,13 @@ async def query_memory(query):
 
 
 async def save_qdict_to_json(my_dict):
-    settings = load_settings()
-    settings.prepare_directories()
-    with settings.data_path("question_file.json").open("w", encoding="utf-8") as f:
-        # Save the key-value pairs to the file using JSON encoding
-        json.dump(my_dict, f)
-
-
-# Open the file for reading
+    path = load_settings().data_path("question_file.json")
+    question_bank.save_question_bank(path, my_dict)
 
 
 async def load_qdict_from_json():
-    question_file = load_settings().data_path("question_file.json")
-    if not question_file.exists():
-        return {}
-    with question_file.open("r", encoding="utf-8") as f:
-        # Load the key-value pairs from the file using JSON decoding
-        my_dict = json.load(f)
-        print("type:", type(my_dict))
-        return my_dict
+    path = load_settings().data_path("question_file.json")
+    return question_bank.load_question_bank(path)
 
 
 async def init():

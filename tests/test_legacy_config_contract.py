@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from deskbuddy import question_bank
 from deskbuddy.settings import Settings, SettingsError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +46,7 @@ def test_question_bank_missing_file_is_empty_and_has_no_cwd_side_effect(
     load = _extract_functions(
         BOT_CORTEX_PATH,
         {"load_qdict_from_json"},
-        {"json": json, "load_settings": lambda: settings},
+        {"question_bank": question_bank, "load_settings": lambda: settings},
     )["load_qdict_from_json"]
 
     assert asyncio.run(load()) == {}
@@ -67,7 +68,7 @@ def test_question_bank_existing_file_is_read_from_user_data(
     load = _extract_functions(
         BOT_CORTEX_PATH,
         {"load_qdict_from_json"},
-        {"json": json, "load_settings": lambda: settings},
+        {"question_bank": question_bank, "load_settings": lambda: settings},
     )["load_qdict_from_json"]
 
     assert asyncio.run(load()) == expected
@@ -87,7 +88,7 @@ def test_question_bank_save_targets_user_data_not_cwd(
     save = _extract_functions(
         BOT_CORTEX_PATH,
         {"save_qdict_to_json"},
-        {"json": json, "load_settings": lambda: settings},
+        {"question_bank": question_bank, "load_settings": lambda: settings},
     )["save_qdict_to_json"]
     qdict = {"where are you?": "right here"}
 

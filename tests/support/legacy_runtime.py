@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import json
+import logging
 import sys
 import threading
 import time
@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from deskbuddy import question_bank
 from deskbuddy.settings import Settings
 from tests.support.fakes import (
     CallRecorder,
@@ -193,6 +194,7 @@ def load_botcortex_runtime(
     embedding_scores: list[float] | None = None,
     qdict_data: dict[str, str] | None = None,
     qgen_output: str = "Could you clarify what you mean?",
+    use_disk_question_bank: bool = False,
 ) -> tuple[dict[str, Any], CallRecorder]:
     """Load real routing, memory, and talk_* functions from BotCortex.py."""
     rec = recorder or CallRecorder()
@@ -284,6 +286,8 @@ def load_botcortex_runtime(
         "load_all_models",
         "is_requesting_SD",
     }
+    if use_disk_question_bank:
+        cortex_names.update({"load_qdict_from_json", "save_qdict_to_json"})
 
     async def fake_init_fn(name: str) -> tuple[str, str]:
         rec.record(name)
@@ -320,7 +324,9 @@ def load_botcortex_runtime(
 
     globals_: dict[str, Any] = {
         "asyncio": asyncio,
-        "json": json,
+        "__name__": "BotCortex",
+        "logging": logging,
+        "question_bank": question_bank,
         "threading": threading,
         "time": SimpleNamespace(time=time.monotonic, sleep=lambda _s: None),
         "load_settings": lambda overrides=None: effective_settings,

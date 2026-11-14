@@ -449,6 +449,30 @@ async def test_non_text_model_result_is_not_spoken(conversation, monkeypatch, ca
     assert "Could not generate a text reply" in capsys.readouterr().out
 
 
+async def test_corrupt_question_bank_falls_through_to_generation(conversation, tmp_path, caplog):
+    bank = tmp_path / "question_file.json"
+    damaged = b'{"private-memory-fragment":'
+    bank.write_bytes(damaged)
+    rec = conversation.recorder
+
+    await conversation.run(
+        ["What is the capital of France?"],
+        settings=Settings(data_dir=tmp_path, cache_dir=tmp_path / "cache"),
+        use_disk_question_bank=True,
+        nli_classifier=FakeNLIClassifier(rec, routes=nli_routes()),
+    )
+
+    assert conversation.received_replies == conversation.spoken == ["LOCAL_MODEL_REPLY"]
+    assert rec.count("chat_model.generate") == 1
+    assert rec.count("get_embeddings") == 0
+    assert bank.read_bytes() == damaged
+    warnings = [record.getMessage() for record in caplog.records if record.name == "BotCortex"]
+    (warning,) = warnings
+    assert str(bank) in warning
+    assert "malformed-file" in warning
+    assert "private-memory-fragment" not in caplog.text
+
+
 async def test_lost_speech_acknowledgement_is_reported_without_retry(conversation, capsys):
     conversation.drop_reply_ack = True
     await conversation.run(
