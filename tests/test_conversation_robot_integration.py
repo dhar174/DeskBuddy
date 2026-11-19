@@ -416,9 +416,16 @@ async def test_desktop_close_before_selection_skips_startup_and_polling(conversa
 
 
 async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation, monkeypatch):
+    loop = asyncio.get_running_loop()
     client = await robot_client.get_robot_client()
     real_loader = load_botcortex_runtime
     acknowledged_request_starts: list[float] = []
+
+    def age_connection() -> None:
+        request_started_at = client._last_request_started_at
+        assert request_started_at is not None
+        acknowledged_request_starts.append(request_started_at)
+        client._last_request_started_at = loop.time() - 2 * client.config.read_timeout
 
     def load_with_slow_model(**options):
         cortex, recorder = real_loader(**options)
@@ -427,12 +434,7 @@ async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation
 
         def generate_after_slow_turn(*args, **kwargs):
             result = generate(*args, **kwargs)
-            request_started_at = client._last_request_started_at
-            assert request_started_at is not None
-            acknowledged_request_starts.append(request_started_at)
-            client._last_request_started_at = (
-                asyncio.get_running_loop().time() - 2 * client.config.read_timeout
-            )
+            loop.call_soon_threadsafe(age_connection)
             return result
 
         model.generate = generate_after_slow_turn
@@ -454,9 +456,17 @@ async def test_slow_model_turn_refreshes_stale_socket_before_speech(conversation
 
 
 async def test_slow_model_turn_reuses_socket_below_refresh_threshold(conversation, monkeypatch):
+    loop = asyncio.get_running_loop()
     client = await robot_client.get_robot_client()
     real_loader = load_botcortex_runtime
     acknowledged_request_starts: list[float] = []
+
+    def age_connection() -> None:
+        request_started_at = client._last_request_started_at
+        assert request_started_at is not None
+        acknowledged_request_starts.append(request_started_at)
+        refresh_after = client.config.read_timeout - min(1.0, client.config.read_timeout * 0.2)
+        client._last_request_started_at = loop.time() - refresh_after * 0.5
 
     def load_with_nearly_stale_model(**options):
         cortex, recorder = real_loader(**options)
@@ -465,13 +475,7 @@ async def test_slow_model_turn_reuses_socket_below_refresh_threshold(conversatio
 
         def generate_before_refresh_threshold(*args, **kwargs):
             result = generate(*args, **kwargs)
-            request_started_at = client._last_request_started_at
-            assert request_started_at is not None
-            acknowledged_request_starts.append(request_started_at)
-            refresh_after = client.config.read_timeout - min(1.0, client.config.read_timeout * 0.2)
-            client._last_request_started_at = asyncio.get_running_loop().time() - (
-                refresh_after * 0.5
-            )
+            loop.call_soon_threadsafe(age_connection)
             return result
 
         model.generate = generate_before_refresh_threshold
@@ -761,7 +765,7 @@ async def test_startup_loop_handles_settings_error_caps_backoff_and_resets(capsy
         pytest.fail("The scripted polls must not generate replies")
 
     main = load_start_bot_main(
-        {},
+        {"start_workers": lambda: None, "shutdown_workers": lambda: None},
         SimpleNamespace(
             TranscriptPoller=lambda: SimpleNamespace(next_transcript=next_transcript),
             close_client=close_client,

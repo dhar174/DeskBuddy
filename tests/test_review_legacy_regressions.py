@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from deskbuddy.legacy_worker import LegacyWorker, WorkerBusyError, WorkerClosedError
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BOT_CORTEX_PATH = REPOSITORY_ROOT / "BotCortex.py"
 
@@ -18,7 +20,7 @@ def _vqa_runtime(
     model_loader: Callable[[str], Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     tree = ast.parse(BOT_CORTEX_PATH.read_text(encoding="utf-8"), filename=str(BOT_CORTEX_PATH))
-    names = {"_answer_visual_question_sync", "answer_visual_question"}
+    names = {"_get_legacy_worker", "_answer_visual_question_sync", "answer_visual_question"}
     functions = {
         node.name: node
         for node in tree.body
@@ -123,6 +125,11 @@ def _vqa_runtime(
         "visionQA_processor": None,
         "visionQA_model": None,
         "_vqa_lock": threading.Lock(),
+        "LegacyWorker": LegacyWorker,
+        "WorkerBusyError": WorkerBusyError,
+        "WorkerClosedError": WorkerClosedError,
+        "_legacy_workers": {"vision": LegacyWorker("review-vision", use_default_executor=True)},
+        "_runtime_shutdown": False,
     }
     exec(compile(module, str(BOT_CORTEX_PATH), "exec"), namespace)
     return namespace, settings.__dict__
@@ -142,14 +149,31 @@ def test_empty_and_single_entry_question_banks_return_without_embedding() -> Non
         for item in tree.body
         if isinstance(item, ast.AsyncFunctionDef) and item.name == "search_question_in_bank"
     )
-    module = ast.Module(body=[node], type_ignores=[])
+    sync_node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "_search_question_sync"
+    )
+    module = ast.Module(body=[sync_node, node], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace: dict[str, Any] = {
         "__builtins__": __builtins__,
-        "get_embeddings": lambda _value: (_ for _ in ()).throw(
+        "_get_embeddings_sync": lambda *_args: (_ for _ in ()).throw(
             AssertionError("embeddings should not be needed for fewer than two entries")
         ),
+        "search_model": None,
+        "search_tokenizer": None,
+        "device": "cpu",
+        "torch": SimpleNamespace(),
+        "F": SimpleNamespace(),
     }
+    worker = LegacyWorker("review-search-empty")
+
+    async def run_legacy_stage(operation: Callable[[], Any]) -> Any:
+        worker.start()
+        return await worker.submit(operation)
+
+    namespace["run_legacy_stage"] = run_legacy_stage
     exec(compile(module, str(BOT_CORTEX_PATH), "exec"), namespace)
 
     async def exercise() -> None:
@@ -160,6 +184,7 @@ def test_empty_and_single_entry_question_banks_return_without_embedding() -> Non
         )
 
     asyncio.run(exercise())
+    worker.shutdown()
 
 
 def test_two_entry_question_bank_preserves_high_confidence_match() -> None:
@@ -169,7 +194,12 @@ def test_two_entry_question_bank_preserves_high_confidence_match() -> None:
         for item in tree.body
         if isinstance(item, ast.AsyncFunctionDef) and item.name == "search_question_in_bank"
     )
-    module = ast.Module(body=[node], type_ignores=[])
+    sync_node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "_search_question_sync"
+    )
+    module = ast.Module(body=[sync_node, node], type_ignores=[])
     ast.fix_missing_locations(module)
 
     class Vector:
@@ -225,17 +255,27 @@ def test_two_entry_question_bank_preserves_high_confidence_match() -> None:
 
     embedding_calls = 0
 
-    async def embeddings(_value: Any) -> Vector:
+    def embeddings(*_args: Any) -> Vector:
         nonlocal embedding_calls
         embedding_calls += 1
         return Vector([1.0, 0.0])
 
     namespace: dict[str, Any] = {
         "__builtins__": __builtins__,
-        "get_embeddings": embeddings,
+        "_get_embeddings_sync": embeddings,
         "F": FakeFunctional,
         "torch": FakeTorch,
+        "search_model": None,
+        "search_tokenizer": None,
+        "device": "cpu",
     }
+    worker = LegacyWorker("review-search-two")
+
+    async def run_legacy_stage(operation: Callable[[], Any]) -> Any:
+        worker.start()
+        return await worker.submit(operation)
+
+    namespace["run_legacy_stage"] = run_legacy_stage
     exec(compile(module, str(BOT_CORTEX_PATH), "exec"), namespace)
 
     result = asyncio.run(
@@ -244,6 +284,7 @@ def test_two_entry_question_bank_preserves_high_confidence_match() -> None:
             "question",
         )
     )
+    worker.shutdown()
 
     assert result == ("first answer", True)
     assert embedding_calls == 2
@@ -359,7 +400,6 @@ def test_failed_vqa_initialization_leaves_cache_empty_and_retries() -> None:
 def test_concurrent_cancelled_first_vqa_requests_publish_one_complete_cache() -> None:
     entered_loader = threading.Event()
     release_loader = threading.Event()
-    second_lock_attempt = threading.Event()
     counts = {"processor": 0, "model": 0}
     counts_lock = threading.Lock()
 
@@ -371,8 +411,6 @@ def test_concurrent_cancelled_first_vqa_requests_publish_one_complete_cache() ->
         def __enter__(self) -> "ProbeLock":
             with counts_lock:
                 self.attempts += 1
-                if self.attempts == 2:
-                    second_lock_attempt.set()
             self.lock.acquire()
             return self
 
@@ -421,12 +459,27 @@ def test_concurrent_cancelled_first_vqa_requests_publish_one_complete_cache() ->
     watchdog.start()
 
     async def exercise() -> tuple[str, bool]:
+        second_submitted = asyncio.Event()
+        worker = namespace["_legacy_workers"]["vision"]
+        original_submit = worker.submit
+        submissions = 0
+
+        async def observe_submit(operation: Callable[[], Any], *, stop: Any = None) -> Any:
+            nonlocal submissions
+            submissions += 1
+            if submissions == 2:
+                second_submitted.set()
+            return await original_submit(operation, stop=stop)
+
+        worker.submit = observe_submit
         first = asyncio.create_task(namespace["answer_visual_question"]("What is shown?"))
         started = await asyncio.to_thread(entered_loader.wait, 1)
         assert started, "first VQA request did not reach model loading"
         second = asyncio.create_task(namespace["answer_visual_question"]("What is shown?"))
-        waiting = await asyncio.to_thread(second_lock_attempt.wait, 1)
-        assert waiting, "second VQA request did not wait for the shared lock"
+        await asyncio.wait_for(second_submitted.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not second.done(), "second VQA request must wait for active cache warming"
+        assert namespace["_vqa_lock"].attempts == 1
         first.cancel()
         try:
             await first
@@ -436,6 +489,12 @@ def test_concurrent_cancelled_first_vqa_requests_publish_one_complete_cache() ->
             raise AssertionError("the first coroutine should be cancellable")
         assert namespace["visionQA_processor"] is None
         assert namespace["visionQA_model"] is None
+        try:
+            await namespace["answer_visual_question"]("A conflicting request")
+        except WorkerBusyError:
+            pass
+        else:
+            raise AssertionError("a new VQA request must not pass an abandoned owner")
         release_loader.set()
         return await second, True
 

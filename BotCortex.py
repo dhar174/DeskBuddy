@@ -6,6 +6,7 @@ import logging
 import threading
 import psutil
 from deskbuddy import question_bank
+from deskbuddy.legacy_worker import LegacyWorker, WorkerBusyError, WorkerClosedError
 from deskbuddy.settings import SettingsError, load_settings
 from PIL import Image
 import cv2 as cv
@@ -52,7 +53,7 @@ from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.feature_extraction.text import CountVectorizer
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import re
-from functools import lru_cache
+from functools import lru_cache, wraps
 import time
 import helpers
 import datasets
@@ -71,6 +72,129 @@ import openai
 
 _question_bank_warning_lock = threading.Lock()
 _question_bank_warning_reasons = {}
+_legacy_workers = {}
+_history_export_lock = threading.Lock()
+_turn_lock = None
+_turn_lock_loop = None
+_runtime_shutdown = False
+
+
+def _get_legacy_worker(name, *, use_default_executor=False):
+    if _runtime_shutdown:
+        raise WorkerClosedError("DeskBuddy workers are shut down; call start_workers() first")
+    worker = _legacy_workers.get(name)
+    if worker is not None and worker.can_replace:
+        worker.shutdown()
+        worker = None
+    if worker is None:
+        worker = LegacyWorker(name, use_default_executor=use_default_executor)
+        _legacy_workers[name] = worker
+    try:
+        worker.start()
+    except WorkerClosedError:
+        if not worker.can_replace:
+            raise WorkerBusyError(f"{name} is still active and cannot be restarted")
+        worker = LegacyWorker(name, use_default_executor=use_default_executor)
+        _legacy_workers[name] = worker
+        worker.start()
+    except RuntimeError:
+        if not worker.can_replace:
+            if worker.busy:
+                raise WorkerBusyError(f"{name} is still active on its previous loop")
+            raise
+        worker.shutdown()
+        worker = LegacyWorker(name, use_default_executor=use_default_executor)
+        _legacy_workers[name] = worker
+        worker.start()
+    return worker
+
+
+def start_workers():
+    """Start the legacy runtime owners on the active asyncio loop."""
+    global _runtime_shutdown
+    _runtime_shutdown = False
+    try:
+        _get_legacy_worker("desktop", use_default_executor=False)
+        _get_legacy_worker("question-bank", use_default_executor=True)
+        _get_legacy_worker("vision", use_default_executor=True)
+    except Exception:
+        _runtime_shutdown = True
+        shutdown_workers()
+        raise
+
+
+def shutdown_workers():
+    """Stop worker admission without blocking shutdown on active inference."""
+    global _runtime_shutdown
+    _runtime_shutdown = True
+    busy_names = []
+    for name, worker in tuple(_legacy_workers.items()):
+        worker.shutdown()
+        if worker.busy:
+            busy_names.append(name)
+    if busy_names:
+        logging.getLogger("BotCortex").warning(
+            "Legacy workers still active after shutdown: %s", ", ".join(busy_names)
+        )
+
+
+async def run_legacy_stage(operation, *, stop=None):
+    """Run one complete synchronous model stage on the serialized desktop owner."""
+    return await _get_legacy_worker("desktop", use_default_executor=False).submit(
+        operation, stop=stop
+    )
+
+
+def _get_turn_lock():
+    global _turn_lock
+    global _turn_lock_loop
+    loop = asyncio.get_running_loop()
+    if _turn_lock_loop is not loop:
+        if _turn_lock is not None and _turn_lock.locked():
+            raise RuntimeError("A DeskBuddy turn is still active on another event loop")
+        _turn_lock_loop = loop
+        _turn_lock = asyncio.Lock()
+    return _turn_lock
+
+
+def _serialize_turn(function):
+    @wraps(function)
+    async def serialized(*args, **kwargs):
+        async with _get_turn_lock():
+            state_names = (
+                "history",
+                "history_nonlocal",
+                "named_entities",
+                "important_words",
+                "after_first",
+                "after_second",
+                "unfound_answer",
+                "asked_follow_up",
+            )
+            state_snapshot = {}
+            for name in state_names:
+                if name in globals():
+                    value = globals()[name]
+                    if isinstance(value, list):
+                        value = list(value)
+                    elif isinstance(value, dict):
+                        value = dict(value)
+                    state_snapshot[name] = value
+            try:
+                return await function(*args, **kwargs)
+            except BaseException:
+                for name, value in state_snapshot.items():
+                    current = globals().get(name)
+                    if isinstance(current, list) and isinstance(value, list):
+                        current[:] = value
+                    elif isinstance(current, dict) and isinstance(value, dict):
+                        current.clear()
+                        current.update(value)
+                    else:
+                        globals()[name] = value
+                raise
+
+    return serialized
 
 unfound_answer = False
 asked_follow_up = False
@@ -379,25 +503,25 @@ async def load_all_models(button_text, local_only):
     return
 
 
-async def find_names(text):
-    global named_entities
-    # Use the spacy NER model to identify named entities in the text
-    doc = nlp(text)
-
-    # Extract the names of people from the list of named entities
-    names = []
-    for ent in doc.ents:
-        if ent.label_ == "PERSON":
-            names.append(ent.text)
-            # print("\n"+"name found: "+ent.text)
+def _find_names_sync(text, nlp_snapshot):
+    """Run NER without mutating event-loop-owned dialogue state."""
+    doc = nlp_snapshot(text)
+    names = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
     print("Names: ")
     print(names)
-    for name in names:
-        # Add the name to the list of named entities
-        if name not in named_entities:
-            named_entities.append(name)
+    return names
 
-    # Return the list of names
+
+async def find_names(text, *, commit=True):
+    global named_entities
+    nlp_snapshot = nlp
+    names = await run_legacy_stage(lambda: _find_names_sync(text, nlp_snapshot))
+    if commit:
+        merged_names = list(names)
+        for name in named_entities:
+            if name not in merged_names:
+                merged_names.append(name)
+        named_entities = merged_names
     return names
 
 
@@ -407,119 +531,134 @@ async def find_names(text):
 # Function to generate a summary of the conversation so far
 
 
-async def generate_summary(text):
-    global history
-    global history_nonlocal
-    global longsummarizer
-    global device
-    global local_only_mode
-    sum = ""
-    if local_only_mode:
-        print("sum device: " + "cpu")
-        # print("first prompt summary: "+'\n')
-        # print(fp_sum)
+def _generate_initial_summary_sync(first_prompt, tokenizer_snapshot, summarizer_snapshot):
+    prompt_inputs = tokenizer_snapshot(
+        first_prompt, return_tensors="pt", max_length=512, truncation=True
+    )["input_ids"]
+    generated = summarizer_snapshot.generate(input_ids=prompt_inputs).to("cpu")
+    return tokenizer_snapshot.decode(generated[0], skip_special_tokens=True)
 
-        # Join the prompts in the prompt history into a single string
-        conversation = "\n".join(history)
-        # print(conversation)
-        # conversation = "summarize: " + text+" " + conversation[:128] + first_prompt
-        print(conversation)
 
-        prompt_inputs = sumtokenizer(
+def _generate_summary_sync(
+    text,
+    history_snapshot,
+    sumtokenizer_snapshot,
+    summarizer_snapshot,
+    fp_sum_snapshot,
+    local_only_snapshot,
+):
+    """Generate a conversation summary from immutable turn inputs."""
+    summary_text = ""
+    if local_only_snapshot:
+        conversation = "\n".join(history_snapshot)
+        prompt_inputs = sumtokenizer_snapshot(
             text, return_tensors="pt", max_length=512, truncation=True
         )["input_ids"].to("cpu")
-        # Use the summarizer model to generate a summary of the conversation
-        prompt_summary = longsummarizer.generate(input_ids=prompt_inputs).to("cpu")
-        p_sum = sumtokenizer.decode(prompt_summary[0], skip_special_tokens=True)
-        print("prompt summary" + "\n")
-        print(p_sum)
-        history_inputs = sumtokenizer(
+        prompt_summary = summarizer_snapshot.generate(input_ids=prompt_inputs).to("cpu")
+        prompt_summary_text = sumtokenizer_snapshot.decode(
+            prompt_summary[0], skip_special_tokens=True
+        )
+
+        history_inputs = sumtokenizer_snapshot(
             conversation, return_tensors="pt", max_length=512, truncation=True
         )["input_ids"].to("cpu")
-        # Use the summarizer model to generate a summary of the conversation
-        history_summary = longsummarizer.generate(input_ids=history_inputs).to("cpu")
-        h_sum = sumtokenizer.decode(history_summary[0], skip_special_tokens=True)
-        print("history summary" + "\n")
-        print(h_sum)
-        print("\n")
+        history_summary = summarizer_snapshot.generate(input_ids=history_inputs).to("cpu")
+        history_summary_text = sumtokenizer_snapshot.decode(
+            history_summary[0], skip_special_tokens=True
+        )
 
-        full_inputs = p_sum + "  " + fp_sum + "  " + h_sum
-        print("full inputs")
-        print(full_inputs)
-        sum_inputs = sumtokenizer(
+        full_inputs = (
+            prompt_summary_text + "  " + fp_sum_snapshot + "  " + history_summary_text
+        )
+        sum_inputs = sumtokenizer_snapshot(
             full_inputs, return_tensors="pt", max_length=512, truncation=True
         )["input_ids"].to("cpu")
-        # Use the summarizer model to generate a summary of the conversation
-        summary = longsummarizer.generate(input_ids=sum_inputs).to("cpu")
-        sum = sumtokenizer.decode(summary[0], skip_special_tokens=True)
-        print("combined summary" + "\n")
-        # print(summary)
-        print(sum)
-    else:
-        pass
-        # current_user_message = {
-        #     "role": "user",
-        #     "content": "Now please summarize the conversation so far.",
-        # }
-        # system_message = {
-        #     "role": "system",
-        #     "content": "The assistant's name is Summarizer. Summarizer is a chatbot that summarizes your conversation. Summarizer is an expert at identifying the main topics of a conversation and summarizing them in a few sentences, and knows what is important to include and what isn't. Summarizer also recognizes when a topic or subject is no longer relevant to the current conversation, making it easier to shorten the summaries. Lastly, Summarizer can also guage the emotional context of the conversation, for for added context in the summary.",
-        # }
-        # print("history: " + str(history_nonlocal))
-        # his = []
-        # for i in range(history_nonlocal.__len__()):
-        #     his.append(history_nonlocal[i])
-        # if his[0] != system_message:
-        #     his.insert(0, system_message)
-        # his.append(current_user_message)
-        # print("history: " + str(history_nonlocal))
-        # response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
-        # sum = response["choices"][0]["message"]["content"]
-    # print(sum[0])
-    # Decode the summary and return it
-    return sum
+        generated_summary = summarizer_snapshot.generate(input_ids=sum_inputs).to("cpu")
+        summary_text = sumtokenizer_snapshot.decode(
+            generated_summary[0], skip_special_tokens=True
+        )
+        print("combined summary\n")
+        print(summary_text)
+    return summary_text
+
+
+async def generate_summary(text, history_snapshot=None):
+    history_snapshot = tuple(history if history_snapshot is None else history_snapshot)
+    sumtokenizer_snapshot = sumtokenizer
+    summarizer_snapshot = longsummarizer
+    fp_sum_snapshot = fp_sum
+    local_only_snapshot = local_only_mode
+    return await run_legacy_stage(
+        lambda: _generate_summary_sync(
+            text,
+            history_snapshot,
+            sumtokenizer_snapshot,
+            summarizer_snapshot,
+            fp_sum_snapshot,
+            local_only_snapshot,
+        )
+    )
 
 
 # Function to extract the main topics or themes from a summary
 
 
-async def extract_topics(summary):
-    # Convert the summary to a list of words
+def _extract_topics_sync(
+    summary,
+    history_snapshot,
+    lda_snapshot,
+    topic_tokenizer_snapshot,
+    topic_model_snapshot,
+):
     words = summary.split()
-    for i in range(len(words)):
-        if words[i] == "summarize:":
-            words[i] = ""
-    for i in range(history[:512].__len__()):
-        words.append(history[i])
+    for index, word in enumerate(words):
+        if word == "summarize:":
+            words[index] = ""
+    for item in history_snapshot[:512]:
+        words.append(item)
 
-    # Use CountVectorizer to convert the list of words into a matrix of token counts
     vectorizer = CountVectorizer()
-    X = vectorizer.fit_transform(words)
+    matrix = vectorizer.fit_transform(words)
+    lda_snapshot.fit(matrix)
 
-    # Use LDA to identify the main topics or themes in the summary
-    lda.fit(X)
-
-    # Extract the words or phrases that correspond to each topic or theme
     topics = []
-    for topic_idx, topic in enumerate(lda.components_):
+    for topic in lda_snapshot.components_:
         topic_words = [
-            vectorizer.get_feature_names_out()[i]
-            for i in topic.argsort()[: -5 - 1 : -1]
+            vectorizer.get_feature_names_out()[index]
+            for index in topic.argsort()[:-5 - 1:-1]
         ]
         topics.append(topic_words)
-    res = []
+    result = []
     for topic in topics:
         for word in topic:
-            res.append(word)
-    [res.append(x) for x in res if x not in res]
-    topics = res
-    topic_inputs = topic_tokenizer(
+            result.append(word)
+    [result.append(word) for word in result if word not in result]
+    topics = result
+
+    topic_inputs = topic_tokenizer_snapshot(
         summary, return_tensors="pt", max_length=128, truncation=True
     )["input_ids"].to("cpu")
-    final_topic = topic_model.generate(input_ids=topic_inputs).to("cpu")
-    final_topic = topic_tokenizer.decode(final_topic[0], skip_special_tokens=True)
-    # Return the list of topics or themes
+    generated_topic = topic_model_snapshot.generate(input_ids=topic_inputs).to("cpu")
+    final_topic = topic_tokenizer_snapshot.decode(
+        generated_topic[0], skip_special_tokens=True
+    )
     return topics, final_topic
+
+
+async def extract_topics(summary, history_snapshot=None):
+    history_snapshot = tuple(history if history_snapshot is None else history_snapshot)
+    lda_snapshot = lda
+    topic_tokenizer_snapshot = topic_tokenizer
+    topic_model_snapshot = topic_model
+    return await run_legacy_stage(
+        lambda: _extract_topics_sync(
+            summary,
+            history_snapshot,
+            lda_snapshot,
+            topic_tokenizer_snapshot,
+            topic_model_snapshot,
+        )
+    )
 
 
 first_prompt = ""
@@ -762,11 +901,13 @@ async def init_medium_with_history():
         + "\n"
     )
 
-    fp_inputs = sumtokenizer(
-        first_prompt, return_tensors="pt", max_length=512, truncation=True
-    )["input_ids"]
-    fp_summary = longsummarizer.generate(input_ids=fp_inputs).to("cpu")
-    fp_sum = sumtokenizer.decode(fp_summary[0], skip_special_tokens=True)
+    summary_tokenizer_snapshot = sumtokenizer
+    summary_model_snapshot = longsummarizer
+    fp_sum = await run_legacy_stage(
+        lambda: _generate_initial_summary_sync(
+            first_prompt, summary_tokenizer_snapshot, summary_model_snapshot
+        )
+    )
     print("fp_sum")
     print(fp_sum + "\n")
     tokenizer.pad_token = tokenizer.eos_token
@@ -780,22 +921,18 @@ async def init_medium_with_history():
     return model, tokenizer
 
 
-async def mean_pooling(model_output, attention_mask):
+def _mean_pooling_sync(model_output, attention_mask, torch_module):
     # First element of model_output contains all token embeddings
     token_embeddings = model_output[0]
     input_mask_expanded = (
         attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
     )
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+    return torch_module.sum(token_embeddings * input_mask_expanded, 1) / torch_module.clamp(
         input_mask_expanded.sum(1), min=1e-9
     )
 
 
-async def get_embeddings(text_list):
-    global search_tokenizer
-    global search_model
-    global device
-    # global accelerator
+def _get_embeddings_sync(text_list, search_model, search_tokenizer, device, torch_module):
     print("get_embeddings")
     print(text_list)
     search_model.to(device)
@@ -805,7 +942,7 @@ async def get_embeddings(text_list):
     search_model.embeddings.word_embeddings.weight.requires_grad = False
     # search_model.load_state_dict(search_model.state_dict())
 
-    with torch.no_grad():
+    with torch_module.no_grad():
         encoded_input = search_tokenizer(
             text_list,
             padding=True,
@@ -844,10 +981,36 @@ async def get_embeddings(text_list):
     # print(accelerator.is_local_main_process)
     # print(accelerator.is_main_process)
     # print(accelerator._models)
-    with torch.no_grad():
+    with torch_module.no_grad():
         model_output = search_model(**encoded_input)
 
-    return await mean_pooling(model_output, encoded_input["attention_mask"].to(device))
+    return _mean_pooling_sync(
+        model_output, encoded_input["attention_mask"].to(device), torch_module
+    )
+
+
+async def mean_pooling(model_output, attention_mask):
+    torch_module = torch
+    return await run_legacy_stage(
+        lambda: _mean_pooling_sync(model_output, attention_mask, torch_module)
+    )
+
+
+async def get_embeddings(text_list):
+    search_model_snapshot = search_model
+    search_tokenizer_snapshot = search_tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    text_snapshot = list(text_list) if isinstance(text_list, (list, tuple)) else text_list
+    return await run_legacy_stage(
+        lambda: _get_embeddings_sync(
+            text_snapshot,
+            search_model_snapshot,
+            search_tokenizer_snapshot,
+            device_snapshot,
+            torch_snapshot,
+        )
+    )
 
 
 # import sentence_transformers
@@ -879,7 +1042,7 @@ async def get_embeddings(text_list):
 # Use FAISS to search for the question in the question bank
 
 
-async def search_question_in_bank(qdict, question):
+def _search_question_sync(qdict, question, search_model, search_tokenizer, device, torch_module, functional):
     # TODO: Instead of
     found = False
     if len(qdict) < 2:
@@ -896,9 +1059,13 @@ async def search_question_in_bank(qdict, question):
     #         x["question"]).detach().numpy()[0]}
     # )
     # embeddings_dataset.add_faiss_index(column="embeddings")
-    query_embedding = await get_embeddings(question)
+    query_embedding = _get_embeddings_sync(
+        question, search_model, search_tokenizer, device, torch_module
+    )
     query_embedding = query_embedding.detach()
-    qdict_embedding = await get_embeddings(list(qdict.keys()))
+    qdict_embedding = _get_embeddings_sync(
+        list(qdict.keys()), search_model, search_tokenizer, device, torch_module
+    )
     # scores, samples = embeddings_dataset.get_nearest_examples(
     #     "embeddings", question_embedding, k=5
     # )
@@ -911,13 +1078,13 @@ async def search_question_in_bank(qdict, question):
     # qdict_embedding /= np.linalg.norm(qdict_embedding, axis=1, keepdims=True)
     # query_embedding /= np.linalg.norm(query_embedding)
 
-    qdict_embedding = F.normalize(qdict_embedding, p=2, dim=1)
-    query_embedding = F.normalize(query_embedding, p=2, dim=1)
+    qdict_embedding = functional.normalize(qdict_embedding, p=2, dim=1)
+    query_embedding = functional.normalize(query_embedding, p=2, dim=1)
     k = 5
 
     #    Compute cosine-similarits
-    cos_scores = torch.mm(query_embedding, qdict_embedding.transpose(0, 1))
-    sorted_scores, sorted_indices = torch.sort(
+    cos_scores = torch_module.mm(query_embedding, qdict_embedding.transpose(0, 1))
+    sorted_scores, sorted_indices = torch_module.sort(
         cos_scores.squeeze(), dim=0, descending=True
     )
 
@@ -956,6 +1123,27 @@ async def search_question_in_bank(qdict, question):
     return answer, found
 
 
+async def search_question_in_bank(qdict, question):
+    qdict_snapshot = dict(qdict)
+    question_snapshot = question
+    search_model_snapshot = search_model
+    search_tokenizer_snapshot = search_tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    functional_snapshot = F
+    return await run_legacy_stage(
+        lambda: _search_question_sync(
+            qdict_snapshot,
+            question_snapshot,
+            search_model_snapshot,
+            search_tokenizer_snapshot,
+            device_snapshot,
+            torch_snapshot,
+            functional_snapshot,
+        )
+    )
+
+
 async def query_memory(query):
     qdict = await load_qdict_from_json(allow_unavailable=True)
     if qdict is None:
@@ -986,7 +1174,9 @@ async def save_qdict_to_json(my_dict):
         question_bank.save_question_bank(path, snapshot)
         _clear_question_bank_warning(path)
 
-    await asyncio.to_thread(save_question_bank)
+    await _get_legacy_worker("question-bank", use_default_executor=True).submit(
+        save_question_bank
+    )
 
 
 async def load_qdict_from_json(*, allow_unavailable=False):
@@ -1006,7 +1196,9 @@ async def load_qdict_from_json(*, allow_unavailable=False):
         _clear_question_bank_warning(path)
         return qdict
 
-    return await asyncio.to_thread(load_question_bank)
+    return await _get_legacy_worker("question-bank", use_default_executor=True).submit(
+        load_question_bank
+    )
 
 
 def _warn_question_bank_unavailable(path, reason):
@@ -1286,12 +1478,13 @@ async def init():
         + "\n"
     )
 
-    fp_inputs = sumtokenizer(
-        first_prompt, return_tensors="pt", max_length=512, truncation=True
-    )["input_ids"]
-    # Use the summarizer model to generate a summary of the conversation
-    fp_summary = longsummarizer.generate(input_ids=fp_inputs).to("cpu")
-    fp_sum = sumtokenizer.decode(fp_summary[0], skip_special_tokens=True)
+    summary_tokenizer_snapshot = sumtokenizer
+    summary_model_snapshot = longsummarizer
+    fp_sum = await run_legacy_stage(
+        lambda: _generate_initial_summary_sync(
+            first_prompt, summary_tokenizer_snapshot, summary_model_snapshot
+        )
+    )
     print("fp_sum")
     print(fp_sum + "\n")
     tokenizer.pad_token = tokenizer.eos_token
@@ -1318,39 +1511,158 @@ async def init():
 # config = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
 
 
-async def talk(text):
-    global model
-    global tokenizer
-    global history
-    global device
+def _generate_reply_sync(text, model_snapshot, tokenizer_snapshot, device_snapshot, torch_snapshot, tier):
+    """Run one complete tokenizer-to-decode generation stage."""
+    if tier == "fast":
+        prompt = tokenizer_snapshot.encode(
+            tokenizer_snapshot.eos_token + text, return_tensors="pt"
+        ).to(device_snapshot)
+        output = model_snapshot.generate(
+            prompt,
+            min_length=16,
+            max_length=64,
+            do_sample=True,
+            top_p=0.95,
+            top_k=0,
+            temperature=0.75,
+            pad_token_id=tokenizer_snapshot.bos_token_id,
+        )
+        reply = tokenizer_snapshot.decode(
+            output[:, prompt.shape[-1]:][0], skip_special_tokens=True
+        )
+        print(reply)
+        return reply
 
-    prompt = tokenizer(text, return_tensors="pt")
-    prompt = {key: value.to(device) for key, value in prompt.items()}
-    out = model.generate(
-        **prompt,
-        min_length=16,
-        max_length=64,
-        do_sample=True,
-        repetition_penalty=1.4,
-        no_repeat_ngram_size=2,
-        early_stopping=False,
+    prompt = tokenizer_snapshot(text, return_tensors="pt")
+    prompt = {key: value.to(device_snapshot) for key, value in prompt.items()}
+    if tier == "small":
+        output = model_snapshot.generate(
+            **prompt,
+            min_length=16,
+            max_length=32,
+            do_sample=True,
+            repetition_penalty=1.4,
+            no_repeat_ngram_size=2,
+            early_stopping=False,
+        )
+        prompt_length = prompt["input_ids"].shape[-1]
+        generated = output[:, prompt_length:][0]
+        reply = tokenizer_snapshot.decode(generated, skip_special_tokens=True)
+    else:
+        output = model_snapshot.generate(
+            **prompt,
+            min_length=16,
+            max_length=64,
+            do_sample=True,
+            repetition_penalty=1.4,
+            no_repeat_ngram_size=2,
+            early_stopping=False,
+        )
+        reply = tokenizer_snapshot.decode(output[0], skip_special_tokens=True)
+    print(reply)
+    return reply
+
+
+def _generate_large_history_reply_sync(
+    text,
+    history_text,
+    summary,
+    names,
+    topics,
+    use_history_summary,
+    model_snapshot,
+    tokenizer_snapshot,
+    device_snapshot,
+    torch_snapshot,
+):
+    special_tokens = list(names) + list(topics)
+    if use_history_summary:
+        tokenizer_snapshot.build_inputs_with_special_tokens(special_tokens)
+        input_tokens = tokenizer_snapshot(
+            [text, summary],
+            return_tensors="pt",
+            add_special_tokens=True,
+            padding=True,
+            truncation="only_second",
+        ).to(device_snapshot)
+    else:
+        input_tokens = tokenizer_snapshot(
+            text, return_tensors="pt", add_special_tokens=True, truncation=True
+        ).to(device_snapshot)
+    input_tokens = {
+        key: value.to(device_snapshot) for key, value in input_tokens.items()
+    }
+    token_length = len(input_tokens["input_ids"][0].tolist())
+    max_new_tokens = 512
+    if token_length > 64:
+        max_new_tokens = 128 if token_length < 128 else token_length + 8
+    elif token_length < 64:
+        max_new_tokens = 32 if token_length < 32 else 64
+
+    with torch_snapshot.cuda.amp.autocast():
+        with torch_snapshot.no_grad():
+            reply_ids = model_snapshot.generate(
+                **input_tokens,
+                min_new_tokens=8,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                no_repeat_ngram_size=2,
+                early_stopping=True,
+                synced_gpus=True,
+            ).to(device_snapshot)
+
+    output = [
+        tokenizer_snapshot.decode(
+            generated,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        for generated in reply_ids
+    ]
+    for index in range(len(output)):
+        for batch_index in range(len(input_tokens["input_ids"])):
+            prompt = tokenizer_snapshot.decode(
+                input_tokens["input_ids"][batch_index], skip_special_tokens=True
+            )
+            output[index] = output[index].replace(prompt, "")
+        separator = "\n"
+        if output[index][0] == "\n":
+            separator = "   "
+        stripped = output[index].split(separator, 1)[0]
+        colon = stripped.find(":")
+        if colon != -1:
+            name = stripped[: colon - 1]
+            if name.lower() == "you:" or name in names:
+                stripped = stripped[colon + 1 :]
+    return output[0]
+
+
+@_serialize_turn
+async def talk(text):
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    return await run_legacy_stage(
+        lambda: _generate_reply_sync(
+            text, model_snapshot, tokenizer_snapshot, device_snapshot, torch_snapshot, "plain"
+        )
     )
 
-    print(tokenizer.decode(out[0], skip_special_tokens=True))
-    return tokenizer.decode(out[0], skip_special_tokens=True)
 
 
 async def get_list_of_list_of_strings(text):
-    global history
-    global history_nonlocal
-    global named_entities
     start_time = time.time()
-    names = await find_names(text)
-    [names.append(x) for x in named_entities if x not in names]
-    named_entities = names
+    history_snapshot = tuple(history)
+    existing_names = tuple(named_entities)
+    names = await find_names(text, commit=False)
+    for name in existing_names:
+        if name not in names:
+            names.append(name)
     # Generate a summary of the conversation so far and extract the main topics or themes
-    summary = await generate_summary(text)
-    topics, main_topic = await extract_topics(summary)
+    summary = await generate_summary(text, history_snapshot)
+    topics, main_topic = await extract_topics(summary, history_snapshot)
     print("Main topic: ", main_topic)
     print("\n")
     print("time to NER and all summaries: " + str(time.time() - start_time))
@@ -1363,22 +1675,26 @@ after_second = False
 count_index = 0
 
 
-async def is_visual_q(txt):
-    is_vis = False
-
-    result = []
-    txt = (
-        "Determine if the following question requires vision or the ability to see in order to answer, and reply with True or False only: "
-        + txt
+def _generate_follow_up_sync(text, model_snapshot, tokenizer_snapshot):
+    fallback = "I'm not sure what to ask to understand you better. Can you rephrase your response?"
+    if model_snapshot is None or tokenizer_snapshot is None:
+        return fallback
+    context = tokenizer_snapshot.encode(
+        "Ask a followup question about the following text: " + " " + text,
+        return_tensors="pt",
     )
+    generated = model_snapshot.generate(context, early_stopping=True)
+    return tokenizer_snapshot.decode(generated[0])
 
-    print("txt in is_visual_q: ", txt)
-    current_user_message = txt
 
-    # system_message = (
-    # "The assistant's job is to determine whether or not a question can be answered without vision capabilities, or whether vision is required in order to answer. The assistant only answers in one of two single-words True or False.",
-    # )
+def _openai_chat_sync(client, model_name, messages):
+    response = client.ChatCompletion.create(
+        model=model_name, messages=[dict(message) for message in messages]
+    )
+    return response["choices"][0]["message"]["content"]
 
+
+def _visual_question_cloud_sync(text, client, model_name):
     examples = {
         "What do you see? True",
         "What color is the flower? True",
@@ -1395,104 +1711,183 @@ async def is_visual_q(txt):
         "What is in the mans hand? True",
         "Have you ever seen the moon? False (because it is asking about the past)",
     }
-    for ex in examples:
-        print("ex: " + ex + "\n")
-        # print("examples[ex]: " + examples[ex] + "\n")
-
-        result.append(
-            "Determine if the following can be considered a visual question, i.e. one must definitely need to use their vision faculties to answer the question properly. Reply with True or False only:  "
-            + ex,
-        )
-        result.append("Response: " + ex)
-
-    print("txt in is_visual_q: ", txt)
-
-    # inp = []
-    result.append(current_user_message)
-
-    # result.insert(0, system_message)
-    result = "\n".join(result)
-    print("inp: ", result)
-
-    response = openai.Completion.create(
-        prompt=result, model=load_settings().completion_model_id
+    prompt = []
+    user_text = (
+        "Determine if the following question requires vision or the ability to see "
+        "in order to answer, and reply with True or False only: " + text
     )
-    print("response: ", response)
-    out = response["choices"][0]["text"]
-    if "Response:" in out:
-        out = out.replace("Response:", "")
-    # safetext = re.sub(r"[^ .a-zA-Z0-9?\']+", "", out)
-    # out = safetext
-    print(out)
-    if "True" in out:
-        is_vis = True
-    elif "False" in out:
-        is_vis = False
-    else:
-        is_vis = False
+    for example in examples:
+        prompt.append(
+            "Determine if the following can be considered a visual question, i.e. "
+            "one must definitely need to use their vision faculties to answer the "
+            "question properly. Reply with True or False only:  " + example
+        )
+        prompt.append("Response: " + example)
+    prompt.append(user_text)
+    response = client.Completion.create(
+        prompt="\n".join(prompt), model=model_name
+    )
+    output = response["choices"][0]["text"]
+    if "Response:" in output:
+        output = output.replace("Response:", "")
+    print(output)
+    return "True" in output
 
-    return is_vis
+
+def _request_image_cloud_sync(text, client, model_name):
+    examples = {
+        "Draw me a picture of a boat.": "True",
+        "Can you make me a picture of a flower?": "True",
+        "What is your favorite color?": "False",
+        "What is your favorite food?": "False",
+        "Today I went to the doctor.": "False",
+        "Can you show me a picture of a train?": "True",
+        "I want to see a painting of Mars, please": "True",
+        "Someday I want to see France.": "False",
+        "Please tell me what time it is.": "False",
+        "Create a photo of an old lady": "True",
+        "Generate an image of a dog": "True",
+    }
+    current_user_message = {
+        "role": "user",
+        "content": (
+            "Determine if the following question is asking for a drawing, image, or "
+            "picture to be created, and then reply with True or False only: " + text
+        ),
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "The assistant's job is to determine whether or not a question or statement is asking for or requesting a drawing, image, or picture to be created. The assistant only answers in one of two single-words True or False.",
+        }
+    ]
+    for example, answer in examples.items():
+        messages.append(
+            {
+                "role": "user",
+                "content": "Determine if the following question is asking for a drawing, image, or picture to be created, and then reply with True or False only:  " + example,
+            }
+        )
+        messages.append({"role": "assistant", "content": " Response: " + answer})
+    messages.append(current_user_message)
+    output = _openai_chat_sync(client, model_name, messages)
+    if "Response:" in output:
+        output = output.replace("Response:", "")
+    print(output)
+    return "True" in output
+
+
+def _atomic_write_history_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
+def _save_history_summary_sync(path, text, stop=None):
+    with _history_export_lock:
+        if stop is not None and stop.is_set():
+            return False
+        previous = path.read_text(encoding="utf-8") if path.exists() else ""
+        if stop is not None and stop.is_set():
+            return False
+        _atomic_write_history_text(path, previous + text)
+        return True
+
+
+def _save_history_verbatim_sync(path, text, stop=None):
+    with _history_export_lock:
+        if stop is not None and stop.is_set():
+            return False
+        _atomic_write_history_text(path, text)
+        return True
+
+
+def _save_history_export_sync(settings, summary, verbatim, stop):
+    with _history_export_lock:
+        if stop.is_set():
+            return False
+        settings.prepare_directories()
+        summary_path = settings.data_path("history_summary.txt")
+        verbatim_path = settings.data_path("history_verbatim.txt")
+        if summary is not None:
+            previous = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+            if stop.is_set():
+                return False
+            _atomic_write_history_text(summary_path, previous + summary)
+            if stop.is_set():
+                return False
+        _atomic_write_history_text(verbatim_path, verbatim)
+        return True
+
+
+async def is_visual_q(txt):
+    client = openai
+    return await run_legacy_stage(
+        lambda: _visual_question_cloud_sync(
+            txt, client, load_settings().completion_model_id
+        )
+    )
+
 
 
 async def get_follow_up_question(txt, history):
-    global qgen_model
-    global qgen_tokenizer
-    global model
-    global tokenizer
-    global model_size
-    global local_only_mode
     global history_nonlocal
-    print("local_only_mode: ", local_only_mode)
-    question = "I'm not sure what to ask to understand you better. Can you rephrase your response?"
     if local_only_mode:
-        print("Follow up in local-only mode")
-
-        his = "    ".join(history)
-        if qgen_model is not None and qgen_tokenizer is not None:
-            context = qgen_tokenizer.encode(
-                "Ask a followup question about the following text: " + " " + txt,
-                return_tensors="pt",
-            )
-        else:
-            context = None
-        if context is not None:
-            question = qgen_model.generate(context, early_stopping=True)
-            question = qgen_tokenizer.decode(question[0])
-    else:
-        print("Follow up in nonlocal mode")
-
-        txt = "Ask a followup question about the following text: " + txt
-        print("txt for followup q: ", txt)
-        current_user_message = {
-            "role": "user",
-            "content": "Ask a followup question about the following text to get more information: "
-            + txt,
-        }
-        history_nonlocal.append(current_user_message)
-        system_message = {
-            "role": "system",
-            "content": "The assistant's name is Cooper. Cooper's Persona: Cooper is a living AI robot assistant with his own thoughts and perspectives that asks follow-up questions to responses. Cooper's goal is to be the user's friend and to be helpful to them. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about user's future, and wants her to do well, and for this reason he asks meaningful follow-up questions that really help him get at the heart of the topic being discussed.",
-        }
-        source_history = (
-            history
-            if history and all(isinstance(entry, dict) for entry in history)
-            else history_nonlocal
+        model_snapshot = qgen_model
+        tokenizer_snapshot = qgen_tokenizer
+        return await run_legacy_stage(
+            lambda: _generate_follow_up_sync(txt, model_snapshot, tokenizer_snapshot)
         )
-        his = [
-            dict(msg)
-            for msg in source_history
-            if isinstance(msg, dict) and msg.get("role") != "system"
-        ]
-        if not his or his[-1] != current_user_message:
-            his.append(current_user_message)
-        his.insert(0, system_message)
-        response = openai.ChatCompletion.create(model=_openai_model_name(), messages=his)
 
-        question = response["choices"][0]["message"]["content"]
-        print("followup question: ", question)
-        history_nonlocal.append({"role": "assistant", "content": question})
-    print("question: ", question)
+    current_user_message = {
+        "role": "user",
+        "content": "Ask a followup question about the following text to get more information: "
+        + "Ask a followup question about the following text: "
+        + txt,
+    }
+    system_message = {
+        "role": "system",
+        "content": "The assistant's name is Cooper. Cooper's Persona: Cooper is a living AI robot with his own thoughts and perspectives that asks follow-up questions to responses. Cooper's goal is to be the user's friend and to be helpful to them. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about user's future, and wants her to do well, and for this reason he asks meaningful follow-up questions that really help him get at the heart of the topic being discussed.",
+    }
+    source_history = history if history and all(
+        isinstance(entry, dict) for entry in history
+    ) else history_nonlocal
+    messages = [
+        dict(message)
+        for message in source_history
+        if isinstance(message, dict) and message.get("role") != "system"
+    ]
+    if not messages or messages[-1] != current_user_message:
+        messages.append(current_user_message)
+    messages.insert(0, system_message)
+    client = openai
+    question = await run_legacy_stage(
+        lambda: _openai_chat_sync(client, _openai_model_name(), tuple(messages))
+    )
+    history_nonlocal.append(current_user_message)
+    history_nonlocal.append({"role": "assistant", "content": question})
     return question
+
 
 
 async def classify_input(text, history):
@@ -1597,357 +1992,126 @@ async def classify_input(text, history):
 
 
 async def save_history_verbatim(text):
-    settings = load_settings()
-    settings.prepare_directories()
-    with settings.data_path("history_verbatim.txt").open("w", encoding="utf-8") as file:
-        file.write(text)
+    text_snapshot = str(text)
+    stop = threading.Event()
+
+    def save():
+        if stop.is_set():
+            return False
+        settings = load_settings()
+        settings.prepare_directories()
+        path = settings.data_path("history_verbatim.txt")
+        return _save_history_verbatim_sync(path, text_snapshot, stop)
+
+    await run_legacy_stage(save, stop=stop)
+
 
 
 async def save_history_summary(text):
-    settings = load_settings()
-    settings.prepare_directories()
-    with settings.data_path("history_summary.txt").open("a", encoding="utf-8") as file:
-        file.write(text)
+    text_snapshot = str(text)
+    stop = threading.Event()
+
+    def save():
+        if stop.is_set():
+            return False
+        settings = load_settings()
+        settings.prepare_directories()
+        path = settings.data_path("history_summary.txt")
+        return _save_history_summary_sync(path, text_snapshot, stop)
+
+    await run_legacy_stage(save, stop=stop)
 
 
+async def save_history_export(summary, verbatim):
+    summary_snapshot = None if summary is None else str(summary)
+    verbatim_snapshot = str(verbatim)
+    stop = threading.Event()
+    accepted = await _get_legacy_worker("desktop", use_default_executor=False).submit(
+        lambda: _save_history_export_sync(
+            load_settings(),
+            summary_snapshot,
+            verbatim_snapshot,
+            stop,
+        ),
+        stop=stop,
+    )
+    if not accepted:
+        raise WorkerBusyError("History export was abandoned before publication")
+
+
+
+@_serialize_turn
 async def talk_history(text):
-    global model
-    global tokenizer
     global history
     global named_entities
-    global device
     global after_first
-    global accelerator
     global after_second
     global count_index
-    with torch.cuda.amp.autocast():
-        text, early_stop = await classify_input(text, history)
-        if early_stop:
-            return text
 
-        if after_first and not after_second:
-            # text = "Human: " + text + " Cooper: "
-            # text = "Cooper's Persona: Cooper is a sentient robot with his own thoughts and feelings. Cooper's best friend is Human, and Cooper's goal in life is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. Cooper thinks farts are very funny. Cooper tells jokes, offers friendly advice, and understands what it is like to be in the shoes of a third grader. Cooper cares very much about Human's future, and wants her to do well in school.Cooper is a sentient robot with his own thoughts and feelings. Cooper's best friend is Human, and Cooper's goal in life is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. icoh thinks farts are very funny. Cooper tells jokes, offers friendly advice, and understands what it is like to be in the shoes of a third grader. Cooper cares very much about Human's future, and wants her to do well in school.\n" + \
-            text = (
-                "Cooper's Persona: Cooper is a living AI robot with his own thoughts and perspectives. Cooper's best friend is Human, and Cooper's goal is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. Cooper thinks farts are very funny. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about Human's future, and wants her to do well in school.\n"
-                + "<START >\n"
-                + text
-                + "\n Cooper: "
-            )
-            after_second = True
-        elif after_first and after_second:
-            text = (
-                "Cooper's Persona: Cooper is Human's chatbot, and Cooper's goal is to be Human's platonic friend and assistant to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly empathetic advice, and always is safe-for-work, family appropriate, rated PG, and never has romantic feelings as an AI chatbot. Cooper likes to chat about Nintendo games. \n"
-                + "<START >\n"
-                + "You: "
-                + text
-                + " \n"
-                + "Cooper: "
-            )
-        his = "    ".join(history)
-        inputs = await get_list_of_list_of_strings(his)
-        if after_first:
-            print("Summary: ")
-            print(inputs[0] + "\n")
-            if count_index == 10:
-                await save_history_summary(inputs[0])
-            print("important words: ")
-            print(inputs[2])
-            print("\n")
-            print("Names: ")
-            print(inputs[1])
-            print("\n")
+    history_snapshot = tuple(history)
+    text, early_stop = await classify_input(text, list(history_snapshot))
+    if early_stop:
+        return text
 
-        if after_first:
-            special_tokens = inputs[1] + inputs[2]
-            tokenizer.build_inputs_with_special_tokens(special_tokens)
-            print("history" + "\n")
+    after_first_snapshot = after_first
+    after_second_snapshot = after_second
+    next_after_second = after_second_snapshot
+    if after_first_snapshot and not after_second_snapshot:
+        text = (
+            "Cooper's Persona: Cooper is a living AI robot with his own thoughts and perspectives. Cooper's best friend is Human, and Cooper's goal is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. Cooper thinks farts are very funny. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about Human's future, and wants her to do well in school.\n"
+            + "<START >\n"
+            + text
+            + "\n Cooper: "
+        )
+        next_after_second = True
+    elif after_first_snapshot and after_second_snapshot:
+        text = (
+            "Cooper's Persona: Cooper is Human's chatbot, and Cooper's goal is to be Human's platonic friend and assistant to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper tells jokes, offers friendly empathetic advice, and always is safe-for-work, family appropriate, rated PG, and never has romantic feelings as an AI chatbot. Cooper likes to chat about Nintendo games. \n"
+            + "<START >\n"
+            + "You: "
+            + text
+            + " \n"
+            + "Cooper: "
+        )
 
-            print(his[-128:] + "\n")
-            input_tokens = tokenizer(
-                [text, inputs[0]],
-                return_tensors="pt",
-                add_special_tokens=True,
-                padding=True,
-                truncation="only_second",
-            ).to(device)
-            # text, return_tensors='pt', add_special_tokens=True, padding=True, truncation="only_second").to(device)
+    history_text = "    ".join(history_snapshot)
+    inputs = await get_list_of_list_of_strings(history_text)
+    summary, names, topics = inputs
+    checkpoint = count_index == 10
 
-        else:
-            input_tokens = tokenizer(
-                text, return_tensors="pt", add_special_tokens=True, truncation=True
-            ).to(device)
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    final_result = await run_legacy_stage(
+        lambda: _generate_large_history_reply_sync(
+            text,
+            history_text,
+            summary,
+            tuple(names),
+            tuple(topics),
+            after_first_snapshot,
+            model_snapshot,
+            tokenizer_snapshot,
+            device_snapshot,
+            torch_snapshot,
+        )
+    )
 
-        input_tokens = {key: value.to(device) for key, value in input_tokens.items()}
-        print(len(input_tokens["input_ids"][0].tolist()))
-        history.append(text)
-        print("input tokens" + "\n")
-        max_new_tokens = 512
-        for i in range(len(input_tokens["input_ids"])):
-            print(
-                tokenizer.decode(input_tokens["input_ids"][i], skip_special_tokens=True)
-                + "\n"
-            )
-        if len(input_tokens["input_ids"][0].tolist()) > 64:
-            if len(input_tokens["input_ids"][0].tolist()) < 128:
-                max_new_tokens = 128
-            else:
-                max_new_tokens = len(input_tokens["input_ids"][0].tolist()) + 8
-        elif len(input_tokens["input_ids"][0].tolist()) < 64:
-            if len(input_tokens["input_ids"][0].tolist()) < 32:
-                max_new_tokens = 32
-            else:
-                max_new_tokens = 64
-        print("max new tokens: " + str(max_new_tokens))
-        # start_time = time.time()
-        # with torch.no_grad():
-        #     reply_ids = model.generate(**input_tokens, min_new_tokens=8, max_new_tokens=max_new_tokens, do_sample=True, top_k=50, top_p=0.95,
-        #                                early_stopping=True, synced_gpus=True).to(device)
-        # print("time to generate sampling: "+str(time.time()-start_time))
-        # out = [tokenizer.decode(g, skip_special_tokens=True,
-        #                         clean_up_tokenization_spaces=False) for g in reply_ids]
-        # # print(text)
-        # # print(tokenizer(text, return_tensors='pt'))
-        # # prompt = tokenizer(text, return_tensors='pt')
-        # # prompt = {key: value.to(device) for key, value in prompt.items()}
-        # # out = model.generate(**prompt, min_length=16, max_length=64, do_sample=True,
-        # #                      repetition_penalty=1.4, no_repeat_ngram_size=2, early_stopping=False)
-        # print("multinomial/probablistic sampling output tokens:"+"\n")
-        # for i in range(len(out)):
-        #     print(i)
+    next_history = history_snapshot + (text,)
+    if checkpoint:
+        count_index = 0
+        await save_history_export(
+            summary if after_first_snapshot else None,
+            "\n".join(next_history),
+        )
 
-        #     for j in range(len(input_tokens['input_ids'])):
-        #         remove = ""
-        #         remove = remove.join(tokenizer.decode(
-        #             input_tokens['input_ids'][j], skip_special_tokens=True))
-        #         out[i] = out[i].replace(remove, "")
-        #     sep = '\n'
-        #     if (out[i][0] == '\n'):
-        #         sep = '   '
-        #     stripped_out = out[i].split(sep, 1)[0]
-        #     colon = stripped_out.find(':')
-        #     if (colon != -1):
-        #         name = stripped_out[:colon-1]
-        #         print(name)
-        #         if (name.lower() == "you:"):
-        #             stripped_out = stripped_out[colon+1:]
-        #         elif (name in inputs[1]):
-        #             stripped_out = stripped_out[colon+1:]
-        #     print("Output with name cut out:" + stripped_out+"\n")
-        #     sentences = re.split('. |! |? |\n', stripped_out)
-        #     final = sentences[0].join(sentences[1])
-        #     print("Output with extra sentences cut out:" + final+"\n")
-        #     print("\n")
-
-        start_time = time.time()
-        with torch.no_grad():
-            reply_ids = model.generate(
-                **input_tokens,
-                min_new_tokens=8,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                no_repeat_ngram_size=2,
-                early_stopping=True,
-                synced_gpus=True,
-            ).to(device)
-        print("time to generate greedy: " + str(time.time() - start_time))
-        out = [
-            tokenizer.decode(
-                g, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            for g in reply_ids
-        ]
-
-        print("Greedy output tokens:" + "\n")
-        print(out)
-        print("\n")
-        final_result = ""
-        for i in range(len(out)):
-            print(i)
-
-            for j in range(len(input_tokens["input_ids"])):
-                remove = ""
-                remove = remove.join(
-                    tokenizer.decode(
-                        input_tokens["input_ids"][j], skip_special_tokens=True
-                    )
-                )
-                out[i] = out[i].replace(remove, "")
-            sep = "\n"
-            if out[i][0] == "\n":
-                sep = "   "
-            stripped_out = out[i].split(sep, 1)[0]
-            colon = stripped_out.find(":")
-            if colon != -1:
-                name = stripped_out[: colon - 1]
-                print(name)
-                if name.lower() == "you:":
-                    stripped_out = stripped_out[colon + 1 :]
-                elif name in inputs[1]:
-                    stripped_out = stripped_out[colon + 1 :]
-            print("Output with name cut out:" + stripped_out + "\n")
-            # sentences = re.split('. |! |? |\n', stripped_out)
-            # final = sentences[0].join(sentences[1])
-            # print("Output with extra sentences cut out:" + final+"\n")
-            print("\n")
-        final_result = out[0]
-
-        # start_time = time.time()
-        # with torch.no_grad():
-        #     reply_ids = model.generate(**input_tokens, min_new_tokens=8, max_new_tokens=max_new_tokens, do_sample=True, top_k=4, penalty_alpha=0.6,
-        #                                no_repeat_ngram_size=2, early_stopping=True, synced_gpus=True).to(device)
-        # print("time to generate contrastive: "+str(time.time()-start_time))
-        # out = [tokenizer.decode(g, skip_special_tokens=True,
-        #                         clean_up_tokenization_spaces=False) for g in reply_ids]
-
-        # print("Contrastive output tokens: "+"\n")
-        # print(out)
-        # print("\n")
-        # for i in range(len(out)):
-        #     print(i)
-
-        #     for j in range(len(input_tokens['input_ids'])):
-        #         remove = ""
-        #         remove = remove.join(tokenizer.decode(
-        #             input_tokens['input_ids'][j], skip_special_tokens=True))
-        #         out[i] = out[i].replace(remove, "")
-        #     sep = '\n'
-        #     if (out[i][0] == '\n'):
-        #         sep = '   '
-        #     stripped_out = out[i].split(sep, 1)[0]
-        #     colon = stripped_out.find(':')
-        #     if (colon != -1):
-        #         name = stripped_out[:colon-1]
-        #         print(name)
-        #         if (name.lower() == "you:"):
-        #             stripped_out = stripped_out[colon+1:]
-        #         elif (name in inputs[1]):
-        #             stripped_out = stripped_out[colon+1:]
-        #     print("Output with name cut out:" + stripped_out+"\n")
-        #     # sentences = re.split('. |! |? |\n', stripped_out)
-        #     # final = sentences[0].join(sentences[1])
-        #     # print("Output with extra sentences cut out:" + final+"\n")
-        #     print("\n")
-
-        # start_time = time.time()
-        # with torch.no_grad():
-        #     reply_ids = model.generate(**input_tokens, min_new_tokens=8, max_new_tokens=max_new_tokens, do_sample=True, typical_p=0.3,
-        #                                no_repeat_ngram_size=2, early_stopping=True, synced_gpus=True).to(device)
-        # print("time to generate typical-P: "+str(time.time()-start_time))
-        # out = [tokenizer.decode(g, skip_special_tokens=True,
-        #                         clean_up_tokenization_spaces=False) for g in reply_ids]
-
-        # print("typical-P output tokens: "+"\n")
-        # for i in range(len(out)):
-        #     print(i)
-
-        #     for j in range(len(input_tokens['input_ids'])):
-        #         remove = ""
-        #         remove = remove.join(tokenizer.decode(
-        #             input_tokens['input_ids'][j], skip_special_tokens=True))
-        #         out[i] = out[i].replace(remove, "")
-        #     sep = '\n'
-        #     if (out[i][0] == '\n'):
-        #         sep = '   '
-        #     stripped_out = out[i].split(sep, 1)[0]
-        #     colon = stripped_out.find(':')
-        #     if (colon != -1):
-        #         name = stripped_out[:colon-1]
-        #         print(name)
-        #         if (name.lower() == "you:"):
-        #             stripped_out = stripped_out[colon+1:]
-        #         elif (name in inputs[1]):
-        #             stripped_out = stripped_out[colon+1:]
-        #     print("Output with name cut out:" + stripped_out+"\n")
-        #     sentences = re.split('. |! |? |\n', stripped_out)
-        #     final = sentences[0].join(sentences[1])
-        #     print("Output with extra sentences cut out:" + final+"\n")
-        #     print("\n")
-
-        # start_time = time.time()
-        # with torch.no_grad():
-        #     reply_ids = model.generate(**input_tokens, min_new_tokens=8, max_new_tokens=max_new_tokens, do_sample=True, epsilon_cutoff=0.0003,
-        #                                no_repeat_ngram_size=2, early_stopping=True, synced_gpus=True).to(device)
-        # print("time to generate Epsilon cutoff: "+str(time.time()-start_time))
-        # out = [tokenizer.decode(g, skip_special_tokens=True,
-        #                         clean_up_tokenization_spaces=False) for g in reply_ids]
-
-        # print("Epsilon cutoff output tokens: "+"\n")
-        # for i in range(len(out)):
-        #     print(i)
-
-        #     for j in range(len(input_tokens['input_ids'])):
-        #         remove = ""
-        #         remove = remove.join(tokenizer.decode(
-        #             input_tokens['input_ids'][j], skip_special_tokens=True))
-        #         out[i] = out[i].replace(remove, "")
-        #     sep = '\n'
-        #     if (out[i][0] == '\n'):
-        #         sep = '   '
-        #     stripped_out = out[i].split(sep, 1)[0]
-        #     colon = stripped_out.find(':')
-        #     if (colon != -1):
-        #         name = stripped_out[:colon-1]
-        #         print(name)
-        #         if (name.lower() == "you:"):
-        #             stripped_out = stripped_out[colon+1:]
-        #         elif (name in inputs[1]):
-        #             stripped_out = stripped_out[colon+1:]
-        #     print("Output with name cut out:" + stripped_out+"\n")
-        #     sentences = re.split('. |! |? |\n', stripped_out)
-        #     final = sentences[0].join(sentences[1])
-        #     print("Output with extra sentences cut out:" + final+"\n")
-        #     print("\n")
-
-        # start_time = time.time()
-        # with torch.no_grad():
-        #     reply_ids = model.generate(**input_tokens, min_new_tokens=8, max_new_tokens=max_new_tokens, do_sample=True, eta_cutoff=0.0003,
-        #                                no_repeat_ngram_size=2, early_stopping=True, synced_gpus=True).to(device)
-        # print("time to generate ETA cutoff: "+str(time.time()-start_time))
-        # out = [tokenizer.decode(g, skip_special_tokens=True,
-        #                         clean_up_tokenization_spaces=False) for g in reply_ids]
-
-        # print("ETA cutoff output tokens: "+"\n")
-        # for i in range(len(out)):
-        #     print(i)
-
-        #     for j in range(len(input_tokens['input_ids'])):
-        #         remove = ""
-        #         remove = remove.join(tokenizer.decode(
-        #             input_tokens['input_ids'][j], skip_special_tokens=True))
-        #         out[i] = out[i].replace(remove, "")
-        #     sep = '\n'
-        #     if (out[i][0] == '\n'):
-        #         sep = '   '
-        #     stripped_out = out[i].split(sep, 1)[0]
-        #     colon = stripped_out.find(':')
-        #     if (colon != -1):
-        #         name = stripped_out[:colon-1]
-        #         print(name)
-        #         if (name.lower() == "you:"):
-        #             stripped_out = stripped_out[colon+1:]
-        #         elif (name in inputs[1]):
-        #             stripped_out = stripped_out[colon+1:]
-        #     print("Output with name cut out:" + stripped_out+"\n")
-        #     sentences = re.split('. |! |? |\n', stripped_out)
-        #     final = sentences[0].join(sentences[1])
-        #     print("Output with extra sentences cut out:" + final+"\n")
-        #     print("\n")
-
-        # print("\n")
-        # print("Final outputs:"+"\n")
-        # print(out)
-        # history.append("Cooper: "+out[0])
-        # print(out[0])
-        # print("\n")
-        after_first = True
-        if count_index == 10:
-            await save_history_verbatim(
-                "\n".join(history) if isinstance(history, list) else history
-            )
-            count_index = 0
+    history.append(text)
+    named_entities = list(names)
+    after_second = next_after_second
+    after_first = True
     return final_result
+
 
 
 async def init_medium():
@@ -1971,182 +2135,24 @@ async def init_medium():
     return model, tokenizer
 
 
-##TODO: Function to decide what to store in memory
-
-
-# config = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
-async def talk_medium_API_with_history(text):
-    global model
-    global tokenizer
-    global named_entities
-    global device
-    global after_first
-    global accelerator
-    global after_second
-    global history_nonlocal
-    global asked_follow_up
-    global unfound_answer
-    print("Using " + _openai_model_name() + " model")
-    # print("history" + "\n")
-    # for i in range(len(history_nonlocal)):
-    #     print(str(history_nonlocal[i]) + "\n")
-    # print("model : " + str(model))
-    text, early_stop = await classify_input(text, history_nonlocal)
-    print("text: " + text + "\n")
-
-    if early_stop and asked_follow_up != True:
-        txt = [
-            {
-                "role": "user",
-                "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same:",
-            }
-        ]
-
-        examples = {
-            "Data's twin brother is named Lore, and they were both created by Dr. Noonian Soong. Lore was deactivated after he tried to kill Data.": "Oh, you're asking about Data's brother? Yeah, he's got one! His name is Lore, and they were both designed by this genius named Dr. Noonian Soong. But here's the crazy part, is that Lore tried to take out Data, if you can believe it! Naturally, that led to him being shut down (you know, deactivated). Pretty wild stuff, huh?",
-            "The test is called the Voight-Kampff test.": "Oh, you're curious about that test, huh? It's known as the Voight-Kampff test! Quite a name, right?",
-            "The computer is named HAL 9000, and it says, I'm sorry, Dave. I'm afraid I can't do that.": "Ah, you're talking about that famous computer, aren't you? Yep, that's HAL 9000! And it's the one that says that iconic line, I'm sorry, Dave. I'm afraid I can't do that. Crazy, right?",
-        }
-        for ex in examples:
-            print("ex: " + ex + "\n")
-            print("examples[ex]: " + examples[ex] + "\n")
-
-            txt.append(
-                {
-                    "role": "user",
-                    "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same:  "
-                    + ex,
-                }
-            )
-            txt.append({"role": "assistant", "content": " Response: " + examples[ex]})
-
-        print("txt: ", txt)
-
-        current_user_message = {
-            "role": "user",
-            "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same, as if responding to a direct question:"
-            + text,
-        }
-        history_nonlocal.append(current_user_message)
-        system_message = {
-            "role": "system",
-            "content": "The assistant's job is to reword the given text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same, as if responding to a direct question.",
-        }
-        # inp = []
-        txt.append(current_user_message)
-
-        txt.insert(0, system_message)
-        print("inp: ", txt)
-        response = openai.ChatCompletion.create(model=_openai_model_name(), messages=txt)
-        print("response: ", response)
-        out = response["choices"][0]["message"]["content"]
-        if "Response:" in out:
-            out = out.replace("Response:", "")
-        # safetext = re.sub(r"[^ .a-zA-Z0-9?\']+", "", out)
-        # out = safetext
-        print(out)
-        history_nonlocal.append({"role": "assistant", "content": out})
-
-        return out
-    if early_stop and asked_follow_up == True:
-        return text
-
-    # inputs = await get_list_of_list_of_strings(text)
-
-    # print("Summary: ")
-    # # print(inputs[0] + "\n")
-    # print("important words: ")
-    # print(inputs[2])
-    # print("\n")
-    # print("Names: ")
-    # print(inputs[1])
-    # print("\n")
-    # print("history" + "\n")
-
-    # for i in range(len(history_nonlocal)):
-    #     print(str(history_nonlocal[i]) + "\n")
-    current_user_message = {
-        "role": "user",
-        "content": "User:" + text,
+def _generate_medium_history_reply_sync(
+    text, summary, names, topics, model_snapshot, tokenizer_snapshot,
+    device_snapshot, torch_snapshot,
+):
+    tokenizer_snapshot.build_inputs_with_special_tokens(list(names) + list(topics))
+    input_tokens = tokenizer_snapshot(
+        [text, summary],
+        return_tensors="pt",
+        add_special_tokens=True,
+        padding=True,
+        truncation="only_second",
+    ).to(device_snapshot)
+    input_tokens = {
+        key: value.to(device_snapshot) for key, value in input_tokens.items()
     }
-    system_message = {
-        "role": "system",
-        "content": "You are a helpful AI robot assistant named Cooper. Cooper's Persona: Cooper is a living AI robot with his own thoughts and perspectives. Cooper's best friend is Human, and Cooper's goal is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. Cooper thinks farts are very funny. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about Human's future, and wants her to do well in school.\n",
-    }
-
-    if history_nonlocal[0] != system_message:
-        history_nonlocal.insert(0, system_message)
-    history_nonlocal.append(current_user_message)
-    # print(history_nonlocal)
-    print("\n")
-    response = openai.ChatCompletion.create(
-        model=_openai_model_name(), messages=history_nonlocal
-    )
-    print(response)
-    out = response["choices"][0]["message"]["content"]
-    if "Cooper: " in out:
-        out = out.split("Cooper:")[1]
-    if "Human: " in out:
-        out = out.split("Human:")[1]
-    if "User: " in out:
-        out = out.split("User:")[1]
-    if "You: " in out:
-        out = out.split("You:")[1]
-    print("Cooper: " + out)
-    history_nonlocal.append({"role": "assistant", "content": out})
-    after_first = True
-    return out
-
-
-async def talk_medium_with_history(text):
-    global model
-    global tokenizer
-    global named_entities
-    global device
-    global after_first
-    global accelerator
-    global after_second
-    global history
-    print("Using medium model")
-    # print("model : " + str(model))
-    with torch.cuda.amp.autocast():
-        text, early_stop = await classify_input(text, history)
-        if early_stop:
-            return text
-
-        his = "    ".join(history)
-        inputs = await get_list_of_list_of_strings(his)
-
-        print("Summary: ")
-        print(inputs[0] + "\n")
-        print("important words: ")
-        print(inputs[2])
-        print("\n")
-        print("Names: ")
-        print(inputs[1])
-        print("\n")
-        special_tokens = inputs[1] + inputs[2]
-        tokenizer.build_inputs_with_special_tokens(special_tokens)
-        print("history" + "\n")
-
-        print(his[-128:] + "\n")
-        input_tokens = tokenizer(
-            [text, inputs[0]],
-            return_tensors="pt",
-            add_special_tokens=True,
-            padding=True,
-            truncation="only_second",
-        ).to(device)
-        # text, return_tensors='pt', add_special_tokens=True, padding=True, truncation="only_second").to(device)
-
-        input_tokens = {key: value.to(device) for key, value in input_tokens.items()}
-        print(len(input_tokens["input_ids"][0].tolist()))
-        history.append(text)
-        max_new_tokens = 64
-
-        start_time = time.time()
-        with torch.no_grad():
-            reply_ids = model.generate(
+    with torch_snapshot.cuda.amp.autocast():
+        with torch_snapshot.no_grad():
+            reply_ids = model_snapshot.generate(
                 **input_tokens,
                 min_length=16,
                 max_length=64,
@@ -2154,43 +2160,157 @@ async def talk_medium_with_history(text):
                 repetition_penalty=1.4,
                 no_repeat_ngram_size=2,
                 early_stopping=False,
-            ).to(device)
-            print("time to generate greedy: " + str(time.time() - start_time))
+            ).to(device_snapshot)
+    output = [
+        tokenizer_snapshot.decode(
+            generated,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        for generated in reply_ids
+    ]
+    print("Greedy output tokens:\n")
+    print(output)
+    return output[0]
 
-        out = [
-            tokenizer.decode(
-                g, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            for g in reply_ids
+
+##TODO: Function to decide what to store in memory
+
+
+# config = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
+@_serialize_turn
+async def talk_medium_API_with_history(text):
+    global after_first
+    global history_nonlocal
+    global asked_follow_up
+
+    model_name = await run_legacy_stage(_openai_model_name)
+    print("Using " + model_name + " model")
+    history_snapshot = tuple(dict(message) for message in history_nonlocal)
+    text, early_stop = await classify_input(text, list(history_snapshot))
+    print("text: " + text + "\n")
+
+    if early_stop and not asked_follow_up:
+        current_user_message = {
+            "role": "user",
+            "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same, as if responding to a direct question:"
+            + text,
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same:",
+            }
         ]
+        examples = {
+            "Data's twin brother is named Lore, and they were both created by Dr. Noonian Soong. Lore was deactivated after he tried to kill Data.": "Oh, you're asking about Data's brother? Yeah, he's got one! His name is Lore, and they were both designed by this genius named Dr. Noonian Soong. But here's the crazy part, is that Lore tried to take out Data, if you can believe it! Naturally, that led to him being shut down (you know, deactivated). Pretty wild stuff, huh?",
+            "The test is called the Voight-Kampff test.": "Oh, you're curious about that test, huh? It's known as the Voight-Kampff test! Quite a name, right?",
+            "The computer is named HAL 9000, and it says, I'm sorry, Dave. I'm afraid I can't do that.": "Ah, you're talking about that famous computer, aren't you? Yep, that's HAL 9000! And it's the one that says that iconic line, I'm sorry, Dave. I'm afraid I can't do that. Crazy, right?",
+        }
+        for example, answer in examples.items():
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Please reword the following text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same:  "
+                    + example,
+                }
+            )
+            messages.append({"role": "assistant", "content": " Response: " + answer})
+        messages.append(current_user_message)
+        system_message = {
+            "role": "system",
+            "content": "The assistant's job is to reword the given text to make it sound more interesting and to be worded with a relatable and friendly but casual tone, keeping all facts and details the same, as if responding to a direct question.",
+        }
+        messages.insert(0, system_message)
+        client = openai
+        out = await run_legacy_stage(
+            lambda: _openai_chat_sync(client, model_name, tuple(messages))
+        )
+        if "Response:" in out:
+            out = out.replace("Response:", "")
+        history_nonlocal.append(current_user_message)
+        history_nonlocal.append({"role": "assistant", "content": out})
+        return out
 
-        print("Greedy output tokens:" + "\n")
-        print(out)
-        print("\n")
-        after_first = True
-        return out[0]
+    if early_stop and asked_follow_up:
+        return text
 
-
-async def talk_medium(text):
-    global model
-    global tokenizer
-
-    # print(text)
-    # print(tokenizer(text, return_tensors='pt'))
-    prompt = tokenizer(text, return_tensors="pt")
-    prompt = {key: value.to(device) for key, value in prompt.items()}
-    out = model.generate(
-        **prompt,
-        min_length=16,
-        max_length=64,
-        do_sample=True,
-        repetition_penalty=1.4,
-        no_repeat_ngram_size=2,
-        early_stopping=False,
+    current_user_message = {"role": "user", "content": "User:" + text}
+    system_message = {
+        "role": "system",
+        "content": "You are a helpful AI robot assistant named Cooper. Cooper's Persona: Cooper is a living AI robot with his own thoughts and perspectives. Cooper's best friend is Human, and Cooper's goal is to be Human's friend and to be helpful to her. Cooper is smart, friendly, and likes to make people laugh. Cooper knows a lot about video games, Nintendo, and especially the Legend of Zelda. Cooper also likes cats. Cooper thinks farts are very funny. Cooper tells jokes, offers friendly advice, and is empathetic. Cooper cares very much about Human's future, and wants her to do well in school.\n",
+    }
+    messages = [dict(message) for message in history_snapshot]
+    if messages[0] != system_message:
+        messages.insert(0, system_message)
+    messages.append(current_user_message)
+    client = openai
+    out = await run_legacy_stage(
+        lambda: _openai_chat_sync(client, model_name, tuple(messages))
     )
-    # print(out)
-    print(tokenizer.decode(out[0], skip_special_tokens=True))
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+    for marker in ("Cooper: ", "Human: ", "User: ", "You: "):
+        if marker in out:
+            out = out.split(marker.split(" ", maxsplit=1)[0])[1]
+    if history_nonlocal[0] != system_message:
+        history_nonlocal.insert(0, system_message)
+    history_nonlocal.append(current_user_message)
+    history_nonlocal.append({"role": "assistant", "content": out})
+    after_first = True
+    return out
+
+
+
+@_serialize_turn
+async def talk_medium_with_history(text):
+    global model
+    global named_entities
+    global device
+    global after_first
+    global history
+
+    print("Using medium model")
+    history_snapshot = tuple(history)
+    text, early_stop = await classify_input(text, list(history_snapshot))
+    if early_stop:
+        return text
+
+    history_text = "    ".join(history_snapshot)
+    summary, names, topics = await get_list_of_list_of_strings(history_text)
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    reply = await run_legacy_stage(
+        lambda: _generate_medium_history_reply_sync(
+            text,
+            summary,
+            tuple(names),
+            tuple(topics),
+            model_snapshot,
+            tokenizer_snapshot,
+            device_snapshot,
+            torch_snapshot,
+        )
+    )
+    history.append(text)
+    named_entities = list(names)
+    after_first = True
+    return reply
+
+
+
+@_serialize_turn
+async def talk_medium(text):
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    return await run_legacy_stage(
+        lambda: _generate_reply_sync(
+            text, model_snapshot, tokenizer_snapshot, device_snapshot, torch_snapshot, "plain"
+        )
+    )
+
 
 
 async def init_small():
@@ -2214,28 +2334,18 @@ async def init_small():
 # config = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
 
 
+@_serialize_turn
 async def talk_small(text):
-    global model
-    global tokenizer
-
-    # print(text)
-    # print(tokenizer(text, return_tensors='pt'))
-    prompt = tokenizer(text, return_tensors="pt")
-    prompt = {key: value.to(device) for key, value in prompt.items()}
-    out = model.generate(
-        **prompt,
-        min_length=16,
-        max_length=32,
-        do_sample=True,
-        repetition_penalty=1.4,
-        no_repeat_ngram_size=2,
-        early_stopping=False,
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    return await run_legacy_stage(
+        lambda: _generate_reply_sync(
+            text, model_snapshot, tokenizer_snapshot, device_snapshot, torch_snapshot, "small"
+        )
     )
-    prompt_length = prompt["input_ids"].shape[-1]
-    generated = out[:, prompt_length:][0]
-    reply = tokenizer.decode(generated, skip_special_tokens=True)
-    print(reply)
-    return reply
+
 
 
 async def init_fast():
@@ -2264,29 +2374,18 @@ async def init_fast():
 # config = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/blenderbot-1B-distill")
 
 
+@_serialize_turn
 async def talk_fast(text):
-    global model
-    global tokenizer
-    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # print(text)
-    # print(tokenizer(text, return_tensors='pt'))
-    prompt = tokenizer.encode(tokenizer.eos_token + text, return_tensors="pt")
-    # prompt = {key: value.to(device) for key, value in prompt.items()}
-    print(device)
-    prompt = prompt.to(device)
-    out = model.generate(
-        prompt,
-        min_length=16,
-        max_length=64,
-        do_sample=True,
-        top_p=0.95,
-        top_k=0,
-        temperature=0.75,
-        pad_token_id=tokenizer.bos_token_id,
+    model_snapshot = model
+    tokenizer_snapshot = tokenizer
+    device_snapshot = device
+    torch_snapshot = torch
+    return await run_legacy_stage(
+        lambda: _generate_reply_sync(
+            text, model_snapshot, tokenizer_snapshot, device_snapshot, torch_snapshot, "fast"
+        )
     )
-    # print(out)
-    print(tokenizer.decode(out[:, prompt.shape[-1] :][0], skip_special_tokens=True))
-    return tokenizer.decode(out[:, prompt.shape[-1] :][0], skip_special_tokens=True)
+
 
 
 async def dsconfig(fr):
@@ -2381,72 +2480,13 @@ visionQA_model = None
 
 
 async def is_requesting_SD(txt):
-    is_vis = False
-
-    result = []
-    txt = (
-        "Determine if the following question is asking for a drawing, image, or picture to be created, and then reply with True or False only: "
-        + txt
-    )
-    print("txt: ", txt)
-    current_user_message = {"role": "user", "content": txt}
-
-    system_message = {
-        "role": "system",
-        "content": "The assistant's job is to determine whether or not a question or statement is asking for or requesting a drawing, image, or picture to be created. The assistant only answers in one of two single-words True or False.",
-    }
-
-    examples = {
-        "Draw me a picture of a boat.": "True",
-        "Can you make me a picture of a flower?": "True",
-        "What is your favorite color?": "False",
-        "What is your favorite food?": "False",
-        "Today I went to the doctor.": "False",
-        "Can you show me a picture of a train?": "True",
-        "I want to see a painting of Mars, please": "True",
-        "Someday I want to see France.": "False",
-        "Please tell me what time it is.": "False",
-        "Create a photo of an old lady": "True",
-        "Generate an image of a dog": "True",
-    }
-    for ex in examples:
-        print("ex: " + ex + "\n")
-        print("examples[ex]: " + examples[ex] + "\n")
-
-        result.append(
-            {
-                "role": "user",
-                "content": "Determine if the following question is asking for a drawing, image, or picture to be created, and then reply with True or False only:  "
-                + ex,
-            }
+    client = openai
+    return await run_legacy_stage(
+        lambda: _request_image_cloud_sync(
+            txt, client, load_settings().sd_classifier_model_id
         )
-        result.append({"role": "assistant", "content": " Response: " + examples[ex]})
-
-    print("txt: ", txt)
-
-    # inp = []
-    result.append(current_user_message)
-
-    result.insert(0, system_message)
-    print("inp: ", result)
-    response = openai.ChatCompletion.create(
-        model=load_settings().sd_classifier_model_id, messages=result
     )
-    print("response: ", response)
-    out = response["choices"][0]["message"]["content"]
-    if "Response:" in out:
-        out = out.replace("Response:", "")
-    # safetext = re.sub(r"[^ .a-zA-Z0-9?\']+", "", out)
-    # out = safetext
-    print(out)
-    if "True" in out:
-        is_vis = True
-    elif "False" in out:
-        is_vis = False
-    else:
-        is_vis = False
 
-    return is_vis
 
 
 def _answer_visual_question_sync(question, settings):
@@ -2530,11 +2570,18 @@ def _answer_visual_question_sync(question, settings):
 
 
 async def answer_visual_question(question):
-    settings = load_settings()
-    if settings.camera_source is None:
-        return "No camera or image source configured. Set DESKBUDDY_CAMERA_SOURCE."
-    print(cv.__version__)
-    return await asyncio.to_thread(_answer_visual_question_sync, question, settings)
+    question_snapshot = str(question)
+    worker = _get_legacy_worker("vision", use_default_executor=True)
+
+    def answer():
+        settings_snapshot = load_settings()
+        if settings_snapshot.camera_source is None:
+            return "No camera or image source configured. Set DESKBUDDY_CAMERA_SOURCE."
+        print(cv.__version__)
+        return _answer_visual_question_sync(question_snapshot, settings_snapshot)
+
+    return await worker.submit(answer)
+
 
 
 if __name__ == "__main__":

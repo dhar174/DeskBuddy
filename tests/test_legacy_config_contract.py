@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from deskbuddy import question_bank
+from deskbuddy.legacy_worker import LegacyWorker, WorkerBusyError, WorkerClosedError
 from deskbuddy.settings import Settings, SettingsError
 from tests.support.legacy_runtime import extract_module_functions
 
@@ -23,19 +24,40 @@ def _settings_at(data_dir: Path, cache_dir: Path, offload_dir: Path | None = Non
     return Settings(data_dir=data_dir, cache_dir=cache_dir, offload_dir=offload_dir)
 
 
+def _worker_globals() -> dict[str, Any]:
+    workers: dict[str, LegacyWorker] = {}
+
+    def get_legacy_worker(name: str, *, use_default_executor: bool = False) -> LegacyWorker:
+        worker = workers.get(name)
+        if worker is not None and worker.can_replace:
+            worker = None
+        if worker is None:
+            worker = LegacyWorker(name, use_default_executor=use_default_executor)
+            workers[name] = worker
+        worker.start()
+        return worker
+
+    async def run_legacy_stage(operation: Any, *, stop: Any = None) -> Any:
+        return await get_legacy_worker("desktop").submit(operation, stop=stop)
+
+    return {
+        "_legacy_workers": workers,
+        "_runtime_shutdown": False,
+        "_get_legacy_worker": get_legacy_worker,
+        "run_legacy_stage": run_legacy_stage,
+        "LegacyWorker": LegacyWorker,
+        "WorkerBusyError": WorkerBusyError,
+        "WorkerClosedError": WorkerClosedError,
+    }
+
+
 def _question_bank_adapters(
     settings: Settings,
     *,
     settings_loader: Any | None = None,
 ) -> dict[str, Any]:
-    return extract_module_functions(
-        BOT_CORTEX_PATH,
-        {
-            "load_qdict_from_json",
-            "save_qdict_to_json",
-            "_clear_question_bank_warning",
-            "_warn_question_bank_unavailable",
-        },
+    runtime_globals = _worker_globals()
+    runtime_globals.update(
         {
             "asyncio": asyncio,
             "logging": logging,
@@ -44,7 +66,17 @@ def _question_bank_adapters(
             "load_settings": settings_loader or (lambda: settings),
             "_question_bank_warning_lock": threading.Lock(),
             "_question_bank_warning_reasons": {},
+        }
+    )
+    return extract_module_functions(
+        BOT_CORTEX_PATH,
+        {
+            "load_qdict_from_json",
+            "save_qdict_to_json",
+            "_clear_question_bank_warning",
+            "_warn_question_bank_unavailable",
         },
+        runtime_globals,
     )
 
 
@@ -291,22 +323,16 @@ def test_question_bank_save_snapshots_mapping_before_offloading(
     adapters = _question_bank_adapters(settings)
     save = adapters["save_qdict_to_json"]
     submitted = threading.Event()
-    release = asyncio.Event()
+    release = threading.Event()
     saved_entries: list[dict[str, str]] = []
 
     def record_save(_path: Path, entries: dict[str, str]) -> None:
+        submitted.set()
+        assert release.wait(timeout=2)
         saved_entries.append(dict(entries))
 
     monkeypatch.setattr(question_bank, "save_question_bank", record_save)
     original = {"question": "before save starts"}
-    real_asyncio = asyncio
-
-    async def gated_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
-        submitted.set()
-        await release.wait()
-        return await real_asyncio.to_thread(function, *args, **kwargs)
-
-    save.__globals__["asyncio"] = SimpleNamespace(to_thread=gated_to_thread)
 
     async def exercise() -> None:
         save_task = asyncio.create_task(save(original))
@@ -343,13 +369,33 @@ def test_history_persistence_uses_user_data_not_cwd(
     data_dir.mkdir()
     (data_dir / filename).write_text(initial, encoding="utf-8")
     settings = _settings_at(data_dir, tmp_path / "user-cache")
+    runtime_globals = _worker_globals()
+    runtime_globals.update(
+        {
+            "asyncio": asyncio,
+            "threading": threading,
+            "tempfile": __import__("tempfile"),
+            "os": __import__("os"),
+            "_history_export_lock": threading.Lock(),
+            "load_settings": lambda: settings,
+        }
+    )
     save = extract_module_functions(
         BOT_CORTEX_PATH,
-        {function_name},
-        {"load_settings": lambda: settings},
+        {
+            function_name,
+            "_atomic_write_history_text",
+            "_save_history_summary_sync",
+            "_save_history_verbatim_sync",
+        },
+        runtime_globals,
     )[function_name]
 
-    asyncio.run(save(new_content))
+    try:
+        asyncio.run(save(new_content))
+    finally:
+        for worker in runtime_globals["_legacy_workers"].values():
+            worker.shutdown()
 
     assert (data_dir / filename).read_text(encoding="utf-8") == expected
     assert not (checkout / filename).exists()
@@ -361,19 +407,26 @@ def test_missing_camera_returns_message_without_touching_vision_dependencies() -
             pytest.fail(f"camera/vision runtime accessed without a source: {name}")
 
     forbidden = ForbiddenRuntime()
-    answer = extract_module_functions(
-        BOT_CORTEX_PATH,
-        {"answer_visual_question"},
+    worker_globals = _worker_globals()
+    worker_globals.update(
         {
+            "asyncio": asyncio,
             "load_settings": lambda: SimpleNamespace(camera_source=None),
             "cv": forbidden,
             "torch": forbidden,
             "GitProcessor": forbidden,
             "GitForCausalLM": forbidden,
-        },
+        }
+    )
+    answer = extract_module_functions(
+        BOT_CORTEX_PATH,
+        {"_get_legacy_worker", "answer_visual_question"},
+        worker_globals,
     )["answer_visual_question"]
 
     result = asyncio.run(answer("What is in the picture?"))
+    for worker in worker_globals["_legacy_workers"].values():
+        worker.shutdown()
 
     assert result == "No camera or image source configured. Set DESKBUDDY_CAMERA_SOURCE."
 
