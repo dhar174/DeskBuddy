@@ -13,6 +13,15 @@ from struct import pack
 import signal
 import sys
 from deskbuddy.settings import load_settings
+from deskbuddy.legacy_audio import (
+    CaptureStopped,
+    CaptureStopToken,
+    capture_and_transcribe,
+    capture_pcm,
+    submit_until_stopped,
+    write_wav,
+)
+from deskbuddy.legacy_worker import LegacyWorker, WorkerBusyError, WorkerClosedError
 from typing import Any
 
 try:
@@ -100,6 +109,95 @@ priorReplyMessage = ""
 lastTranscription = ""
 priorTranscription = ""
 transcript_queue = TranscriptQueue()
+listening = False
+_runtime_stop_event: asyncio.Event | None = None
+_shared_audio_worker: LegacyWorker | None = None
+_shared_audio_users = 0
+_shared_audio_worker_owned = False
+
+
+def _audio_worker_for_call(
+    supplied: LegacyWorker | None,
+) -> tuple[LegacyWorker, bool]:
+    global _shared_audio_worker, _shared_audio_users, _shared_audio_worker_owned
+    if supplied is not None:
+        supplied.start()
+        if _shared_audio_worker is None or _shared_audio_worker.can_replace:
+            _shared_audio_worker = supplied
+            _shared_audio_worker_owned = False
+        elif _shared_audio_worker is not supplied:
+            raise WorkerBusyError("another audio worker owns this adapter")
+        return supplied, False
+    if _shared_audio_worker is None or _shared_audio_worker.can_replace:
+        _shared_audio_worker = LegacyWorker("deskbuddy-legacy-audio")
+        _shared_audio_worker_owned = True
+    worker = _shared_audio_worker
+    worker.start()
+    _shared_audio_users += 1
+    return worker, True
+
+
+def _release_audio_worker(worker: LegacyWorker, leased: bool) -> None:
+    global _shared_audio_worker, _shared_audio_users, _shared_audio_worker_owned
+    if not leased or _shared_audio_worker is not worker:
+        return
+    _shared_audio_users = max(0, _shared_audio_users - 1)
+    if _shared_audio_users == 0 and _shared_audio_worker_owned:
+        worker.shutdown()
+        if worker.can_replace:
+            _shared_audio_worker = None
+            _shared_audio_worker_owned = False
+
+
+def _bind_runtime_audio_worker(worker: LegacyWorker) -> None:
+    global _shared_audio_worker, _shared_audio_users, _shared_audio_worker_owned
+    if _shared_audio_worker is not None and not _shared_audio_worker.can_replace:
+        if _shared_audio_worker is not worker:
+            raise WorkerBusyError("another audio worker owns this adapter")
+    _shared_audio_worker = worker
+    _shared_audio_users = 0
+    _shared_audio_worker_owned = False
+
+
+def _shutdown_runtime_audio_worker(worker: LegacyWorker) -> None:
+    global _shared_audio_worker, _shared_audio_users, _shared_audio_worker_owned
+    worker.shutdown()
+    if _shared_audio_worker is worker and worker.can_replace:
+        _shared_audio_worker = None
+        _shared_audio_users = 0
+        _shared_audio_worker_owned = False
+
+
+def _capture_operation(
+    stop: CaptureStopToken | threading.Event,
+    silence_chunks: int,
+) -> Any:
+    return capture_and_transcribe(
+        pyaudio_module=pyaudio,
+        whisper_model=model,
+        audio_format=FORMAT,
+        rate=RATE,
+        chunk_size=CHUNK_SIZE,
+        threshold=THRESHOLD,
+        silence_chunks=silence_chunks,
+        stop=stop,
+    )
+
+
+def _capture_to_path(path: str, stop: threading.Event, silence_chunks: int) -> tuple[int, array]:
+    sample_width, samples = capture_pcm(
+        pyaudio_module=pyaudio,
+        audio_format=FORMAT,
+        rate=RATE,
+        chunk_size=CHUNK_SIZE,
+        threshold=THRESHOLD,
+        silence_chunks=silence_chunks,
+        stop=stop,
+    )
+    if stop.is_set():
+        raise CaptureStopped("audio capture stopped before WAV write")
+    write_wav(path, sample_width, samples, rate=RATE)
+    return sample_width, samples
 
 
 class MyFunctions:
@@ -296,118 +394,145 @@ class MyFunctions:
         return r
 
     async def record():
-        """
-        Record a word or words from the microphone and
-        return the data as an array of signed shorts.
-
-        Normalizes the audio, trims silence from the
-        start and end, and pads with 0.5 seconds of
-        blank sound to make sure VLC et al can play
-        it without getting chopped off.
-        """
-
-        p = pyaudio.PyAudio()
-        stream = p.open(format=FORMAT, channels=1, rate=RATE,
-                        input=True, output=True,
-                        frames_per_buffer=CHUNK_SIZE)
-
-        num_silent = 0
-        snd_started = False
-
-        r = array('h')
-
-        while 1:
-            # little endian, signed short
-            snd_data = array('h', stream.read(CHUNK_SIZE))
-            if byteorder == 'big':
-                snd_data.byteswap()
-            r.extend(snd_data)
-            silent = await MyFunctions.is_silent(snd_data)
-            if silent and snd_started:
-                num_silent += 1
-            elif not silent and not snd_started:
-                snd_started = True
-            if snd_started and num_silent > 30:
-                break
-
-        sample_width = p.get_sample_size(FORMAT)
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-
-        r = await MyFunctions.normalize(r)
-        r = await MyFunctions.trim(r)
-        r = await MyFunctions.add_silence(r, 0.5)
-        return sample_width, r
-
-    async def record_to_file(path):
-        "Records from the microphone and outputs the resulting data to 'path'"
-        global recording
-        global recorded
-        recording = True
+        """Capture one VAD-delimited recording without blocking the event loop."""
+        stop = threading.Event()
+        worker, owns_worker = _audio_worker_for_call(None)
         try:
-            sample_width, data = await MyFunctions.record()
-            data = pack('<' + ('h'*len(data)), *data)
+            return await worker.submit(
+                lambda: capture_pcm(
+                    pyaudio_module=pyaudio,
+                    audio_format=FORMAT,
+                    rate=RATE,
+                    chunk_size=CHUNK_SIZE,
+                    threshold=THRESHOLD,
+                    silence_chunks=30,
+                    stop=stop,
+                ),
+                stop=stop,
+            )
+        finally:
+            _release_audio_worker(worker, owns_worker)
 
-            wf = wave.open(path, 'wb')
-            wf.setnchannels(1)
-            wf.setsampwidth(sample_width)
-            wf.setframerate(RATE)
-            wf.writeframes(data)
-            wf.close()
-        except:
-            print("Recording failed")
+    async def record_to_file(path: str):
+        """Capture a recording and write it to the requested legacy path."""
+        global recording, recorded
+        stop = threading.Event()
+        worker, owns_worker = _audio_worker_for_call(None)
+        recording = True
+        recorded = False
+        try:
+            result = await worker.submit(
+                lambda: _capture_to_path(path, stop, 30),
+                stop=stop,
+            )
+        except Exception as exc:
+            print(f"Recording failed: {exc}")
             recording = False
             recorded = False
-            return
-        recorded = True
-        recording = False
+            raise
+        finally:
+            recording = False
+            _release_audio_worker(worker, owns_worker)
         await MyFunctions.baseCol(0, 0, 5)
+        recorded = True
         print("Recording stopped")
-        return None
+        return result
 
-    async def listen():
-        global listening
-        global recording
-        global recorded
-        global result
-        global lastReplyMessage
+    async def listen(
+        stop_event: asyncio.Event | None = None,
+        audio_worker: LegacyWorker | None = None,
+        capture_stop: threading.Event | None = None,
+    ):
+        global listening, recording, recorded, result
+        stop = stop_event if stop_event is not None else asyncio.Event()
+        audio_stop = capture_stop if capture_stop is not None else threading.Event()
+        worker, owns_worker = _audio_worker_for_call(audio_worker)
         recorded = False
         recording = False
         result = None
-        while True:
-            try:
-                if listening:
-                    fs = 44100
-                    if keyboard.is_pressed("space") and recording == False:
+        try:
+            while not stop.is_set():
+                try:
+                    pressed = (
+                        listening
+                        and keyboard is not None
+                        and keyboard.is_pressed("space")
+                        and not recording
+                    )
+                    if pressed and not recorded:
                         await MyFunctions.baseCol(0, 8, 0)
+                        if stop.is_set():
+                            break
                         print("Recording started")
-                        if keyboard.is_pressed("space") and recorded == False:
-                            await MyFunctions.record_to_file(picoh.get_input_path())
-                # else:
-                #     time.sleep(0.1)
-                if (recording != True and recorded == True):
-                    print("Transcribing...")
-                    # wav = wave.open(picoh.get_input_path(), 'rb')
-                    result = model.transcribe(
-                        await MyFunctions.picoh_get_input_path())
-                    await MyFunctions.picoh_wait(0.25)
-                transcript_text = result.get("text") if isinstance(result, dict) else None
-                if is_valid_transcript_text(transcript_text):
-                    resp = await MyFunctions.send_response(
-                        transcript_text)
-                else:
-                    recorded = False
+                        recording = True
+                        capture_token = CaptureStopToken(audio_stop)
+                        has_result, captured = await submit_until_stopped(
+                            worker,
+                            lambda: _capture_operation(capture_token, 30),
+                            stop_event=stop,
+                            capture_stop=capture_token,
+                        )
+                        recording = False
+                        if (
+                            not has_result
+                            or stop.is_set()
+                            or capture_token.is_set()
+                            or audio_stop.is_set()
+                        ):
+                            recorded = False
+                            result = None
+                            if stop.is_set() or audio_stop.is_set():
+                                break
+                        else:
+                            result = captured
+                            recorded = True
+                            await MyFunctions.picoh_wait(0.25)
+                            if stop.is_set() or capture_token.is_set() or audio_stop.is_set():
+                                recorded = False
+                                result = None
+                                if stop.is_set() or audio_stop.is_set():
+                                    break
+                                continue
+                            transcript_text = (
+                                captured.get("text") if isinstance(captured, dict) else None
+                            )
+                            if (
+                                not stop.is_set()
+                                and not capture_token.is_set()
+                                and not audio_stop.is_set()
+                                and is_valid_transcript_text(transcript_text)
+                            ):
+                                await MyFunctions.send_response(transcript_text)
+                            else:
+                                recorded = False
+                                recording = False
+                                result = None
+                                if not stop.is_set():
+                                    await MyFunctions.baseCol(0, 0, 5)
+                except asyncio.CancelledError:
+                    audio_stop.set()
+                    raise
+                except (CaptureStopped, WorkerBusyError, WorkerClosedError) as exc:
+                    print(f"Audio turn unavailable: {exc}")
                     recording = False
+                    recorded = False
                     result = None
-                    await MyFunctions.baseCol(0, 0, 5)
-            except Exception as e:
-                print(e)
-                pass
-            for i in range(10):
-                if (i == 9):
-                    await asyncio.sleep(0.1)
-        return None  # This is required to stop the loop
+                    if stop.is_set() or audio_stop.is_set():
+                        break
+                except Exception as exc:
+                    print(exc)
+                    recording = False
+                    recorded = False
+                    result = None
+                await asyncio.sleep(0.1)
+        finally:
+            audio_stop.set()
+            recording = False
+            recorded = False
+            result = None
+            listening = False
+            _release_audio_worker(worker, owns_worker)
+        return None
 
 
 # Define a TCP server configuration
@@ -499,13 +624,19 @@ def create_robot_server(config: TransportConfig | None = None) -> RobotServer:
     )
 
 
-async def start_server(config: TransportConfig | None = None, server: RobotServer | None = None) -> None:
+async def start_server(
+    config: TransportConfig | None = None,
+    server: RobotServer | None = None,
+) -> None:
     """Start the authenticated, framed robot server. Propagates startup failures."""
     if server is None:
         server = create_robot_server(config)
-    await server.start()
-    print(f"Server started on {server.host}:{server.port}")
-    await server.serve_forever()
+    try:
+        await server.start()
+        print(f"Server started on {server.host}:{server.port}")
+        await server.serve_forever()
+    finally:
+        await server.stop()
 
 
 
@@ -582,62 +713,111 @@ def init_hardware():
 
 
 def signal_handler(signal, frame):
-    loop.stop()
-    sys.exit(0)
+    stop = _runtime_stop_event
+    if stop is not None:
+        stop.set()
+    else:
+        raise KeyboardInterrupt
 
 
-signal.signal(signal.SIGINT, signal_handler)
+def _install_runtime_sigint(
+    stop: asyncio.Event,
+) -> tuple[asyncio.AbstractEventLoop | None, Any | None]:
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, stop.set)
+        return loop, None
+    except (NotImplementedError, OSError, RuntimeError):
+        try:
+            previous = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal_handler)
+            return None, previous
+        except (OSError, ValueError):
+            return None, None
 
 
-async def main():
-    global servertask
-    global t0
-    global t1
-    global t2
-    global t3
-    global t4
-    global t5
-    global picoh
-    global lastReplyMessage
-    global priorReplyMessage
-    global lastTranscription
-    global priorTranscription
-    global CHUNK_SIZE
-    global FORMAT
-    global RATE
-    global listening
-    global model
-    global moving
-    global blinking
-    global defaultEyeshape
-    global THRESHOLD
-    global recording
-    global recorded
+def _restore_runtime_sigint(
+    loop: asyncio.AbstractEventLoop | None,
+    previous: Any | None,
+) -> None:
+    if loop is not None:
+        loop.remove_signal_handler(signal.SIGINT)
+    elif previous is not None:
+        try:
+            signal.signal(signal.SIGINT, previous)
+        except (OSError, ValueError):
+            pass
 
-    # asyncio.ensure_future(start_server())
-    # loop.create_task(start_server())
-    # asyncio.ensure_future(MyFunctions.listen())
-    # asyncio.ensure_future(MyFunctions.blinkLids())
-    # asyncio.ensure_future(MyFunctions.randomLook())
-    # asyncio.ensure_future(MyFunctions.randomNod())
-    # asyncio.ensure_future(MyFunctions.randomTurn())
-    # loop.run_forever()
-    init_hardware()
-    server_task = asyncio.create_task(start_server())
-    listen_task = asyncio.create_task(MyFunctions.listen())
-    blink_task = asyncio.create_task(MyFunctions.blinkLids())
-    look_task = asyncio.create_task(MyFunctions.randomLook())
-    nod_task = asyncio.create_task(MyFunctions.randomNod())
-    turn_task = asyncio.create_task(MyFunctions.randomTurn())
 
-    await asyncio.gather(server_task, listen_task)
+async def main(
+    config: TransportConfig | None = None,
+    server: RobotServer | None = None,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Own server, listener, motion tasks, and the bounded audio worker."""
+    global _runtime_stop_event
+    stop = stop_event if stop_event is not None else asyncio.Event()
+    previous_stop = _runtime_stop_event
+    _runtime_stop_event = stop
+    signal_loop, previous_sigint = _install_runtime_sigint(stop)
+    audio_worker = LegacyWorker("deskbuddy-legacy-audio")
+    active_server: RobotServer | None = None
+    tasks: list[asyncio.Task[Any]] = []
+    stop_task: asyncio.Task[bool] | None = None
+    try:
+        audio_worker.start()
+        _bind_runtime_audio_worker(audio_worker)
+        active_server = server if server is not None else create_robot_server(config)
+        stop_task = asyncio.create_task(stop.wait(), name="buddy1-stop")
+        if stop.is_set():
+            return
+        init_hardware()
+        tasks = [
+            asyncio.create_task(
+                start_server(config, active_server), name="buddy1-server"
+            ),
+            asyncio.create_task(
+                MyFunctions.listen(stop, audio_worker), name="buddy1-listener"
+            ),
+            asyncio.create_task(MyFunctions.blinkLids(), name="buddy1-blink"),
+            asyncio.create_task(MyFunctions.randomLook(), name="buddy1-look"),
+            asyncio.create_task(MyFunctions.randomNod(), name="buddy1-nod"),
+            asyncio.create_task(MyFunctions.randomTurn(), name="buddy1-turn"),
+        ]
+        done, _ = await asyncio.wait(
+            (*tasks, stop_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if stop_task not in done:
+            for task in done:
+                if task.cancelled():
+                    continue
+                if (error := task.exception()) is not None:
+                    raise error
+            if not stop.is_set():
+                raise RuntimeError("a robot runtime task stopped unexpectedly")
+    finally:
+        stop.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+        cleanup_tasks: list[asyncio.Task[Any]] = tasks[:]
+        if stop_task is not None:
+            cleanup_tasks.append(stop_task)
+        try:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            if active_server is not None:
+                await active_server.stop()
+        finally:
+            _shutdown_runtime_audio_worker(audio_worker)
+            _restore_runtime_sigint(signal_loop, previous_sigint)
+            _runtime_stop_event = previous_stop
 
 
 if __name__ == "__main__":
     if whisper is not None:
         model = whisper.load_model("base")
-    loop = asyncio.get_event_loop()
-
     lastReplyMessage = ""
     priorReplyMessage = ""
     lastTranscription = ""
@@ -648,5 +828,4 @@ if __name__ == "__main__":
     RATE = 44100
 
     asyncio.run(main())
-    loop.run_forever()
 
