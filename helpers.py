@@ -41,6 +41,82 @@ qgen_tokenizer = None
 qgen_model = None
 
 
+def _best_nli_label_sync(text, candidate_labels, classifier):
+    labels = classifier(text, candidate_labels)
+    for label, value in labels.items():
+        print("label: " + label)
+        print("val: " + str(value))
+    selected = labels["labels"][labels["scores"].index(max(labels["scores"]))]
+    print(selected)
+    return selected
+
+
+def _is_question_sync(text, model, tokenizer):
+    logits = model(tokenizer.encode(text, return_tensors="pt", max_length=512))
+    print("text for isquestion: " + text)
+    logits = logits["logits"].detach().cpu().numpy()
+    prediction = logits.argmax(axis=1)
+    print(prediction)
+    return bool(prediction == 1)
+
+
+def _answer_question_based_on_context_sync(text, context, answerer):
+    result = answerer(question=text, context=context)
+    print(
+        f"Answer: '{result['answer']}', score: {round(result['score'], 4)}, "
+        f"start: {result['start']}, end: {result['end']}"
+    )
+    if result["score"] < 0.5:
+        return "I'm not sure I understand the question. Can you rephrase it?", False
+    return result["answer"], True
+
+
+def _needs_follow_up_sync(text, classifier):
+    first = _best_nli_label_sync(
+        text,
+        ["needs a follow-up question", "needs a statement response"],
+        classifier,
+    )
+    second = _best_nli_label_sync(
+        text,
+        [
+            "there is enough info here to reply just fine",
+            "more info is needed here to reply appropriately",
+        ],
+        classifier,
+    )
+    third = _best_nli_label_sync(
+        text,
+        [
+            "I think I need to ask a question to understand",
+            "this sentence makes sense on its own",
+        ],
+        classifier,
+    )
+    return (
+        first == "needs a follow-up question"
+        and second == "more info is needed here to reply appropriately"
+        and third == "I think I need to ask a question to understand"
+    )
+
+
+def _interpret_command_sync(text, model, tokenizer, torch_module):
+    inputs = tokenizer(text, return_tensors="pt")
+    outputs = model(**inputs)
+    prediction = torch_module.argmax(outputs[0]).item()
+    print(f"The predicted class is {model.config.id2label[prediction]}")
+    return model.config.id2label[prediction]
+
+
+def _command_type_sync(text, classifier, tokenizer):
+    candidate_labels = ["command", "conversation", "request", "other"]
+    labels = classifier(
+        tokenizer.encode(text, return_tensors="pt", max_length=512),
+        candidate_labels,
+    )
+    return labels["labels"][labels["scores"].index(max(labels["scores"]))]
+
+
 async def load_models():
     global question_answerer
     global visionQA_processor
@@ -88,35 +164,22 @@ async def load_models():
 
 
 async def is_question(txt):
-    is_q = False
-    logits = BotCortex.isquestion_model(
-        BotCortex.isquestion_tokenizer.encode(txt, return_tensors="pt", max_length=512)
+    model = BotCortex.isquestion_model
+    tokenizer = BotCortex.isquestion_tokenizer
+    return await BotCortex.run_legacy_stage(
+        lambda: _is_question_sync(txt, model, tokenizer)
     )
-    print("text for isquestion: " + txt)
-    # label.logits = label.logits.detach().numpy()
-    # labels_decoded = BotCortex.isquestion_tokenizer.decode(
-    #     label.logits.argmax(axis=1))
-    logits = logits["logits"].detach().cpu().numpy()
-    logit = logits.argmax(axis=1)
-    print(logit)
-    if logit == 1:
-        is_q = True
-    return is_q
+
 
 
 async def is_chat_or_command(txt):
-    is_com = False
+    classifier = BotCortex.nli_classifier
     candidate_labels = ["command", "conversation", "request", "other"]
+    label = await BotCortex.run_legacy_stage(
+        lambda: _best_nli_label_sync(txt, candidate_labels, classifier)
+    )
+    return label == "request" or label == "command"
 
-    labels = BotCortex.nli_classifier(txt, candidate_labels)
-    for label, val in labels.items():
-        print("label: " + label)
-        print("val: " + str(val))
-    label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-    print(label)
-    if label == "request" or label == "command":
-        is_com = True
-    return is_com
 
 
 async def is_personal(txt):
@@ -128,19 +191,13 @@ async def is_personal(txt):
         or str("What are you") in txt
     ):
         return False
-    is_pers = False
+    classifier = BotCortex.nli_classifier
     candidate_labels = ["personal question", "knowledge question"]
+    label = await BotCortex.run_legacy_stage(
+        lambda: _best_nli_label_sync(txt, candidate_labels, classifier)
+    )
+    return label == "personal question"
 
-    labels = BotCortex.nli_classifier(txt, candidate_labels)
-    for label, val in labels.items():
-        print("label: " + label)
-        print("val: " + str(val))
-    label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-    print(label)
-    if label == "personal question":
-        is_pers = True
-
-    return is_pers
 
 
 # answer_tokenizer = DistilBertTokenizer.from_pretrained(
@@ -159,62 +216,20 @@ async def determine_question_context():
 
 
 async def answer_question_based_on_context(txt, context):
-    # inputs = answer_tokenizer(txt, context, return_tensors="pt")
-
-    # with torch.no_grad():
-
-    #     answer = answer_model(**inputs)
-    result = question_answerer(question=txt, context=context)
-    print(
-        f"Answer: '{result['answer']}', score: {round(result['score'], 4)}, start: {result['start']}, end: {result['end']}"
+    answerer = question_answerer
+    return await BotCortex.run_legacy_stage(
+        lambda: _answer_question_based_on_context_sync(txt, context, answerer)
     )
 
-    if result["score"] < 0.5:
-        return "I'm not sure I understand the question. Can you rephrase it?", False
-    else:
-        return result["answer"], True
     # print(f"The predicted class is {answer_model.config.id2label[pred]}")
 
 
 async def needs_follow_up(txt):
-    needs_fu = False
-    candidate_labels = ["needs a follow-up question", "needs a statement response"]
+    classifier = BotCortex.nli_classifier
+    return await BotCortex.run_legacy_stage(
+        lambda: _needs_follow_up_sync(txt, classifier)
+    )
 
-    labels = BotCortex.nli_classifier(txt, candidate_labels)
-    for key, val in labels.items():
-        print("label: " + key)
-        print("val: " + str(val))
-    label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-    print(label)
-    candidate_labelsb = [
-        "there is enough info here to reply just fine",
-        "more info is needed here to reply appropriately",
-    ]
-
-    labelsb = BotCortex.nli_classifier(txt, candidate_labelsb)
-    for key, val in labelsb.items():
-        print("label: " + key)
-        print("val: " + str(val))
-    labelb = labelsb["labels"][labelsb["scores"].index(max(labelsb["scores"]))]
-    print(labelsb)
-    candidate_labelsc = [
-        "I think I need to ask a question to understand",
-        "this sentence makes sense on its own",
-    ]
-
-    labelsc = BotCortex.nli_classifier(txt, candidate_labelsc)
-
-    for key, val in labelsc.items():
-        print("label: " + key)
-        print("val: " + str(val))
-    labelc = labelsc["labels"][labelsc["scores"].index(max(labelsc["scores"]))]
-    print(labelc)
-    if label == "needs a follow-up question":
-        if labelb == "more info is needed here to reply appropriately":
-            if labelc == "I think I need to ask a question to understand":
-                needs_fu = True
-
-    return needs_fu
 
 
 async def submit_command(text):
@@ -223,11 +238,13 @@ async def submit_command(text):
 
 
 async def interpret_command(text):
-    inputs = command_tokenizer(text, return_tensors="pt")
-    outputs = command_model(**inputs)
-    pred = torch.argmax(outputs[0]).item()
-    print(f"The predicted class is {command_model.config.id2label[pred]}")
-    return command_model.config.id2label[pred]
+    model = command_model
+    tokenizer = command_tokenizer
+    torch_module = torch
+    return await BotCortex.run_legacy_stage(
+        lambda: _interpret_command_sync(text, model, tokenizer, torch_module)
+    )
+
 
 
 async def execute_command(command):
@@ -299,45 +316,31 @@ patch_size = 16  # pixels
 
 
 async def is_requesting_image(txt):
-    is_requesting_image = False
     if BotCortex.local_only_mode:
+        classifier = BotCortex.nli_classifier
         candidate_labels = [
             "a request for a drawing or image",
             "something else",
         ]
+        label = await BotCortex.run_legacy_stage(
+            lambda: _best_nli_label_sync(txt, candidate_labels, classifier)
+        )
+        return label == "a request for a drawing or image"
+    return await BotCortex.is_requesting_SD(txt)
 
-        labels = BotCortex.nli_classifier(txt, candidate_labels)
-        for label, val in labels.items():
-            print("label: " + label)
-            print("val: " + str(val))
-        label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-        print(label)
-        if label == "a request for a drawing or image":
-            is_requesting_image = True
-    else:
-        is_requesting_image = await BotCortex.is_requesting_SD(txt)
-    return is_requesting_image
 
 
 async def is_visual_question(txt):
-    is_vis = False
-    # if BotCortex.local_only_mode:
+    classifier = BotCortex.nli_classifier
     candidate_labels = [
         "question requiring vision to answer",
         "question not requiring vision to answer",
     ]
+    label = await BotCortex.run_legacy_stage(
+        lambda: _best_nli_label_sync(txt, candidate_labels, classifier)
+    )
+    return label == "question requiring vision to answer"
 
-    labels = BotCortex.nli_classifier(txt, candidate_labels)
-    for label, val in labels.items():
-        print("label: " + label)
-        print("val: " + str(val))
-    label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-    print(label)
-    if label == "question requiring vision to answer":
-        is_vis = True
-    # else:
-    #     is_vis = await BotCortex.is_visual_q(txt)
-    return is_vis
 
 
 # async def mean_pooling(model_output, attention_mask):
@@ -480,14 +483,12 @@ async def is_visual_question(txt):
 
 
 async def command_type(txt):
-    candidate_labels = ["command", "conversation", "request", "other"]
-
-    labels = await BotCortex.command_classifier(
-        BotCortex.command_tokenizer.encode(txt, return_tensors="pt", max_length=512),
-        candidate_labels,
+    classifier = BotCortex.command_classifier
+    tokenizer = BotCortex.command_tokenizer
+    return await BotCortex.run_legacy_stage(
+        lambda: _command_type_sync(txt, classifier, tokenizer)
     )
-    label = labels["labels"][labels["scores"].index(max(labels["scores"]))]
-    return label
+
 
 
 async def start():

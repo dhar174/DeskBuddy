@@ -121,7 +121,7 @@ def test_needs_follow_up_is_deterministic_and_independent_of_dict_identity_or_ke
     class ShuffledFreshDictNLI:
         def __init__(self, reverse: bool) -> None:
             self.reverse = reverse
-            self.seen_ids: list[int] = []
+            self.seen_payloads: list[dict[str, Any]] = []
 
         def __call__(self, text: str, candidate_labels: list[str]) -> dict[str, Any]:
             # Scores favor clarification even when label order in returned dict is non-trivial
@@ -136,7 +136,7 @@ def test_needs_follow_up_is_deterministic_and_independent_of_dict_identity_or_ke
                 if self.reverse
                 else {"sequence": text, "labels": labels, "scores": scores}
             )
-            self.seen_ids.append(id(payload))
+            self.seen_payloads.append(payload)
             return payload
 
     nli_forward = ShuffledFreshDictNLI(reverse=False)
@@ -149,8 +149,8 @@ def test_needs_follow_up_is_deterministic_and_independent_of_dict_identity_or_ke
 
     assert res_forward is True
     assert res_reverse is True
-    assert len(set(nli_forward.seen_ids)) == 3
-    assert len(set(nli_reverse.seen_ids)) == 3
+    assert len({id(payload) for payload in nli_forward.seen_payloads}) == 3
+    assert len({id(payload) for payload in nli_reverse.seen_payloads}) == 3
     assert_no_new_heavy_imports(loaded_before)
 
 

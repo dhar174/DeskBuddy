@@ -128,7 +128,7 @@ async def dispatch_reply(message, button_text, local_only, cortex=None):
             return await cortex.talk_fast(message)
 
 
-async def main():
+async def main(*, poller=None, max_turns=None):
     global local_only
     fast_button = tk.Button(root, text="Fast", command=lambda: chose_fast())
     small_button = tk.Button(root, text="Small", command=lambda: chose_small())
@@ -148,21 +148,22 @@ async def main():
     )
     local_only_checkbox.pack()
 
-    # Start the main event loop
     try:
         root.mainloop()
         if not button_text:
             return
         local_only = local_only_tk.get()
+        BotCortex.start_workers()
         await BotCortex.load_all_models(button_text, local_only)
         await helpers.load_models()
 
-        poller = rc.TranscriptPoller()
+        transcript_poller = poller or rc.TranscriptPoller()
         backoff = 0.1
         last_poll_error = None
-        while True:
+        handled_turns = 0
+        while max_turns is None or handled_turns < max_turns:
             try:
-                message = await poller.next_transcript()
+                message = await transcript_poller.next_transcript()
             except Exception as exc:
                 reason = type(exc).__name__
                 detail = ""
@@ -225,8 +226,14 @@ async def main():
                             f"Could not confirm speech delivery ({type(exc).__name__}); "
                             "continuing to poll."
                         )
+            finally:
+                handled_turns += 1
     finally:
-        await rc.close_client()
+        try:
+            BotCortex.shutdown_workers()
+        finally:
+            await rc.close_client()
+
 
 
 def configure_botcortex_logging():

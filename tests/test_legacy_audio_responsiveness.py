@@ -28,6 +28,37 @@ ADAPTERS: tuple[tuple[ModuleType, int], ...] = (
 )
 
 
+@pytest.mark.parametrize(
+    ("method", "flag"),
+    [
+        ("blinkLids", "blinking"),
+        ("randomLook", "moving"),
+        ("randomNod", "moving"),
+        ("randomTurn", "moving"),
+    ],
+)
+async def test_windows_buddy2_disabled_motion_yields_to_shutdown(
+    method: str, flag: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    class DisabledMotion:
+        checked = False
+
+        def __bool__(self) -> bool:
+            assert not self.checked, "disabled motion loop spun before giving shutdown a turn"
+            self.checked = True
+            loop.call_soon(stop.set)
+            return False
+
+    disabled = DisabledMotion()
+    monkeypatch.setattr(windows_buddy2, flag, disabled)
+    motion = getattr(windows_buddy2.MyFunctions, method)
+    await asyncio.wait_for(motion(stop), 5)
+    assert disabled.checked and stop.is_set()
+
+
 class FakeKeyboard:
     def __init__(self, pressed: bool) -> None:
         self.pressed = pressed
