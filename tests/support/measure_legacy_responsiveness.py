@@ -467,6 +467,7 @@ def _runtime_metadata(target: Path, parameters: Mapping[str, Any]) -> dict[str, 
     return {
         "target_checkout": str(target),
         "target_head": head,
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "target_branch": branch,
         "baseline_reference": BASELINE_COMMIT,
         "runtime_sources_dirty": bool(runtime_dirty),
@@ -506,6 +507,7 @@ def _install_record_delay(
     recorder: Any,
     delay_ms: float,
     stall_ms: float,
+    stall_target: str | None,
 ) -> dict[str, Any]:
     counter = {
         "fake_sync_calls": 0,
@@ -518,11 +520,12 @@ def _install_record_delay(
     }
     original = recorder.record
 
-    def record_with_delay(*args: Any, **kwargs: Any) -> Any:
+    def record_with_delay(target: str, *args: Any, **kwargs: Any) -> Any:
         counter["fake_sync_calls"] += 1
         if (
             counter["targeted_fake_stall_armed"]
             and not counter["targeted_fake_stall_fired_this_operation"]
+            and (stall_target is None or target == stall_target)
         ):
             time.sleep(stall_ms / 1000.0)
             counter["targeted_fake_stall_fired"] = True
@@ -530,7 +533,7 @@ def _install_record_delay(
             counter["targeted_fake_stall_injections"] += 1
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
-        return original(*args, **kwargs)
+        return original(target, *args, **kwargs)
 
     recorder.record = record_with_delay
     return counter
@@ -719,14 +722,20 @@ def _load_bot_case(
     fake_delay_ms: float,
     camera_source: str | None = None,
     stall_ms: float = 0.0,
+    stall_target: str | None = None,
 ) -> tuple[dict[str, Any], Any, Any, dict[str, Any]]:
     from deskbuddy.settings import Settings
 
     loader = importlib.import_module("tests.support.legacy_runtime")
+    fakes = importlib.import_module("tests.support.fakes")
+    recorder = fakes.CallRecorder()
     worker = _make_legacy_worker()
     settings = _make_settings(Settings, data_dir, camera_source=camera_source)
     kwargs: dict[str, Any] = {
         "settings": settings,
+        "recorder": recorder,
+        "nli_classifier": fakes.FakeNLIClassifier(recorder, routes=fakes.nli_routes()),
+        "is_question": False,
         "local_only_mode": local_only,
         "use_disk_question_bank": use_disk_question_bank,
     }
@@ -736,7 +745,7 @@ def _load_bot_case(
     ):
         kwargs["legacy_worker"] = worker
     namespace, recorder = loader.load_botcortex_runtime(**kwargs)
-    counters = _install_record_delay(recorder, fake_delay_ms, stall_ms)
+    counters = _install_record_delay(recorder, fake_delay_ms, stall_ms, stall_target)
     namespace["_benchmark_support"] = loader
     namespace["_benchmark_settings"] = settings
     namespace["_benchmark_worker"] = worker
@@ -860,6 +869,11 @@ async def _run_bot_case(
         stall_ms=stall_ms
         if callable_name not in {"question_bank", "answer_visual_question"}
         else 0.0,
+        stall_target=(
+            ("chat_model.generate" if local_only else "openai.ChatCompletion.create")
+            if callable_name.startswith("talk_")
+            else None
+        ),
     )
     production_vqa = False
     vqa_state: dict[str, int | bool] = {}
@@ -1066,6 +1080,7 @@ async def _run_desktop_turn_case(
             use_disk_question_bank=False,
             fake_delay_ms=fake_delay_ms,
             stall_ms=stall_ms,
+            stall_target="chat_model.generate" if local_only else "openai.ChatCompletion.create",
         )
         for index in range(warmups + repetitions)
     ]
@@ -1822,7 +1837,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--heartbeat-ms", type=float, default=5.0)
     parser.add_argument("--stall-ms", type=float, default=250.0)
     parser.add_argument("--settle-ms", type=float, default=10.0)
-    parser.add_argument("--fake-sync-delay-ms", type=float, default=10.0)
+    parser.add_argument("--fake-sync-delay-ms", type=float, default=0.0)
     parser.add_argument("--idle-window-ms", type=float, default=250.0)
     parser.add_argument("--audio-read-delay-ms", type=float, default=1.0)
     parser.add_argument("--whisper-delay-ms", type=float, default=10.0)
@@ -1958,6 +1973,14 @@ def _run_full(args: argparse.Namespace) -> int:
                         failures.append(str(result.get("name")))
         except Exception as error:
             failures.append(f"benchmark exception: {type(error).__name__}: {error}")
+
+        for scenario in results:
+            expected = scenario.get("targeted_fake_stall_expected_injections")
+            actual = scenario.get("targeted_fake_stall_injections")
+            if scenario["status"] == "ok" and expected is not None and actual != expected:
+                failures.append(
+                    f"{scenario['name']}: injected {actual} of {expected} targeted stalls"
+                )
 
         report = {
             "schema_version": 1,
